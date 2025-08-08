@@ -1,0 +1,143 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.24.2'
+    
+    - name: Get the version
+      id: get_version
+      run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+    
+    - name: Build for macOS (Intel)
+      run: |
+        GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o kprtfwd-darwin-amd64 main.go
+        
+    - name: Build for macOS (Apple Silicon)
+      run: |
+        GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o kprtfwd-darwin-arm64 main.go
+        
+    - name: Build for Linux (amd64)
+      run: |
+        GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o kprtfwd-linux-amd64 main.go
+        
+    - name: Build for Linux (arm64)
+      run: |
+        GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o kprtfwd-linux-arm64 main.go
+        
+    - name: Build for Windows
+      run: |
+        GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o kprtfwd-windows-amd64.exe main.go
+    
+    - name: Calculate checksums
+      run: |
+        sha256sum kprtfwd-* > checksums.txt
+        cat checksums.txt
+    
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ steps.get_version.outputs.VERSION }}
+        draft: false
+        prerelease: false
+        body: |
+          ## Changes
+          
+          * Please see the git log for detailed changes
+          
+          ## Installation
+          
+          ### Homebrew (macOS)
+          ```bash
+          brew tap xlttj/kprtfwd
+          brew install kprtfwd
+          ```
+          
+          ### Manual Installation
+          1. Download the appropriate binary for your system
+          2. Make it executable: `chmod +x kprtfwd-*`
+          3. Move to your PATH: `mv kprtfwd-* /usr/local/bin/kprtfwd`
+          
+          ### Go Install
+          ```bash
+          go install github.com/xlttj/kprtfwd@${{ steps.get_version.outputs.VERSION }}
+          ```
+    
+    - name: Upload macOS Intel binary
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./kprtfwd-darwin-amd64
+        asset_name: kprtfwd-darwin-amd64
+        asset_content_type: application/octet-stream
+    
+    - name: Upload macOS Apple Silicon binary
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./kprtfwd-darwin-arm64
+        asset_name: kprtfwd-darwin-arm64
+        asset_content_type: application/octet-stream
+    
+    - name: Upload Linux amd64 binary
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./kprtfwd-linux-amd64
+        asset_name: kprtfwd-linux-amd64
+        asset_content_type: application/octet-stream
+    
+    - name: Upload Linux arm64 binary
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./kprtfwd-linux-arm64
+        asset_name: kprtfwd-linux-arm64
+        asset_content_type: application/octet-stream
+    
+    - name: Upload Windows binary
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./kprtfwd-windows-amd64.exe
+        asset_name: kprtfwd-windows-amd64.exe
+        asset_content_type: application/octet-stream
+    
+    - name: Upload checksums
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./checksums.txt
+        asset_name: checksums.txt
+        asset_content_type: text/plain
