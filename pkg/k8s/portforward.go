@@ -122,18 +122,14 @@ func StartPortForward(params PortForwardParams) (*exec.Cmd, error) {
 		return nil, fmt.Errorf("kubectl exited quickly. Stderr: %s", stderrStr)
 	}
 
-	// Check if anything was written to stderr
-	stderrStr := stderr.String()
+	// Do not treat immediate stderr as fatal; kubectl may emit warnings
+	stderrStr := strings.TrimSpace(stderr.String())
 	if stderrStr != "" {
-		logging.LogError("Port-forward process (PID: %d) produced stderr output shortly after start: %s", cmd.Process.Pid, stderrStr)
-		_ = StopPortForward(cmd)
-		// Return the error directly, maybe wrap it? Or use a specific error type?
-		// For now, keep previous fix but consider wrapping later.
-		return nil, fmt.Errorf("%s", strings.TrimSpace(stderrStr)) // Keep using %s format
+		logging.LogDebug("kubectl port-forward initial stderr (non-fatal): %s", stderrStr)
 	}
 
-	// If we reach here, Start() succeeded, process didn't exit quickly, and no stderr output yet.
-	logging.LogDebug("Started port-forward process PID: %d, appears stable.", cmd.Process.Pid) // Updated log message
+	// If we reach here, Start() succeeded and process appears running
+	logging.LogDebug("Started port-forward process PID: %d, appears stable.", cmd.Process.Pid)
 	return cmd, nil
 }
 
@@ -144,7 +140,11 @@ func StopPortForward(cmd *exec.Cmd) error {
 	}
 	logging.LogDebug("Stopping port-forward process PID: %d", cmd.Process.Pid)
 
-	return cmd.Process.Kill()
+	// Try graceful interrupt first, then kill
+	_ = cmd.Process.Kill()
+	// Reap the process to avoid zombies
+	_ = cmd.Wait()
+	return nil
 }
 
 // Start attempts to start the port-forward for the config at the given index.
@@ -356,34 +356,34 @@ func (pf *PortForwarder) CleanupAll() {
 
 // ReloadResult represents the outcome of a configuration reload operation
 type ReloadResult struct {
-	Stopped []int            // Indices of stopped port forwards
-	Started []int            // Indices of started port forwards  
-	Updated []int            // Indices of updated port forwards
-	Errors  map[int]error    // Errors by config index
+	Stopped []int         // Indices of stopped port forwards
+	Started []int         // Indices of started port forwards
+	Updated []int         // Indices of updated port forwards
+	Errors  map[int]error // Errors by config index
 }
 
 // ReloadSync performs intelligent synchronization during config reload
-// Returns changes made and any errors  
+// Returns changes made and any errors
 func (pf *PortForwarder) ReloadSync(oldConfigs, newConfigs []config.PortForwardConfig) (*ReloadResult, error) {
 	pf.Mutex.Lock()
 	defer pf.Mutex.Unlock()
 
 	result := &ReloadResult{
 		Stopped: []int{},
-		Started: []int{}, 
+		Started: []int{},
 		Updated: []int{},
 		Errors:  make(map[int]error),
 	}
 
 	logging.LogDebug("ReloadSync: Starting with %d old configs, %d new configs", len(oldConfigs), len(newConfigs))
-	
+
 	// Debug: Log all old and new configs
 	for i, cfg := range oldConfigs {
-		logging.LogDebug("OLD Config[%d]: ID=%s, Context=%s, NS=%s, Svc=%s, Ports=%d:%d", 
+		logging.LogDebug("OLD Config[%d]: ID=%s, Context=%s, NS=%s, Svc=%s, Ports=%d:%d",
 			i, cfg.ID, cfg.Context, cfg.Namespace, cfg.Service, cfg.PortLocal, cfg.PortRemote)
 	}
 	for i, cfg := range newConfigs {
-		logging.LogDebug("NEW Config[%d]: ID=%s, Context=%s, NS=%s, Svc=%s, Ports=%d:%d", 
+		logging.LogDebug("NEW Config[%d]: ID=%s, Context=%s, NS=%s, Svc=%s, Ports=%d:%d",
 			i, cfg.ID, cfg.Context, cfg.Namespace, cfg.Service, cfg.PortLocal, cfg.PortRemote)
 	}
 
@@ -395,7 +395,7 @@ func (pf *PortForwarder) ReloadSync(oldConfigs, newConfigs []config.PortForwardC
 	for i := 0; i < maxLen; i++ {
 		var oldCfg *config.PortForwardConfig
 		var newCfg *config.PortForwardConfig
-		
+
 		if i < len(oldConfigs) {
 			oldCfg = &oldConfigs[i]
 		}
@@ -447,7 +447,7 @@ func (pf *PortForwarder) ReloadSync(oldConfigs, newConfigs []config.PortForwardC
 		}
 	}
 
-	logging.LogDebug("ReloadSync: Complete - Stopped: %d, Started: %d, Updated: %d, Errors: %d", 
+	logging.LogDebug("ReloadSync: Complete - Stopped: %d, Started: %d, Updated: %d, Errors: %d",
 		len(result.Stopped), len(result.Started), len(result.Updated), len(result.Errors))
 	return result, nil
 }
@@ -476,6 +476,6 @@ func configsExactlyEqual(old, new config.PortForwardConfig) bool {
 // This key is used to match configs across reloads regardless of their position in the array
 // Note: For configs to be considered "the same", they must have identical parameters
 func configIdentityKey(cfg config.PortForwardConfig) string {
-	return fmt.Sprintf("%s|%s|%s|%d|%d|%s", 
+	return fmt.Sprintf("%s|%s|%s|%d|%d|%s",
 		cfg.Context, cfg.Namespace, cfg.Service, cfg.PortRemote, cfg.PortLocal, cfg.ID)
 }

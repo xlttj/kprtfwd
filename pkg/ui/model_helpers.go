@@ -17,14 +17,14 @@ func (m *Model) generatePortForwardRows(configs []config.PortForwardConfig) []ta
 	if !(m.filterMode || m.filterInput.Value() != "") {
 		actualConfigs = m.configStore.GetActiveProjectForwards()
 	}
-	
+
 	rows := make([]table.Row, 0, len(actualConfigs))
 	allConfigs := m.configStore.GetAll()
-	
+
 	for _, cfg := range actualConfigs {
 		// Determine actual runtime status by checking if port forward is running
 		statusText := StatusStopped
-		
+
 		// Find the original index in the full config store using ID
 		originalIndex := -1
 		for j, origCfg := range allConfigs {
@@ -33,17 +33,17 @@ func (m *Model) generatePortForwardRows(configs []config.PortForwardConfig) []ta
 				break
 			}
 		}
-		
+
 		if originalIndex == -1 {
 			logging.LogDebug("Warning: Could not find original index for config ID %s", cfg.ID)
 			continue // Skip this config if we can't find its index
 		}
-		
+
 		// Check actual runtime state from PortForwarder
 		if m.portForwarder.IsRunning(originalIndex) {
 			statusText = StatusRunning
 		}
-		
+
 		rows = append(rows, table.Row{
 			cfg.Context,
 			cfg.Namespace,
@@ -76,7 +76,7 @@ func (m *Model) generateGroupedRows(configs []config.PortForwardConfig) []table.
 
 	// Always get all configs for index mapping
 	allConfigs := m.configStore.GetAll()
-	
+
 	for _, cfg := range actualConfigs {
 		groupKey := cfg.Context
 		if groupKey == "" {
@@ -90,12 +90,12 @@ func (m *Model) generateGroupedRows(configs []config.PortForwardConfig) []table.
 				break
 			}
 		}
-		
+
 		if originalIndex == -1 {
 			logging.LogDebug("Warning: Could not find original index for config ID %s", cfg.ID)
 			continue // Skip this config if we can't find its index
 		}
-		
+
 		groups[groupKey] = append(groups[groupKey], struct {
 			config config.PortForwardConfig
 			index  int
@@ -167,13 +167,13 @@ func (m *Model) generateGroupedRows(configs []config.PortForwardConfig) []table.
 				cfg := item.config
 				index := item.index
 
-			// Determine actual runtime status by checking if port forward is running
-			statusText := StatusStopped
-			isRunning := m.portForwarder.IsRunning(index)
-			if isRunning {
-				statusText = StatusRunning
-			}
-			logging.LogDebug("UI Refresh: Config %d (%s) - IsRunning=%t, Status='%s'", index, cfg.ID, isRunning, statusText)
+				// Determine actual runtime status by checking if port forward is running
+				statusText := StatusStopped
+				isRunning := m.portForwarder.IsRunning(index)
+				if isRunning {
+					statusText = StatusRunning
+				}
+				logging.LogDebug("UI Refresh: Config %d (%s) - IsRunning=%t, Status='%s'", index, cfg.ID, isRunning, statusText)
 
 				// Indent service name to show hierarchy
 				indentedService := "  " + cfg.Service
@@ -203,7 +203,7 @@ func (m *Model) generateGroupedRows(configs []config.PortForwardConfig) []table.
 // getConfigIndexFromTableRow returns the config index for the current table selection
 func (m *Model) getConfigIndexFromTableRow() (int, error) {
 	selectedIdx := m.portForwardsTable.Cursor()
-	
+
 	// In ungrouped mode, handle filtered vs unfiltered data
 	if !m.groupingEnabled {
 		var configs []config.PortForwardConfig
@@ -212,11 +212,11 @@ func (m *Model) getConfigIndexFromTableRow() (int, error) {
 		} else {
 			configs = m.configStore.GetAll()
 		}
-		
+
 		if selectedIdx < 0 || selectedIdx >= len(configs) {
 			return -1, fmt.Errorf("invalid table selection")
 		}
-		
+
 		// If filtering is active, find the original index
 		if (m.filterMode || m.filterInput.Value() != "") && m.filteredConfigs != nil {
 			selectedCfg := configs[selectedIdx]
@@ -228,10 +228,10 @@ func (m *Model) getConfigIndexFromTableRow() (int, error) {
 			}
 			return -1, fmt.Errorf("could not find original config index for filtered item")
 		}
-		
+
 		return selectedIdx, nil
 	}
-	
+
 	// In grouped mode, use enhanced rows
 	if selectedIdx < 0 || selectedIdx >= len(m.tableRows) {
 		return -1, fmt.Errorf("invalid table selection")
@@ -266,7 +266,7 @@ func (m *Model) getSelectedGroupName() string {
 // refreshTable refreshes the table based on current grouping mode and filter state
 func (m *Model) refreshTable() {
 	var configs []config.PortForwardConfig
-	
+
 	// Use filtered configs if filtering is active and we have filtered results
 	if (m.filterMode || m.filterInput.Value() != "") && m.filteredConfigs != nil {
 		configs = m.filteredConfigs
@@ -274,7 +274,7 @@ func (m *Model) refreshTable() {
 		// Use all configs for proper index mapping, but we'll filter later if needed
 		configs = m.configStore.GetAll()
 	}
-	
+
 	if m.groupingEnabled {
 		m.portForwardsTable.SetRows(m.generateGroupedRows(configs))
 	} else {

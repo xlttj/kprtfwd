@@ -2,10 +2,12 @@ package discovery
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 
 	"kprtfwd/pkg/logging"
 )
@@ -62,21 +64,37 @@ func DiscoverServices(opts Options) (*DiscoveryResult, error) {
 		fmt.Printf("📋 Found %d matching namespace(s): %s\n", len(namespaces), strings.Join(namespaces, ", "))
 	}
 
-	// Discover services in all matching namespaces
-	var allServices []ServiceInfo
-	for _, namespace := range namespaces {
-		services, err := getServicesInNamespace(context, namespace)
-		if err != nil {
-			logging.LogError("Failed to get services in namespace %s: %v", namespace, err)
-			continue // Continue with other namespaces
-		}
-		
-		if opts.Verbose && len(services) > 0 {
-			fmt.Printf("   └─ %s: %d service(s)\n", namespace, len(services))
-		}
-		
-		allServices = append(allServices, services...)
+	// For efficiency with large clusters, get all services at once and filter by namespace
+	// This is much faster than making individual calls for each namespace
+	allServices, err := getAllServicesInContext(context)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get services: %w", err)
 	}
+
+	// Filter services to only include those in matching namespaces
+	namespacesSet := make(map[string]bool)
+	for _, ns := range namespaces {
+		namespacesSet[ns] = true
+	}
+
+	var filteredServices []ServiceInfo
+	servicesByNamespace := make(map[string]int)
+	for _, service := range allServices {
+		if namespacesSet[service.Namespace] {
+			filteredServices = append(filteredServices, service)
+			servicesByNamespace[service.Namespace]++
+		}
+	}
+
+	if opts.Verbose {
+		for _, namespace := range namespaces {
+			if count := servicesByNamespace[namespace]; count > 0 {
+				fmt.Printf("   └─ %s: %d service(s)\n", namespace, count)
+			}
+		}
+	}
+
+	allServices = filteredServices
 
 	if len(allServices) == 0 {
 		return &DiscoveryResult{
@@ -117,7 +135,11 @@ func DiscoverServices(opts Options) (*DiscoveryResult, error) {
 
 // getCurrentContext gets the current kubectl context
 func getCurrentContext() (string, error) {
-	cmd := exec.Command("kubectl", "config", "current-context")
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "kubectl", "config", "current-context")
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -125,6 +147,9 @@ func getCurrentContext() (string, error) {
 
 	err := cmd.Run()
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("kubectl current-context timed out after 10 seconds")
+		}
 		return "", fmt.Errorf("kubectl current-context failed: %w (stderr: %s)", err, stderr.String())
 	}
 
@@ -137,14 +162,18 @@ func getCurrentContext() (string, error) {
 }
 
 // discoverNamespaces finds namespaces matching the given filter pattern
-func discoverNamespaces(context, filter string) ([]string, error) {
+func discoverNamespaces(kubeContext, filter string) ([]string, error) {
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	// Get all namespaces
 	args := []string{"get", "namespaces", "-o", "jsonpath={.items[*].metadata.name}"}
-	if context != "" {
-		args = append([]string{"--context", context}, args...)
+	if kubeContext != "" {
+		args = append([]string{"--context", kubeContext}, args...)
 	}
 
-	cmd := exec.Command("kubectl", args...)
+	cmd := exec.CommandContext(ctx, "kubectl", args...)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -152,6 +181,9 @@ func discoverNamespaces(context, filter string) ([]string, error) {
 
 	err := cmd.Run()
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("kubectl get namespaces timed out after 30 seconds")
+		}
 		return nil, fmt.Errorf("kubectl get namespaces failed: %w (stderr: %s)", err, stderr.String())
 	}
 
@@ -175,14 +207,19 @@ func discoverNamespaces(context, filter string) ([]string, error) {
 	return matchingNamespaces, nil
 }
 
-// getServicesInNamespace retrieves all services from a specific namespace
-func getServicesInNamespace(context, namespace string) ([]ServiceInfo, error) {
-	args := []string{"get", "services", "-n", namespace, "-o", "json"}
-	if context != "" {
-		args = append([]string{"--context", context}, args...)
+// getAllServicesInContext retrieves all services from all namespaces in a context
+// This is much more efficient than calling getServicesInNamespace for each namespace individually
+func getAllServicesInContext(kubeContext string) ([]ServiceInfo, error) {
+	// Create context with timeout - use longer timeout since this gets all services
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	args := []string{"get", "services", "--all-namespaces", "-o", "json"}
+	if kubeContext != "" {
+		args = append([]string{"--context", kubeContext}, args...)
 	}
 
-	cmd := exec.Command("kubectl", args...)
+	cmd := exec.CommandContext(ctx, "kubectl", args...)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -190,6 +227,88 @@ func getServicesInNamespace(context, namespace string) ([]ServiceInfo, error) {
 
 	err := cmd.Run()
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("kubectl get services --all-namespaces timed out after 60 seconds")
+		}
+		return nil, fmt.Errorf("kubectl get services --all-namespaces failed: %w (stderr: %s)", err, stderr.String())
+	}
+
+	// Parse JSON response
+	var serviceList K8sServiceList
+	err = json.Unmarshal(stdout.Bytes(), &serviceList)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse kubectl output: %w", err)
+	}
+
+	// Convert to our ServiceInfo format
+	var services []ServiceInfo
+	for _, k8sService := range serviceList.Items {
+		// Convert ports
+		var ports []ServicePort
+		for _, k8sPort := range k8sService.Spec.Ports {
+			targetPort := ""
+			if k8sPort.TargetPort != nil {
+				switch tp := k8sPort.TargetPort.(type) {
+				case float64:
+					targetPort = fmt.Sprintf("%.0f", tp)
+				case string:
+					targetPort = tp
+				default:
+					targetPort = fmt.Sprintf("%v", tp)
+				}
+			}
+
+			port := ServicePort{
+				Name:       k8sPort.Name,
+				Port:       k8sPort.Port,
+				TargetPort: targetPort,
+				Protocol:   k8sPort.Protocol,
+			}
+			ports = append(ports, port)
+		}
+
+		// Skip services without ports
+		if len(ports) == 0 {
+			continue
+		}
+
+		service := ServiceInfo{
+			Name:        k8sService.Metadata.Name,
+			Namespace:   k8sService.Metadata.Namespace,
+			Ports:       ports,
+			Labels:      k8sService.Metadata.Labels,
+			Annotations: k8sService.Metadata.Annotations,
+			Type:        k8sService.Spec.Type,
+		}
+
+		services = append(services, service)
+	}
+
+	return services, nil
+}
+
+// getServicesInNamespace retrieves all services from a specific namespace
+func getServicesInNamespace(kubeContext, namespace string) ([]ServiceInfo, error) {
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	args := []string{"get", "services", "-n", namespace, "-o", "json"}
+	if kubeContext != "" {
+		args = append([]string{"--context", kubeContext}, args...)
+	}
+
+	cmd := exec.CommandContext(ctx, "kubectl", args...)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("kubectl get services in namespace %s timed out after 30 seconds", namespace)
+		}
 		return nil, fmt.Errorf("kubectl get services failed: %w (stderr: %s)", err, stderr.String())
 	}
 

@@ -16,7 +16,7 @@ func (m Model) renderProjectSelector() string {
 		Foreground(lipgloss.Color(ColorTitle)).
 		Bold(true).
 		Padding(0, 1)
-	
+
 	b.WriteString(titleStyle.Render("📁 Project Selector"))
 	b.WriteString("\n\n")
 
@@ -35,7 +35,7 @@ func (m Model) renderProjectSelector() string {
 	// Action hints
 	helpStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color(ColorHelp))
-	
+
 	b.WriteString(helpStyle.Render(ActionProjectSelector))
 	b.WriteString("\n")
 

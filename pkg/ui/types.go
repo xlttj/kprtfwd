@@ -4,8 +4,12 @@ package ui
 type UIState int
 
 const (
-	StatePortForwards UIState = iota // Port forwards table view
-	StateProjectSelector             // Project selection view (Ctrl+P)
+	StatePortForwards            UIState = iota // Port forwards table view
+	StateProjectSelector                        // Project selection view (Ctrl+P)
+	StateServiceDiscovery                       // Service discovery view (Ctrl+D)
+	StateProjectManagement                      // Project management view
+	StateProjectCreation                        // Project creation form
+	StateProjectServiceSelection                // Add/remove services to/from project
 )
 
 // GroupState represents whether a group is expanded or collapsed
@@ -29,4 +33,49 @@ type TableRow struct {
 	ConfigIndex int    // Original config index, -1 for group headers
 	GroupName   string // Group name for group headers
 	Data        []string
+}
+
+// DiscoveryPhase represents the current phase of service discovery
+type DiscoveryPhase int
+
+const (
+	PhaseClusterSelection DiscoveryPhase = iota
+	PhaseServiceSelection
+)
+
+// ServiceSelection represents a service with selection state and customizable local port
+type ServiceSelection struct {
+	Service   DiscoveredServiceWithPorts
+	Selected  bool
+	LocalPort int
+}
+
+// PortSelection represents an individual port selection within a service
+type PortSelection struct {
+	ServiceName         string
+	ServiceNamespace    string
+	ServiceType         string
+	ServiceLabels       map[string]string
+	Port                ServicePortInfo
+	Selected            bool
+	LocalPort           int
+	GeneratedID         string
+	ExistingConfigIndex int // Index in config store if port already exists, -1 if new
+}
+
+// DiscoveredServiceWithPorts wraps discovery.DiscoveredService with additional UI state
+type DiscoveredServiceWithPorts struct {
+	Name      string
+	Namespace string
+	Ports     []ServicePortInfo
+	Labels    map[string]string
+	Type      string
+}
+
+// ServicePortInfo represents a port with UI-specific information
+type ServicePortInfo struct {
+	Name       string
+	Port       int32
+	TargetPort string
+	Protocol   string
 }

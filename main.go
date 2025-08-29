@@ -35,14 +35,14 @@ func main() {
 func handleDiscoverCommand() {
 	// Create a new flag set for the discover subcommand
 	discoverCmd := flag.NewFlagSet("discover", flag.ExitOnError)
-	
+
 	// Define flags
 	namespaceFilter := discoverCmd.String("namespace", "*", "Namespace filter with wildcard support (e.g., 'my-app-*')")
 	context := discoverCmd.String("context", "", "Kubernetes context to use (defaults to current context)")
 	outputFile := discoverCmd.String("o", "", "Output file (defaults to stdout)")
 	acceptAll := discoverCmd.Bool("y", false, "Accept all discovered services without prompting")
 	verbose := discoverCmd.Bool("v", false, "Verbose output")
-	
+
 	// Add usage information
 	discoverCmd.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s discover [options]\n\n", os.Args[0])
@@ -54,14 +54,14 @@ func handleDiscoverCommand() {
 		fmt.Fprintf(os.Stderr, "  %s discover --namespace 'production-*' -y -o config.yaml\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s discover --context local --namespace '*' -v\n", os.Args[0])
 	}
-	
+
 	// Parse the discover command arguments (skip the "discover" part)
 	err := discoverCmd.Parse(os.Args[2:])
 	if err != nil {
 		fmt.Printf("Error parsing arguments: %v\n", err)
 		os.Exit(1)
 	}
-	
+
 	// Set up discovery options
 	opts := discovery.Options{
 		NamespaceFilter: *namespaceFilter,
@@ -70,7 +70,7 @@ func handleDiscoverCommand() {
 		AcceptAll:       *acceptAll,
 		Verbose:         *verbose,
 	}
-	
+
 	if opts.Verbose {
 		fmt.Printf("🔍 Starting service discovery...\n")
 		fmt.Printf("   Context: %s\n", getContextDisplay(opts.Context))
@@ -78,7 +78,7 @@ func handleDiscoverCommand() {
 		fmt.Printf("   Accept all: %v\n", opts.AcceptAll)
 		fmt.Printf("   Output: %s\n\n", getOutputDisplay(opts.OutputFile))
 	}
-	
+
 	// Run the discovery process
 	err = discovery.RunDiscovery(opts)
 	if err != nil {

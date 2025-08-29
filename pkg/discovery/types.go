@@ -47,25 +47,25 @@ type DiscoveryResult struct {
 	NamespaceFilter string
 }
 
-// GenerateConfig creates a ConfigFile from selected services
-func (dr *DiscoveryResult) GenerateConfig() *config.ConfigFile {
+// GenerateConfig creates a list of PortForwardConfig from selected services
+func (dr *DiscoveryResult) GenerateConfig() []config.PortForwardConfig {
 	var portForwards []config.PortForwardConfig
-	
+
 	for _, discovered := range dr.Services {
 		if !discovered.Selected {
 			continue
 		}
-		
+
 		service := discovered.ServiceInfo
-		
+
 		// For each port on the service, create a port forward config
 		for _, port := range service.Ports {
 			// Try to determine a good local port
 			localPort := int(port.Port)
-			
+
 			// Generate a unique ID
 			id := generateServiceID(dr.Context, service, port)
-			
+
 			portForward := config.PortForwardConfig{
 				ID:         id,
 				Context:    dr.Context,
@@ -74,15 +74,12 @@ func (dr *DiscoveryResult) GenerateConfig() *config.ConfigFile {
 				PortRemote: int(port.Port),
 				PortLocal:  localPort,
 			}
-			
+
 			portForwards = append(portForwards, portForward)
 		}
 	}
-	
-	// Use the legacy field name to match existing config format
-	return &config.ConfigFile{
-		PortForwardsOld: portForwards,
-	}
+
+	return portForwards
 }
 
 // generateServiceID creates a human-readable ID following the pattern:
@@ -90,16 +87,16 @@ func (dr *DiscoveryResult) GenerateConfig() *config.ConfigFile {
 func generateServiceID(context string, service ServiceInfo, port ServicePort) string {
 	// Clean context name
 	contextPart := sanitizeIDPart(context)
-	
+
 	// Determine service type from labels, annotations, or service name
 	serviceType := detectServiceType(service)
-	
+
 	// Create discriminator from service name and optionally port name
 	discriminator := sanitizeIDPart(service.Name)
 	if port.Name != "" && port.Name != "http" && port.Name != "tcp" {
 		discriminator += "-" + sanitizeIDPart(port.Name)
 	}
-	
+
 	return contextPart + "." + serviceType + "." + discriminator
 }
 
@@ -107,7 +104,7 @@ func generateServiceID(context string, service ServiceInfo, port ServicePort) st
 func detectServiceType(service ServiceInfo) string {
 	serviceName := service.Name
 	labels := service.Labels
-	
+
 	// Check common service types in labels first
 	if labels != nil {
 		if app, exists := labels["app"]; exists {
@@ -120,7 +117,7 @@ func detectServiceType(service ServiceInfo) string {
 			return sanitizeIDPart(tier)
 		}
 	}
-	
+
 	// Fallback to parsing service name for common patterns
 	commonTypes := []string{
 		"mysql", "postgres", "postgresql", "redis", "mongodb", "mongo",
@@ -128,14 +125,14 @@ func detectServiceType(service ServiceInfo) string {
 		"api", "web", "frontend", "backend", "service", "app",
 		"grafana", "prometheus", "jaeger", "zipkin",
 	}
-	
+
 	nameLower := serviceName
 	for _, serviceType := range commonTypes {
 		if contains(nameLower, serviceType) {
 			return serviceType
 		}
 	}
-	
+
 	// Last resort: use "service" as default
 	return "service"
 }
@@ -145,9 +142,9 @@ func sanitizeIDPart(input string) string {
 	// Replace common separators and invalid characters with hyphens
 	result := ""
 	for _, char := range input {
-		if (char >= 'a' && char <= 'z') || 
-		   (char >= 'A' && char <= 'Z') || 
-		   (char >= '0' && char <= '9') {
+		if (char >= 'a' && char <= 'z') ||
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') {
 			result += string(char)
 		} else if char == '-' || char == '_' || char == '.' {
 			if len(result) > 0 && result[len(result)-1] != '-' {
@@ -155,25 +152,25 @@ func sanitizeIDPart(input string) string {
 			}
 		}
 	}
-	
+
 	// Remove trailing hyphens
 	for len(result) > 0 && result[len(result)-1] == '-' {
 		result = result[:len(result)-1]
 	}
-	
+
 	if result == "" {
 		result = "unknown"
 	}
-	
+
 	return result
 }
 
 func contains(str, substr string) bool {
-	return len(str) >= len(substr) && (str == substr || 
-		   (len(str) > len(substr) && 
-		    (str[:len(substr)] == substr || 
-		     str[len(str)-len(substr):] == substr ||
-		     findSubstring(str, substr))))
+	return len(str) >= len(substr) && (str == substr ||
+		(len(str) > len(substr) &&
+			(str[:len(substr)] == substr ||
+				str[len(str)-len(substr):] == substr ||
+				findSubstring(str, substr))))
 }
 
 func findSubstring(str, substr string) bool {

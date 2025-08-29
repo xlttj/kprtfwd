@@ -66,46 +66,10 @@ go build -o kprtfwd main.go
 
 ## ⚙️ Configuration
 
-Configuration is stored in `~/.kprtfwd/config.yaml`. The file will be created automatically on first run.
+kprtfwd stores its configuration in a local SQLite database at `~/.kprtfwd/kprtfwd.db`. The TUI manages configuration (adding/removing services, editing ports, managing projects), and changes are persisted automatically.
 
-### Basic Configuration Structure
-
-```yaml
-port_forwards:
-  - id: "local.redis"
-    context: "orbstack"
-    namespace: "redis"
-    service: "redis.redis"
-    port_remote: 6379
-    port_local: 6379
-    
-  - id: "staging.api"
-    context: "staging"
-    namespace: "default"
-    service: "api-service"
-    port_remote: 8080
-    port_local: 8080
-
-projects:
-  - name: "staging.my-project"
-    forwards:
-      - "local.redis"
-      - "staging.api"
-```
-
-### Configuration Fields
-
-#### Port Forward Fields
-- `id` - Unique identifier for the port forward (required)
-- `context` - Kubernetes context name (required)
-- `namespace` - Kubernetes namespace (required)
-- `service` - Service name to port-forward to (required)
-- `port_remote` - Remote port on the service (required)
-- `port_local` - Local port to bind to (required)
-
-#### Project Fields
-- `name` - Unique project name (required)
-- `forwards` - List of port forward IDs to include in this project (required)
+- No YAML files are used anymore for configuration.
+- Use Ctrl+R in the TUI to refresh the view; data is already persisted.
 
 ## 🔍 Service Discovery
 
@@ -206,16 +170,15 @@ kprtfwd discover --context prod --namespace 'monitoring-*' -y -o monitoring.yaml
 kprtfwd discover --context staging --namespace 'app-*'
 ```
 
-### Integration with Existing Configs
+### Exporting Discovered Services
 
-You can merge discovered services with your existing configuration:
+You can export discovered services to a JSON file for review or sharing:
 
 ```bash
-# Generate new services
-kprtfwd discover --namespace 'new-services-*' -o new-services.yaml
+# Export new services
+kprtfwd discover --namespace 'new-services-*' -o new-services.json
 
-# Manually merge with your existing ~/.kprtfwd/config.yaml
-# Or use the output as a starting point for new configurations
+# The TUI can add services directly to your local database from its discovery flow
 ```
 
 ## 🎮 Usage
@@ -224,7 +187,7 @@ kprtfwd discover --namespace 'new-services-*' -o new-services.yaml
 
 ```bash
 # Run from anywhere
-prtfwd
+kprtfwd
 
 # Or with debug logging
 DEBUG=1 kprtfwd
@@ -238,8 +201,8 @@ DEBUG=1 kprtfwd
 
 ### Quick Start Example
 
-1. Create a basic config in `~/.kprtfwd/config.yaml`
-2. Run `kprtfwd`
+1. Run `kprtfwd`
+2. Press Ctrl+D to open service discovery and add desired services
 3. Navigate to a port forward using arrow keys
 4. Press **Space** to start it
 5. Press **o** to open it in your browser (if it's HTTP)
@@ -551,50 +514,9 @@ The application validates your configuration on startup. Common validation error
 - **Invalid Project References**: Project forwards must reference existing port forward IDs
 - **Port Conflicts**: Multiple forwards can't use the same local port
 
-## 📄 Configuration Reference
+## 📄 Data Storage
 
-### Complete Configuration Example
-
-```yaml
-# Port forward definitions
-port_forwards:
-  - id: "local.redis"                    # Unique identifier
-    context: "docker-desktop"            # Kubernetes context  
-    namespace: "cache"                   # Kubernetes namespace
-    service: "redis"                     # Service name
-    port_remote: 6379                    # Port on the service
-    port_local: 6379                     # Local port to bind
-    
-  - id: "staging.api"
-    context: "staging-cluster"
-    namespace: "default"
-    service: "api-service"
-    port_remote: 8080
-    port_local: 8080
-
-# Project definitions (optional)
-projects:
-  - name: "local.development"            # Unique project name
-    forwards:                            # List of port forward IDs
-      - "local.redis"
-      - "staging.api"
-```
-
-### Legacy Configuration Support
-
-The application supports the old `portforwards` field name for backward compatibility:
-
-```yaml
-# Old format (still supported)
-portforwards:
-  - id: "old.service"
-    # ... rest of config
-
-# New format (preferred)
-port_forwards:
-  - id: "new.service"
-    # ... rest of config
-```
+kprtfwd persists your port forwards and projects in a local SQLite database at `~/.kprtfwd/kprtfwd.db`. You can manage all entries from within the TUI. The CLI discovery command can export discovered services to JSON for review, but configuration is no longer loaded from YAML files.
 
 ## 🤝 Contributing
 

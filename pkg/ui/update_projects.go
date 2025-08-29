@@ -27,6 +27,9 @@ func (m *Model) updateProjectSelector(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Select the highlighted project
 		return m.handleProjectSelection()
 
+	case "m":
+		// Enter project management mode
+		return m.enterProjectManagement()
 
 	case "up", "k":
 		// Move up in project list
@@ -45,18 +48,13 @@ func (m *Model) updateProjectSelector(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
-
 // initializeProjectSelector initializes the project selector table
 func (m *Model) initializeProjectSelector() {
 	projects := m.configStore.GetAllProjects()
 	activeProjectName := m.configStore.GetActiveProjectName()
 
-	// Create table columns for projects
-	columns := []table.Column{
-		{Title: "PROJECT", Width: 30},
-		{Title: "FORWARDS", Width: 15},
-		{Title: "ACTIVE", Width: 10},
-	}
+	// Create table columns for projects with dynamic widths
+	columns := m.calculateProjectSelectorColumns()
 
 	// Create table rows
 	rows := make([]table.Row, len(projects)+1) // +1 for "All Projects" option
@@ -103,10 +101,10 @@ func (m *Model) initializeProjectSelector() {
 // handleProjectSelection processes project selection
 func (m *Model) handleProjectSelection() (tea.Model, tea.Cmd) {
 	selectedIdx := m.projectSelector.Cursor()
-	
+
 	// Step 1: Stop all currently running port forwards
 	m.stopAllRunningPortForwards()
-	
+
 	if selectedIdx == 0 {
 		// "All Projects" selected - clear active project
 		m.configStore.ClearActiveProject()
@@ -122,13 +120,13 @@ func (m *Model) handleProjectSelection() (tea.Model, tea.Cmd) {
 			} else {
 				// Step 2: Start all port forwards in the selected project
 				startedCount, startErrors := m.startProjectPortForwards(selectedProject)
-				
+
 				if len(startErrors) > 0 {
-					m.errorMsg = fmt.Sprintf("Project '%s' activated, started %d/%d forwards. Errors: %s", 
-						selectedProject.Name, startedCount, len(selectedProject.Forwards), 
+					m.errorMsg = fmt.Sprintf("Project '%s' activated, started %d/%d forwards. Errors: %s",
+						selectedProject.Name, startedCount, len(selectedProject.Forwards),
 						startErrors[0]) // Show first error
 				} else {
-					m.statusMsg = fmt.Sprintf("Project '%s' activated, started %d forwards", 
+					m.statusMsg = fmt.Sprintf("Project '%s' activated, started %d forwards",
 						selectedProject.Name, startedCount)
 				}
 			}
@@ -140,7 +138,6 @@ func (m *Model) handleProjectSelection() (tea.Model, tea.Cmd) {
 	m.uiState = StatePortForwards
 	return m, nil
 }
-
 
 // enterProjectSelector switches to project selector view
 func (m *Model) enterProjectSelector() (tea.Model, tea.Cmd) {
@@ -155,7 +152,7 @@ func (m *Model) enterProjectSelector() (tea.Model, tea.Cmd) {
 func (m *Model) stopAllRunningPortForwards() {
 	allConfigs := m.configStore.GetAll()
 	stoppedCount := 0
-	
+
 	for i := range allConfigs {
 		if m.portForwarder.IsRunning(i) {
 			err := m.portForwarder.Stop(i)
@@ -167,7 +164,7 @@ func (m *Model) stopAllRunningPortForwards() {
 			}
 		}
 	}
-	
+
 	if stoppedCount > 0 {
 		logging.LogDebug("Stopped %d running port forwards during project selection", stoppedCount)
 	}
@@ -178,12 +175,12 @@ func (m *Model) stopAllRunningPortForwards() {
 func (m *Model) startProjectPortForwards(project config.Project) (int, []string) {
 	startedCount := 0
 	var errorMessages []string
-	
+
 	logging.LogDebug("Project '%s': Starting %d port forwards: %v", project.Name, len(project.Forwards), project.Forwards)
-	
+
 	for _, forwardID := range project.Forwards {
 		logging.LogDebug("Project '%s': Processing forward ID '%s'", project.Name, forwardID)
-		
+
 		// Get the config index for this forward ID
 		index, found := m.configStore.GetIndexByID(forwardID)
 		if !found {
@@ -193,14 +190,14 @@ func (m *Model) startProjectPortForwards(project config.Project) (int, []string)
 			continue
 		}
 		logging.LogDebug("Project '%s': Found forward ID '%s' at index %d", project.Name, forwardID, index)
-		
+
 		// Check if already running
 		if m.portForwarder.IsRunning(index) {
 			logging.LogDebug("Project '%s': Forward '%s' (index %d) is already running, skipping", project.Name, forwardID, index)
 			startedCount++
 			continue
 		}
-		
+
 		// Get the config for starting the port forward
 		cfg, err := m.configStore.GetWithError(index)
 		if err != nil {
@@ -210,7 +207,7 @@ func (m *Model) startProjectPortForwards(project config.Project) (int, []string)
 			continue
 		}
 		logging.LogDebug("Project '%s': Retrieved config for '%s' (index %d): %s:%d -> %s:%d", project.Name, forwardID, index, cfg.Context, cfg.PortLocal, cfg.Service, cfg.PortRemote)
-		
+
 		// Start the port forward
 		logging.LogDebug("Project '%s': Attempting to start '%s' (index %d)", project.Name, forwardID, index)
 		err = m.portForwarder.Start(index, cfg)
@@ -221,7 +218,7 @@ func (m *Model) startProjectPortForwards(project config.Project) (int, []string)
 		} else {
 			startedCount++
 			logging.LogDebug("Project '%s': Successfully started port forward '%s' (index %d)", project.Name, forwardID, index)
-			
+
 			// Verify it's actually running
 			if m.portForwarder.IsRunning(index) {
 				logging.LogDebug("Project '%s': Verified '%s' (index %d) is running", project.Name, forwardID, index)
@@ -230,7 +227,7 @@ func (m *Model) startProjectPortForwards(project config.Project) (int, []string)
 			}
 		}
 	}
-	
+
 	logging.LogDebug("Project '%s': Finished starting port forwards. Started %d/%d successfully", project.Name, startedCount, len(project.Forwards))
 	return startedCount, errorMessages
 }
