@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"strings"
 
-	"kprtfwd/pkg/config"
-	"kprtfwd/pkg/discovery"
-	"kprtfwd/pkg/logging"
+	"github.com/xlttj/kprtfwd/pkg/config"
+	"github.com/xlttj/kprtfwd/pkg/discovery"
+	"github.com/xlttj/kprtfwd/pkg/logging"
 
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textinput"

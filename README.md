@@ -36,8 +36,8 @@ A terminal-based UI application for managing Kubernetes port forwards with proje
 ### Homebrew (macOS) - Recommended
 
 ```bash
-brew tap xlttj/kprtfwd
-brew install kprtfwd
+brew tap xlttj/tap
+brew install xlttj/tap/kprtfwd
 ```
 
 ### Go Install

@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"os"
 
-	"kprtfwd/pkg/cmd"
-	"kprtfwd/pkg/logging"
-	"kprtfwd/pkg/ui"
+	"github.com/xlttj/kprtfwd/pkg/cmd"
+	"github.com/xlttj/kprtfwd/pkg/logging"
+	"github.com/xlttj/kprtfwd/pkg/ui"
 
 	tea "github.com/charmbracelet/bubbletea"
 )

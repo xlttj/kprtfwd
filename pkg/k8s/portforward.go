@@ -9,8 +9,8 @@ import (
 	"strings"
 	"sync"
 
-	"kprtfwd/pkg/config"
-	"kprtfwd/pkg/logging"
+	"github.com/xlttj/kprtfwd/pkg/config"
+	"github.com/xlttj/kprtfwd/pkg/logging"
 )
 
 // Sentinel error for port conflict

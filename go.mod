@@ -1,4 +1,4 @@
-module kprtfwd
+module github.com/xlttj/kprtfwd
 
 go 1.24.2
 

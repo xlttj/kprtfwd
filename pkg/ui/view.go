@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"kprtfwd/pkg/logging"
+	"github.com/xlttj/kprtfwd/pkg/logging"
 
 	"github.com/charmbracelet/lipgloss"
 )

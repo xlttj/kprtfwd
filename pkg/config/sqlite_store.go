@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"kprtfwd/pkg/logging"
+	"github.com/xlttj/kprtfwd/pkg/logging"
 
 	_ "modernc.org/sqlite"
 )

@@ -3,8 +3,8 @@ package ui
 import (
 	"fmt"
 
-	"kprtfwd/pkg/config"
-	"kprtfwd/pkg/logging"
+	"github.com/xlttj/kprtfwd/pkg/config"
+	"github.com/xlttj/kprtfwd/pkg/logging"
 
 	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"

@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"kprtfwd/pkg/logging"
+	"github.com/xlttj/kprtfwd/pkg/logging"
 )
 
 // RunDiscovery orchestrates the complete discovery process

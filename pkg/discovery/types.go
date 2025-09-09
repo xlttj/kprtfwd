@@ -1,7 +1,7 @@
 package discovery
 
 import (
-	"kprtfwd/pkg/config"
+	"github.com/xlttj/kprtfwd/pkg/config"
 )
 
 // Options holds the configuration for service discovery

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"kprtfwd/pkg/logging"
+	"github.com/xlttj/kprtfwd/pkg/logging"
 )
 
 // K8sService represents the JSON structure returned by kubectl get services

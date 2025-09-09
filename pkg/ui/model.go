@@ -6,9 +6,9 @@ import (
 	"runtime"
 	"strings"
 
-	"kprtfwd/pkg/config"
-	"kprtfwd/pkg/k8s"
-	"kprtfwd/pkg/logging"
+	"github.com/xlttj/kprtfwd/pkg/config"
+	"github.com/xlttj/kprtfwd/pkg/k8s"
+	"github.com/xlttj/kprtfwd/pkg/logging"
 
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textinput"

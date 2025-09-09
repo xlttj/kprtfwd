@@ -7,8 +7,8 @@ import (
 	"os"
 	"strings"
 
-	"kprtfwd/pkg/config"
-	"kprtfwd/pkg/discovery"
+	"github.com/xlttj/kprtfwd/pkg/config"
+	"github.com/xlttj/kprtfwd/pkg/discovery"
 )
 
 // HandlePruneCommand handles the prune subcommand logic
