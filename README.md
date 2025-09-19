@@ -11,7 +11,7 @@ A terminal-based UI application for managing Kubernetes port forwards with proje
 - **Context Grouping** - Organize port forwards by Kubernetes context
 - **Real-time Status** - See which port forwards are actually running
 - **Smart Filtering** - Search and filter port forwards by any field
-- **Configuration Reload** - Hot-reload config changes without restart
+- **Port Forward Restart** - Restart running port forwards when connectivity is lost
 - **Cross-platform** - Works on macOS, Linux, and Windows
 
 ## 📋 Table of Contents
@@ -168,7 +168,7 @@ You create and manage projects entirely in the TUI:
 | **g** | Toggle between grouped/ungrouped view |
 | **/** | Enter filter mode |
 | **Ctrl+P** | Open project selector |
-| **Ctrl+R** | Reload configuration |
+|| **Ctrl+R** | Restart running port forwards |
 | **q** | Quit application |
 | **Esc** | Clear active filter |
 
@@ -215,11 +215,11 @@ You create and manage projects entirely in the TUI:
 - Works with both grouped and ungrouped views
 - Respects active project filtering
 
-### 5. Configuration Hot-reload
-- Press **Ctrl+R** to reload config without restarting
-- Automatically handles additions, removals, and changes
-- Smart synchronization keeps running forwards that haven't changed
-- Shows detailed summary of changes
+### 5. Port Forward Restart
+- Press **Ctrl+R** to restart all running port forwards
+- Useful when network connectivity is lost (e.g., VPN disconnect)
+- Stops and restarts all currently active port forwards
+- Shows summary of restarted forwards and any errors
 
 ### 6. Error Handling
 - Clear error messages for common issues

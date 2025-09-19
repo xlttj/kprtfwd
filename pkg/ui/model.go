@@ -540,45 +540,33 @@ func (m *Model) applyFilter() {
 	}
 }
 
-// handleConfigReload processes Ctrl+R reload request
-func (m *Model) handleConfigReload() (tea.Model, tea.Cmd) {
+// handlePortForwardsRestart processes Ctrl+R restart request
+func (m *Model) handlePortForwardsRestart() (tea.Model, tea.Cmd) {
 	// Clear previous messages
 	m.errorMsg = ""
 	m.statusMsg = ""
 
-	// 1. Attempt config reload
-	err := m.configStore.Reload()
-	if err != nil {
-		m.errorMsg = fmt.Sprintf("Config reload failed: %v", err)
-		return m, nil
-	}
+	// Get current configurations
+	configs := m.configStore.GetAll()
 
-	// 2. Get old and new configurations
-	oldConfigs := m.configStore.GetPrevious()
-	newConfigs := m.configStore.GetAll()
+	// Restart all running port forwards
+	result := m.portForwarder.RestartRunningForwards(configs)
 
-	// 3. Perform smart sync
-	result, err := m.portForwarder.ReloadSync(oldConfigs, newConfigs)
-	if err != nil {
-		m.errorMsg = fmt.Sprintf("Reload sync failed: %v", err)
-		return m, nil
-	}
-
-	// 4. Update UI state
+	// Update UI state to reflect any changes
 	m.refreshTable()
 
-	// 5. Show reload summary - use appropriate message field
+	// Show restart summary
 	if len(result.Errors) > 0 {
-		m.errorMsg = m.formatReloadSummary(result)
+		m.errorMsg = m.formatRestartSummary(result)
 	} else {
-		m.statusMsg = m.formatReloadSummary(result)
+		m.statusMsg = m.formatRestartSummary(result)
 	}
 
 	return m, nil
 }
 
-// formatReloadSummary creates user-friendly reload summary
-func (m *Model) formatReloadSummary(result *k8s.ReloadResult) string {
+// formatRestartSummary creates user-friendly restart summary
+func (m *Model) formatRestartSummary(result *k8s.RestartResult) string {
 	if len(result.Errors) > 0 {
 		// Show errors first
 		errorMsgs := []string{}
@@ -589,26 +577,15 @@ func (m *Model) formatReloadSummary(result *k8s.ReloadResult) string {
 				errorMsgs = append(errorMsgs, fmt.Sprintf("Index %d: %v", idx, err))
 			}
 		}
-		return fmt.Sprintf("Reload errors: %s", strings.Join(errorMsgs, "; "))
+		return fmt.Sprintf("Restart errors: %s", strings.Join(errorMsgs, "; "))
 	}
 
-	// Show successful reload summary
-	parts := []string{}
-	if len(result.Stopped) > 0 {
-		parts = append(parts, fmt.Sprintf("%d stopped", len(result.Stopped)))
-	}
-	if len(result.Started) > 0 {
-		parts = append(parts, fmt.Sprintf("%d started", len(result.Started)))
-	}
-	if len(result.Updated) > 0 {
-		parts = append(parts, fmt.Sprintf("%d updated", len(result.Updated)))
+	// Show successful restart summary
+	if result.RestartedCount == 0 {
+		return "No running port forwards to restart"
 	}
 
-	if len(parts) > 0 {
-		return fmt.Sprintf("Config reloaded: %s", strings.Join(parts, ", "))
-	} else {
-		return "Config reloaded: no changes needed"
-	}
+	return fmt.Sprintf("Restarted %d port forward(s)", result.RestartedCount)
 }
 
 // openInBrowser opens the HTTP URL for the given port forward configuration

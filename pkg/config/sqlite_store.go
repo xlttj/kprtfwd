@@ -574,16 +574,6 @@ func (cs *SQLiteConfigStore) Load() error {
 	return nil
 }
 
-// Reload is a no-op for SQLite (no file to reload)
-func (cs *SQLiteConfigStore) Reload() error {
-	return nil
-}
-
-// GetPrevious returns empty slice (no previous configs concept in SQLite)
-func (cs *SQLiteConfigStore) GetPrevious() []PortForwardConfig {
-	return nil
-}
-
 // Save is a no-op for SQLite (changes are immediately persisted)
 func (cs *SQLiteConfigStore) Save() error {
 	return nil
