@@ -31,8 +31,6 @@ type ConfigStoreInterface interface {
 
 	// Compatibility methods
 	Load() error
-	Reload() error
-	GetPrevious() []PortForwardConfig
 	Save() error
 }
 

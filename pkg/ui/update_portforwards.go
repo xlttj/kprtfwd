@@ -215,9 +215,9 @@ func (m *Model) updatePortForwards(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.editInput.Focus()
 			m.portForwardsTable.Blur()
 			return m, nil
-		case ShortcutReloadConfig: // ctrl+r
+		case ShortcutRestartForwards: // ctrl+r
 			m.errorMsg = "" // Clear any previous errors
-			return m.handleConfigReload()
+			return m.handlePortForwardsRestart()
 		case ShortcutProjects: // ctrl+p
 			// Switch to project selector
 			return m.enterProjectSelector()

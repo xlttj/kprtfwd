@@ -354,128 +354,63 @@ func (pf *PortForwarder) CleanupAll() {
 	logging.LogDebug("CleanupAll finished.")
 }
 
-// ReloadResult represents the outcome of a configuration reload operation
-type ReloadResult struct {
-	Stopped []int         // Indices of stopped port forwards
-	Started []int         // Indices of started port forwards
-	Updated []int         // Indices of updated port forwards
-	Errors  map[int]error // Errors by config index
+// RestartResult represents the outcome of a restart operation
+type RestartResult struct {
+	RestartedCount int           // Number of port forwards restarted
+	Errors         map[int]error // Errors by config index
 }
 
-// ReloadSync performs intelligent synchronization during config reload
-// Returns changes made and any errors
-func (pf *PortForwarder) ReloadSync(oldConfigs, newConfigs []config.PortForwardConfig) (*ReloadResult, error) {
+// RestartRunningForwards restarts all currently running port forwards
+// This is useful when network connectivity is lost (e.g., VPN disconnect)
+func (pf *PortForwarder) RestartRunningForwards(configs []config.PortForwardConfig) *RestartResult {
 	pf.Mutex.Lock()
 	defer pf.Mutex.Unlock()
 
-	result := &ReloadResult{
-		Stopped: []int{},
-		Started: []int{},
-		Updated: []int{},
-		Errors:  make(map[int]error),
+	result := &RestartResult{
+		RestartedCount: 0,
+		Errors:         make(map[int]error),
 	}
 
-	logging.LogDebug("ReloadSync: Starting with %d old configs, %d new configs", len(oldConfigs), len(newConfigs))
-
-	// Debug: Log all old and new configs
-	for i, cfg := range oldConfigs {
-		logging.LogDebug("OLD Config[%d]: ID=%s, Context=%s, NS=%s, Svc=%s, Ports=%d:%d",
-			i, cfg.ID, cfg.Context, cfg.Namespace, cfg.Service, cfg.PortLocal, cfg.PortRemote)
-	}
-	for i, cfg := range newConfigs {
-		logging.LogDebug("NEW Config[%d]: ID=%s, Context=%s, NS=%s, Svc=%s, Ports=%d:%d",
-			i, cfg.ID, cfg.Context, cfg.Namespace, cfg.Service, cfg.PortLocal, cfg.PortRemote)
+	// Get a snapshot of currently running indices
+	runningIndices := []int{}
+	for index := range pf.RunningForwards {
+		runningIndices = append(runningIndices, index)
 	}
 
-	// Use a simpler approach: direct positional comparison but with smarter logic
-	// This avoids issues with duplicate configs having the same identity keys
+	logging.LogDebug("RestartRunningForwards: Found %d running port forwards to restart", len(runningIndices))
 
-	// Phase 1: Handle configs that exist in both old and new by index
-	maxLen := max(len(oldConfigs), len(newConfigs))
-	for i := 0; i < maxLen; i++ {
-		var oldCfg *config.PortForwardConfig
-		var newCfg *config.PortForwardConfig
-
-		if i < len(oldConfigs) {
-			oldCfg = &oldConfigs[i]
+	// Restart each running port forward
+	for _, index := range runningIndices {
+		// Get the config for this index
+		if index >= len(configs) {
+			logging.LogError("RestartRunningForwards: Index %d is out of bounds (configs length: %d)", index, len(configs))
+			result.Errors[index] = fmt.Errorf("index %d out of bounds", index)
+			continue
 		}
-		if i < len(newConfigs) {
-			newCfg = &newConfigs[i]
+		cfg := configs[index]
+
+		logging.LogDebug("RestartRunningForwards: Restarting port forward %d (%s)", index, cfg.Service)
+
+		// Stop the current port forward
+		stopErr := pf.stopInternal(index)
+		if stopErr != nil {
+			logging.LogError("RestartRunningForwards: Failed to stop port forward %d: %v", index, stopErr)
+			result.Errors[index] = fmt.Errorf("failed to stop: %w", stopErr)
+			continue
 		}
 
-		if oldCfg != nil && newCfg != nil {
-			// Both old and new exist - check for changes
-			paramsChanged := configParamsChanged(*oldCfg, *newCfg)
-			logging.LogDebug("ReloadSync: configParamsChanged(%d) = %v", i, paramsChanged)
-			if paramsChanged {
-				// Core parameters changed - need to restart if currently running
-				logging.LogDebug("ReloadSync: Core parameters changed for index %d", i)
-				if _, isRunning := pf.RunningForwards[i]; isRunning {
-					logging.LogDebug("ReloadSync: Parameters changed for index %d, stopping old version", i)
-					err := pf.stopInternal(i)
-					if err != nil {
-						result.Errors[i] = fmt.Errorf("failed to stop changed config: %w", err)
-					} else {
-						result.Stopped = append(result.Stopped, i)
-					}
-				}
-				// Don't auto-start the new version - user controls runtime state via UI
-				logging.LogDebug("ReloadSync: Config parameters updated at index %d (user can restart via UI)", i)
-				result.Updated = append(result.Updated, i)
-			} else {
-				// Core parameters unchanged - preserve current runtime state
-				logging.LogDebug("ReloadSync: Config at index %d unchanged - preserving current runtime state", i)
-				// No action taken - preserve whatever is currently running
-			}
-		} else if oldCfg != nil {
-			// Old config exists but new doesn't - config was removed
-			if _, isRunning := pf.RunningForwards[i]; isRunning {
-				logging.LogDebug("ReloadSync: Config removed at index %d, stopping running forward", i)
-				err := pf.stopInternal(i)
-				if err != nil {
-					result.Errors[i] = fmt.Errorf("failed to stop removed config: %w", err)
-				} else {
-					result.Stopped = append(result.Stopped, i)
-				}
-			} else {
-				logging.LogDebug("ReloadSync: Config removed at index %d (was not running)", i)
-			}
-		} else if newCfg != nil {
-			// New config exists but old doesn't - config was added
-			logging.LogDebug("ReloadSync: New config added at index %d (user can start via UI)", i)
-			// Don't auto-start new configs - user controls runtime state via UI
+		// Start it again with the same config
+		startErr := pf.startInternal(index, cfg)
+		if startErr != nil {
+			logging.LogError("RestartRunningForwards: Failed to start port forward %d: %v", index, startErr)
+			result.Errors[index] = fmt.Errorf("failed to restart: %w", startErr)
+			continue
 		}
+
+		result.RestartedCount++
+		logging.LogDebug("RestartRunningForwards: Successfully restarted port forward %d (%s)", index, cfg.Service)
 	}
 
-	logging.LogDebug("ReloadSync: Complete - Stopped: %d, Started: %d, Updated: %d, Errors: %d",
-		len(result.Stopped), len(result.Started), len(result.Updated), len(result.Errors))
-	return result, nil
-}
-
-// configParamsChanged checks if the core parameters of a config changed (excluding status)
-func configParamsChanged(old, new config.PortForwardConfig) bool {
-	return old.Context != new.Context ||
-		old.Namespace != new.Namespace ||
-		old.Service != new.Service ||
-		old.PortRemote != new.PortRemote ||
-		old.PortLocal != new.PortLocal ||
-		old.ID != new.ID
-}
-
-// configsExactlyEqual checks if two configs are completely identical
-func configsExactlyEqual(old, new config.PortForwardConfig) bool {
-	return old.Context == new.Context &&
-		old.Namespace == new.Namespace &&
-		old.Service == new.Service &&
-		old.PortRemote == new.PortRemote &&
-		old.PortLocal == new.PortLocal &&
-		old.ID == new.ID
-}
-
-// configIdentityKey creates a unique identity key for a config based on its core parameters
-// This key is used to match configs across reloads regardless of their position in the array
-// Note: For configs to be considered "the same", they must have identical parameters
-func configIdentityKey(cfg config.PortForwardConfig) string {
-	return fmt.Sprintf("%s|%s|%s|%d|%d|%s",
-		cfg.Context, cfg.Namespace, cfg.Service, cfg.PortRemote, cfg.PortLocal, cfg.ID)
+	logging.LogDebug("RestartRunningForwards: Complete - Restarted: %d, Errors: %d", result.RestartedCount, len(result.Errors))
+	return result
 }

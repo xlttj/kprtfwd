@@ -48,4 +48,3 @@ func main() {
 	}
 	model.Cleanup() // if needed
 }
-
