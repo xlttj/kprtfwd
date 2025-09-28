@@ -142,9 +142,9 @@ func (m *Model) generateGroupedRows(configs []config.PortForwardConfig) []table.
 		state := m.groupStates[groupName]
 
 		// Add group header row
-		expandIcon := "▼"
+		expandIcon := ExpanderExpanded
 		if !state.Expanded {
-			expandIcon = "▶"
+			expandIcon = ExpanderCollapsed
 		}
 
 		groupStatus := fmt.Sprintf("%d total, %d active", state.Count, state.Active)
