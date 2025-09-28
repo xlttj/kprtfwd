@@ -57,102 +57,100 @@ func (m *Model) updateServiceDiscovery(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// Handle keys based on current discovery phase
+	switch m.discoveryPhase {
+	case PhaseClusterSelection:
+		return m.handleClusterSelectionKeys(keyStr, msg)
+	case PhaseServiceSelection:
+		return m.handleServiceSelectionKeys(keyStr, msg)
+	}
+
+	return m, nil
+}
+
+// handleClusterSelectionKeys handles key input during cluster selection phase
+func (m *Model) handleClusterSelectionKeys(keyStr string, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch keyStr {
 	case "esc":
-		if m.discoveryPhase == PhaseClusterSelection {
-			// Return to port forwards view
-			m.uiState = StatePortForwards
-			m.errorMsg = ""
-			m.statusMsg = ""
-			return m, nil
-		} else if m.discoveryPhase == PhaseServiceSelection {
-			// Return to cluster selection
-			m.discoveryPhase = PhaseClusterSelection
-			m.initializeClusterSelection()
-			return m, nil
-		}
+		// Return to port forwards view
+		m.uiState = StatePortForwards
+		m.errorMsg = ""
+		m.statusMsg = ""
+		return m, nil
 
 	case "enter":
-		if m.discoveryPhase == PhaseClusterSelection {
-			// Select cluster and move to service discovery
-			return m.handleClusterSelection()
-		} else if m.discoveryPhase == PhaseServiceSelection {
-			// Confirm service selection and add to config
-			return m.handleServiceSelectionConfirm()
-		}
-
-	case " ", "space": // Space key for toggling service selection (handle both variants)
-		if m.discoveryPhase == PhaseServiceSelection {
-			return m.handleServiceToggle()
-		}
-
-	case "/": // Filter for services
-		if m.discoveryPhase == PhaseServiceSelection {
-			m.errorMsg = ""
-			m.statusMsg = ""
-			m.discoveryFilterMode = true
-			m.discoveryFilterInput.Focus()
-			m.discoveryTable.Blur()
-			return m, nil
-		}
-
-	case "e": // Edit local port
-		if m.discoveryPhase == PhaseServiceSelection {
-			// Check if the selected port is an existing configuration
-			selectedIdx := m.discoveryTable.Cursor()
-			ports := m.discoveryPorts
-			if m.discoveryFilterInput.Value() != "" {
-				ports = m.applyDiscoveryPortFilter()
-			}
-
-			if selectedIdx < len(ports) {
-				// Find the actual port in the full list
-				var targetPort *PortSelection
-				if m.discoveryFilterInput.Value() != "" {
-					selectedPort := ports[selectedIdx]
-					for i := range m.discoveryPorts {
-						if m.discoveryPorts[i].GeneratedID == selectedPort.GeneratedID {
-							targetPort = &m.discoveryPorts[i]
-							break
-						}
-					}
-				} else {
-					targetPort = &m.discoveryPorts[selectedIdx]
-				}
-
-				// Prevent editing if this is an existing configuration
-				if targetPort != nil && targetPort.ExistingConfigIndex != -1 {
-					m.errorMsg = "Cannot edit local port: This service already exists in configuration. Edit it from the main view instead."
-					return m, nil
-				}
-			}
-
-			return m.handleDiscoveryEditStart()
-		}
-
-	case "up", "k", "down", "j":
-		// Let the table handle navigation for both phases
-		if m.discoveryPhase == PhaseClusterSelection {
-			// Cluster selection navigation
-			var cmd tea.Cmd
-			m.discoveryTable, cmd = m.discoveryTable.Update(msg)
-			return m, cmd
-		} else if m.discoveryPhase == PhaseServiceSelection && !m.discoveryEditMode {
-			// Service selection navigation (only if not in edit mode)
-			var cmd tea.Cmd
-			m.discoveryTable, cmd = m.discoveryTable.Update(msg)
-			return m, cmd
-		}
+		// Select cluster and move to service discovery
+		return m.handleClusterSelection()
 
 	default:
-		// Let the table handle other keys for cluster selection or service selection (if not in edit mode)
-		if m.discoveryPhase == PhaseClusterSelection {
-			// Allow table to handle any other navigation keys during cluster selection
-			var cmd tea.Cmd
-			m.discoveryTable, cmd = m.discoveryTable.Update(msg)
-			return m, cmd
-		} else if m.discoveryPhase == PhaseServiceSelection && !m.discoveryEditMode {
-			// Allow table to handle other keys during service selection (if not in edit mode)
+		// Let the table handle navigation and other keys
+		var cmd tea.Cmd
+		m.discoveryTable, cmd = m.discoveryTable.Update(msg)
+		return m, cmd
+	}
+}
+
+// handleServiceSelectionKeys handles key input during service selection phase
+func (m *Model) handleServiceSelectionKeys(keyStr string, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch keyStr {
+	case "esc":
+		// Return to cluster selection
+		m.discoveryPhase = PhaseClusterSelection
+		m.initializeClusterSelection()
+		return m, nil
+
+	case "enter":
+		// Confirm service selection and add to config
+		return m.handleServiceSelectionConfirm()
+
+	case " ", "space":
+		// Toggle service selection
+		return m.handleServiceToggle()
+
+	case "/":
+		// Enter filter mode
+		m.errorMsg = ""
+		m.statusMsg = ""
+		m.discoveryFilterMode = true
+		m.discoveryFilterInput.Focus()
+		m.discoveryTable.Blur()
+		return m, nil
+
+	case "e":
+		// Edit local port
+		selectedIdx := m.discoveryTable.Cursor()
+		ports := m.discoveryPorts
+		if m.discoveryFilterInput.Value() != "" {
+			ports = m.applyDiscoveryPortFilter()
+		}
+
+		if selectedIdx < len(ports) {
+			// Find the actual port in the full list
+			var targetPort *PortSelection
+			if m.discoveryFilterInput.Value() != "" {
+				selectedPort := ports[selectedIdx]
+				for i := range m.discoveryPorts {
+					if m.discoveryPorts[i].GeneratedID == selectedPort.GeneratedID {
+						targetPort = &m.discoveryPorts[i]
+						break
+					}
+				}
+			} else {
+				targetPort = &m.discoveryPorts[selectedIdx]
+			}
+
+			// Prevent editing if this is an existing configuration
+			if targetPort != nil && targetPort.ExistingConfigIndex != -1 {
+				m.errorMsg = "Cannot edit local port: This service already exists in configuration. Edit it from the main view instead."
+				return m, nil
+			}
+		}
+
+		return m.handleDiscoveryEditStart()
+
+	default:
+		// Let the table handle navigation and other keys (only if not in edit mode)
+		if !m.discoveryEditMode {
 			var cmd tea.Cmd
 			m.discoveryTable, cmd = m.discoveryTable.Update(msg)
 			return m, cmd
@@ -223,9 +221,9 @@ func (m *Model) initializeClusterSelection() error {
 	// Create table rows for clusters
 	rows := make([]table.Row, len(clusters))
 	for i, cluster := range clusters {
-		status := ""
+		status := IndicatorUnselected
 		if i == m.discoverySelectedCluster {
-			status = "●"
+			status = IndicatorSelected
 		}
 		rows[i] = table.Row{cluster, status}
 	}
@@ -377,9 +375,9 @@ func (m *Model) initializeServiceSelectionTable() {
 	// Create table rows for individual ports
 	rows := make([]table.Row, len(ports))
 	for i, port := range ports {
-		checkbox := "□"
+		checkbox := CheckboxUnchecked
 		if port.Selected {
-			checkbox = "☑"
+			checkbox = CheckboxChecked
 		}
 
 		// Create service:port display name
