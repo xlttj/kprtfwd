@@ -282,7 +282,3 @@ func (m *Model) refreshTable() {
 	}
 }
 
-// getBaseConfigs returns the base set of configs respecting active project
-func (m *Model) getBaseConfigs() []config.PortForwardConfig {
-	return m.configStore.GetActiveProjectForwards()
-}
