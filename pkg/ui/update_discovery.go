@@ -223,7 +223,7 @@ func (m *Model) initializeClusterSelection() error {
 	for i, cluster := range clusters {
 		status := IndicatorUnselected
 		if i == m.discoverySelectedCluster {
-			status = IndicatorSelected
+			status = lipgloss.NewStyle().Foreground(lipgloss.Color(ColorActive)).Render(IndicatorSelected)
 		}
 		rows[i] = table.Row{cluster, status}
 	}
@@ -377,7 +377,7 @@ func (m *Model) initializeServiceSelectionTable() {
 	for i, port := range ports {
 		checkbox := CheckboxUnchecked
 		if port.Selected {
-			checkbox = CheckboxChecked
+			checkbox = lipgloss.NewStyle().Foreground(lipgloss.Color(ColorActive)).Render(CheckboxChecked)
 		}
 
 		// Create service:port display name
