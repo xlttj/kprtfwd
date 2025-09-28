@@ -8,7 +8,16 @@ import (
 	"github.com/xlttj/kprtfwd/pkg/logging"
 
 	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/lipgloss"
 )
+
+// styleStatusText applies color styling to status text
+func styleStatusText(status string) string {
+	if status == StatusRunning {
+		return lipgloss.NewStyle().Foreground(lipgloss.Color(ColorActive)).Render(status)
+	}
+	return status
+}
 
 // generatePortForwardRows converts config slice to table.Row slice (ungrouped)
 func (m *Model) generatePortForwardRows(configs []config.PortForwardConfig) []table.Row {
@@ -50,7 +59,7 @@ func (m *Model) generatePortForwardRows(configs []config.PortForwardConfig) []ta
 			cfg.Service,
 			fmt.Sprintf("%d", cfg.PortRemote),
 			fmt.Sprintf("%d", cfg.PortLocal),
-			statusText,
+			styleStatusText(statusText),
 		})
 	}
 	return rows
@@ -184,7 +193,7 @@ func (m *Model) generateGroupedRows(configs []config.PortForwardConfig) []table.
 					indentedService,
 					fmt.Sprintf("%d", cfg.PortRemote),
 					fmt.Sprintf("%d", cfg.PortLocal),
-					statusText,
+					styleStatusText(statusText),
 				}
 				tableRows = append(tableRows, itemRow)
 				m.tableRows = append(m.tableRows, TableRow{
