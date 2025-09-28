@@ -38,6 +38,21 @@ const (
 	StatusRunning = "Running"
 )
 
+// ASCII Visual Indicators - Compatible across all terminals
+const (
+	// Checkbox symbols
+	CheckboxUnchecked = "[ ]"
+	CheckboxChecked   = "[X]"
+
+	// Selection indicators
+	IndicatorUnselected = "( )"
+	IndicatorSelected   = "(*)"
+
+	// Group expansion indicators
+	ExpanderCollapsed = "[-]"
+	ExpanderExpanded  = "[+]"
+)
+
 // Lipgloss Colors
 const (
 	ColorBorder     = "240"
@@ -46,4 +61,5 @@ const (
 	ColorTitle      = "14"  // Cyan for titles
 	ColorHelp       = "245" // Grey for help text
 	ColorError      = "9"   // Red for errors
+	ColorActive     = "10"  // Green for checked/selected/active states
 )

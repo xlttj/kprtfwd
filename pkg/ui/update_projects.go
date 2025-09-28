@@ -60,17 +60,17 @@ func (m *Model) initializeProjectSelector() {
 	rows := make([]table.Row, len(projects)+1) // +1 for "All Projects" option
 
 	// Add "All Projects" option at the top
-	allStatus := ""
+	allStatus := IndicatorUnselected
 	if activeProjectName == "" {
-		allStatus = "●"
+		allStatus = IndicatorSelected
 	}
 	rows[0] = table.Row{"All Projects", fmt.Sprintf("%d", len(m.configStore.GetAll())), allStatus}
 
 	// Add actual projects
 	for i, project := range projects {
-		activeStatus := ""
+		activeStatus := IndicatorUnselected
 		if project.Name == activeProjectName {
-			activeStatus = "●"
+			activeStatus = IndicatorSelected
 		}
 		rows[i+1] = table.Row{project.Name, fmt.Sprintf("%d", len(project.Forwards)), activeStatus}
 	}

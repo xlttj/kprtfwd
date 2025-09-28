@@ -229,9 +229,9 @@ func (m *Model) initializeProjectServiceSelection() {
 	}
 
 	for i, cfg := range allConfigs {
-		checkbox := "☐"
+		checkbox := CheckboxUnchecked
 		if projectForwards[cfg.ID] {
-			checkbox = "☑"
+			checkbox = CheckboxChecked
 		}
 
 		ports := fmt.Sprintf("%d→%d", cfg.PortLocal, cfg.PortRemote)
