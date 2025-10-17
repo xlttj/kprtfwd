@@ -168,37 +168,31 @@ func (m *Model) calculateClusterSelectionColumns() []table.Column {
 
 // calculateDiscoveryServiceColumns returns columns for service discovery with dynamic widths
 func (m *Model) calculateDiscoveryServiceColumns() []table.Column {
-	// Calculate available width (standardized padding for borders)
+	// Calculate available width (subtract padding for borders) - same as project management
 	availableWidth := m.width - 8
-	availableWidth = max(availableWidth, 50) // Minimum total width
+	availableWidth = max(availableWidth, 60) // Minimum total width
 
 	// Fixed minimums for some columns
 	minSel := 4    // "SEL"
 	minRemote := 6 // "REMOTE"
-	minLocal := 8  // "LOCAL" (increased to avoid truncation)
-	minType := 8   // "TYPE"
+	minLocal := 8  // "LOCAL"
 
-	// Calculate total fixed width
-	fixedWidth := minSel + minRemote + minLocal + minType
+	// Remaining width distributed among SERVICE:PORT, NAMESPACE, TYPE - same logic as project management
+	remainingWidth := availableWidth - minSel - minRemote - minLocal
+	serviceWidth := remainingWidth * 40 / 100   // 40% for SERVICE:PORT (same as SERVICE in project mgmt)
+	namespaceWidth := remainingWidth * 30 / 100 // 30% for NAMESPACE (same as project mgmt)
+	typeWidth := remainingWidth - serviceWidth - namespaceWidth // Rest for TYPE
 
-	// Remaining width distributed between SERVICE:PORT and NAMESPACE
-	remainingWidth := availableWidth - fixedWidth
-	if remainingWidth < 0 {
-		remainingWidth = 0
-	}
-
-	serviceWidth := remainingWidth * 60 / 100 // SERVICE:PORT gets more space
-	namespaceWidth := remainingWidth - serviceWidth
-
-	// Ensure minimums
-	serviceWidth = max(serviceWidth, 15)
-	namespaceWidth = max(namespaceWidth, 8) // Reduced minimum for namespace
+	// Ensure minimums - same as project management
+	serviceWidth = max(serviceWidth, 12)
+	namespaceWidth = max(namespaceWidth, 10)
+	typeWidth = max(typeWidth, 10)
 
 	return []table.Column{
 		{Title: "SEL", Width: minSel},
 		{Title: "SERVICE:PORT", Width: serviceWidth},
 		{Title: "NAMESPACE", Width: namespaceWidth},
-		{Title: "TYPE", Width: minType},
+		{Title: "TYPE", Width: typeWidth},
 		{Title: "REMOTE", Width: minRemote},
 		{Title: "LOCAL", Width: minLocal},
 	}

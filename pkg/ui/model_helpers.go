@@ -8,14 +8,11 @@ import (
 	"github.com/xlttj/kprtfwd/pkg/logging"
 
 	"github.com/charmbracelet/bubbles/table"
-	"github.com/charmbracelet/lipgloss"
 )
 
 // styleStatusText applies color styling to status text
 func styleStatusText(status string) string {
-	if status == StatusRunning {
-		return lipgloss.NewStyle().Foreground(lipgloss.Color(ColorActive)).Render(status)
-	}
+	// Removed color styling to prevent table display issues
 	return status
 }
 

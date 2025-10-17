@@ -229,9 +229,11 @@ func (m *Model) initializeProjectServiceSelection() {
 	}
 
 	for i, cfg := range allConfigs {
-		checkbox := CheckboxUnchecked
+		var checkbox string
 		if projectForwards[cfg.ID] {
-			checkbox = lipgloss.NewStyle().Foreground(lipgloss.Color(ColorActive)).Render(CheckboxChecked)
+			checkbox = CheckboxChecked
+		} else {
+			checkbox = CheckboxUnchecked
 		}
 
 		ports := fmt.Sprintf("%d→%d", cfg.PortLocal, cfg.PortRemote)

@@ -83,10 +83,13 @@ func (dr *DiscoveryResult) GenerateConfig() []config.PortForwardConfig {
 }
 
 // generateServiceID creates a human-readable ID following the pattern:
-// <context>.<service-type>.<discriminator>
+// <context>.<namespace>.<service-type>.<discriminator>
 func generateServiceID(context string, service ServiceInfo, port ServicePort) string {
 	// Clean context name
 	contextPart := sanitizeIDPart(context)
+	
+	// Clean namespace name
+	namespacePart := sanitizeIDPart(service.Namespace)
 
 	// Determine service type from labels, annotations, or service name
 	serviceType := detectServiceType(service)
@@ -97,7 +100,8 @@ func generateServiceID(context string, service ServiceInfo, port ServicePort) st
 		discriminator += "-" + sanitizeIDPart(port.Name)
 	}
 
-	return contextPart + "." + serviceType + "." + discriminator
+	// Include namespace to ensure uniqueness across namespaces
+	return contextPart + "." + namespacePart + "." + serviceType + "." + discriminator
 }
 
 // detectServiceType attempts to identify the type of service based on common patterns

@@ -223,7 +223,7 @@ func (m *Model) initializeClusterSelection() error {
 	for i, cluster := range clusters {
 		status := IndicatorUnselected
 		if i == m.discoverySelectedCluster {
-			status = lipgloss.NewStyle().Foreground(lipgloss.Color(ColorActive)).Render(IndicatorSelected)
+			status = IndicatorSelected
 		}
 		rows[i] = table.Row{cluster, status}
 	}
@@ -375,9 +375,11 @@ func (m *Model) initializeServiceSelectionTable() {
 	// Create table rows for individual ports
 	rows := make([]table.Row, len(ports))
 	for i, port := range ports {
-		checkbox := CheckboxUnchecked
+		var checkbox string
 		if port.Selected {
-			checkbox = lipgloss.NewStyle().Foreground(lipgloss.Color(ColorActive)).Render(CheckboxChecked)
+			checkbox = CheckboxChecked
+		} else {
+			checkbox = CheckboxUnchecked
 		}
 
 		// Create service:port display name
@@ -611,6 +613,7 @@ func (m *Model) handleServiceSelectionConfirm() (tea.Model, tea.Cmd) {
 func generateServicePortID(context string, service discovery.ServiceInfo, port discovery.ServicePort) string {
 	// Generate ID similar to the discovery package but for specific ports
 	contextPart := sanitizeIDPart(context)
+	namespacePart := sanitizeIDPart(service.Namespace)
 	serviceType := detectServiceTypeFromInfo(service)
 	discriminator := sanitizeIDPart(service.Name)
 
@@ -620,7 +623,8 @@ func generateServicePortID(context string, service discovery.ServiceInfo, port d
 		discriminator += "-" + sanitizeIDPart(port.Name)
 	}
 
-	return contextPart + "." + serviceType + "." + discriminator
+	// Include namespace to ensure uniqueness across namespaces
+	return contextPart + "." + namespacePart + "." + serviceType + "." + discriminator
 }
 
 // detectServiceTypeFromInfo attempts to identify the type of service

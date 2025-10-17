@@ -62,7 +62,7 @@ func (m *Model) initializeProjectSelector() {
 	// Add "All Projects" option at the top
 	allStatus := IndicatorUnselected
 	if activeProjectName == "" {
-		allStatus = lipgloss.NewStyle().Foreground(lipgloss.Color(ColorActive)).Render(IndicatorSelected)
+		allStatus = IndicatorSelected
 	}
 	rows[0] = table.Row{"All Projects", fmt.Sprintf("%d", len(m.configStore.GetAll())), allStatus}
 
@@ -70,7 +70,7 @@ func (m *Model) initializeProjectSelector() {
 	for i, project := range projects {
 		activeStatus := IndicatorUnselected
 		if project.Name == activeProjectName {
-			activeStatus = lipgloss.NewStyle().Foreground(lipgloss.Color(ColorActive)).Render(IndicatorSelected)
+			activeStatus = IndicatorSelected
 		}
 		rows[i+1] = table.Row{project.Name, fmt.Sprintf("%d", len(project.Forwards)), activeStatus}
 	}
