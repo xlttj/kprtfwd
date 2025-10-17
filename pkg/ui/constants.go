@@ -61,5 +61,4 @@ const (
 	ColorTitle      = "14"  // Cyan for titles
 	ColorHelp       = "245" // Grey for help text
 	ColorError      = "9"   // Red for errors
-	ColorActive     = "10"  // Green for checked/selected/active states
 )
