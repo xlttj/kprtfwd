@@ -1,5 +1,7 @@
 package ui
 
+import "time"
+
 // Table Column Titles
 const (
 	ColContext    = "CONTEXT"
@@ -51,6 +53,15 @@ const (
 	// Group expansion indicators
 	ExpanderCollapsed = "[-]"
 	ExpanderExpanded  = "[+]"
+)
+
+// Auto-restart timing
+const (
+	// AutoRestartInterval is how often dead port-forward processes are detected and restarted.
+	AutoRestartInterval = 2 * time.Second
+	// AutoRestartGracePeriod is how long after starting a forward before health checks begin.
+	// This avoids false positives while kubectl is still initialising.
+	AutoRestartGracePeriod = 10 * time.Second
 )
 
 // Lipgloss Colors

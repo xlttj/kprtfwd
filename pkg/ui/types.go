@@ -1,5 +1,10 @@
 package ui
 
+import "time"
+
+// tickMsg is sent on each health-check tick to trigger auto-restart of dead port-forwards.
+type tickMsg time.Time
+
 // UIState represents the different views/states of the UI
 type UIState int
 

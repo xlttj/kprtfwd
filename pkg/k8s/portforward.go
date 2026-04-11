@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/xlttj/kprtfwd/pkg/config"
 	"github.com/xlttj/kprtfwd/pkg/logging"
@@ -32,6 +35,7 @@ type PortForwardParams struct {
 type runningInfo struct {
 	cmd       *exec.Cmd
 	localPort int
+	startedAt time.Time // When the process was started (used for grace period during health checks)
 }
 
 // PortForwarder manages multiple port-forward processes
@@ -201,7 +205,7 @@ func (pf *PortForwarder) Start(index int, cfg config.PortForwardConfig) error {
 
 	if cmd != nil {
 		// Start succeeded, store running info
-		pf.RunningForwards[index] = &runningInfo{cmd: cmd, localPort: localPort}
+		pf.RunningForwards[index] = &runningInfo{cmd: cmd, localPort: localPort, startedAt: time.Now()}
 		// Reservation in activeLocalPorts remains
 		logging.LogDebug("Successfully started and registered port-forward for index %d (PID: %d, Port: %d)", index, cmd.Process.Pid, localPort)
 		return nil // Success
@@ -318,7 +322,7 @@ func (pf *PortForwarder) startInternal(index int, cfg config.PortForwardConfig) 
 	}
 	if cmd != nil {
 		// Succeeded, add to running map
-		pf.RunningForwards[index] = &runningInfo{cmd: cmd, localPort: localPort}
+		pf.RunningForwards[index] = &runningInfo{cmd: cmd, localPort: localPort, startedAt: time.Now()}
 		return nil // Success
 	} else {
 		// Failed (nil cmd/err case), release reservation
@@ -335,6 +339,64 @@ func (pf *PortForwarder) IsRunning(index int) bool {
 	defer pf.Mutex.Unlock()
 	_, exists := pf.RunningForwards[index]
 	return exists
+}
+
+// isProcessAlive returns true if the OS process is still running.
+// Uses POSIX signal 0 which checks for process existence without sending a real signal.
+func isProcessAlive(proc *os.Process) bool {
+	if proc == nil {
+		return false
+	}
+	err := proc.Signal(syscall.Signal(0))
+	return err == nil
+}
+
+// CheckDeadForwards returns config indices whose kubectl processes have exited.
+// Entries started within gracePeriod are skipped to avoid false positives
+// while kubectl is still initialising.
+func (pf *PortForwarder) CheckDeadForwards(gracePeriod time.Duration) []int {
+	pf.Mutex.Lock()
+	defer pf.Mutex.Unlock()
+
+	var dead []int
+	now := time.Now()
+	for index, info := range pf.RunningForwards {
+		if now.Sub(info.startedAt) < gracePeriod {
+			continue // still within grace period
+		}
+		if !isProcessAlive(info.cmd.Process) {
+			logging.LogDebug("CheckDeadForwards: process for index %d (port %d) is no longer alive", index, info.localPort)
+			dead = append(dead, index)
+		}
+	}
+	return dead
+}
+
+// RemoveDeadForward cleans up tracking for a process that has already exited.
+// Unlike Stop(), it does not attempt to kill the process.
+func (pf *PortForwarder) RemoveDeadForward(index int) {
+	pf.Mutex.Lock()
+
+	info, exists := pf.RunningForwards[index]
+	if !exists {
+		pf.Mutex.Unlock()
+		return
+	}
+
+	// Release port reservation
+	if holder, ok := pf.activeLocalPorts[info.localPort]; ok && holder == index {
+		delete(pf.activeLocalPorts, info.localPort)
+		logging.LogDebug("RemoveDeadForward: released port %d reservation for index %d", info.localPort, index)
+	}
+	delete(pf.RunningForwards, index)
+	cmd := info.cmd
+	pf.Mutex.Unlock()
+
+	// Reap the zombie process outside the lock so we don't block
+	if cmd != nil && cmd.Process != nil {
+		go func() { _ = cmd.Wait() }()
+	}
+	logging.LogDebug("RemoveDeadForward: removed dead forward for index %d", index)
 }
 
 // CleanupAll stops all port-forwards

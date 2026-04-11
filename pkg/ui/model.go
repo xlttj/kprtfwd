@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/xlttj/kprtfwd/pkg/config"
 	"github.com/xlttj/kprtfwd/pkg/k8s"
@@ -404,7 +405,14 @@ func (m *Model) Cleanup() {
 }
 
 func (m *Model) Init() tea.Cmd {
-	return nil
+	return tickPortForwardCheck()
+}
+
+// tickPortForwardCheck schedules the next health-check tick.
+func tickPortForwardCheck() tea.Cmd {
+	return tea.Tick(AutoRestartInterval, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -490,6 +498,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateProjectServiceSelection(msg)
 		}
 
+	// Periodic health-check tick — detect and auto-restart dead port-forwards
+	case tickMsg:
+		return m.handleAutoRestart()
+
 	// Handle messages specific to certain operations/states
 	case error: // General error handling
 		// Log or display the error appropriately
@@ -557,6 +569,45 @@ func (m *Model) handlePortForwardsRestart() (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+// handleAutoRestart is called on each health-check tick. It finds port-forward
+// processes that have died unexpectedly and attempts to restart them.
+func (m *Model) handleAutoRestart() (tea.Model, tea.Cmd) {
+	deadIndices := m.portForwarder.CheckDeadForwards(AutoRestartGracePeriod)
+	if len(deadIndices) == 0 {
+		return m, tickPortForwardCheck()
+	}
+
+	configs := m.configStore.GetAll()
+	var restarted, failed []string
+
+	for _, idx := range deadIndices {
+		m.portForwarder.RemoveDeadForward(idx)
+		if idx >= len(configs) {
+			logging.LogError("handleAutoRestart: index %d out of bounds (configs length: %d)", idx, len(configs))
+			continue
+		}
+		cfg := configs[idx]
+		if err := m.portForwarder.Start(idx, cfg); err != nil {
+			logging.LogError("handleAutoRestart: failed to restart %s: %v", cfg.Service, err)
+			failed = append(failed, cfg.Service)
+		} else {
+			logging.LogDebug("handleAutoRestart: successfully restarted %s", cfg.Service)
+			restarted = append(restarted, cfg.Service)
+		}
+	}
+
+	m.refreshTable()
+
+	if len(restarted) > 0 {
+		m.statusMsg = fmt.Sprintf("Auto-restarted: %s", strings.Join(restarted, ", "))
+	}
+	if len(failed) > 0 {
+		m.errorMsg = fmt.Sprintf("Auto-restart failed: %s", strings.Join(failed, ", "))
+	}
+
+	return m, tickPortForwardCheck()
 }
 
 // formatRestartSummary creates user-friendly restart summary
