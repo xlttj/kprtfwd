@@ -341,6 +341,12 @@ func (pf *PortForwarder) IsRunning(index int) bool {
 	return exists
 }
 
+// tcpDialTimeout and tcpReadTimeout control the TCP tunnel probe in isTunnelHealthy.
+const (
+	tcpDialTimeout = 300 * time.Millisecond
+	tcpReadTimeout = 200 * time.Millisecond
+)
+
 // isProcessAlive returns true if the OS process is still running.
 // Uses POSIX signal 0 which checks for process existence without sending a real signal.
 func isProcessAlive(proc *os.Process) bool {
@@ -351,22 +357,83 @@ func isProcessAlive(proc *os.Process) bool {
 	return err == nil
 }
 
-// CheckDeadForwards returns config indices whose kubectl processes have exited.
+// isTunnelHealthy probes whether the kubectl port-forward tunnel on localPort is
+// actually functional, not just whether the process is alive.
+//
+// How it works: kubectl port-forward immediately tries to create an upstream SPDY
+// stream to the target pod when a local TCP connection is accepted — before any data
+// is sent. If the upstream (API server / cluster) is reachable, kubectl holds the
+// connection open waiting to proxy data. If the upstream is unreachable (VPN down,
+// cluster unreachable), kubectl closes the connection right away.
+//
+// Probe logic:
+//   - Dial localhost:localPort with tcpDialTimeout
+//     → ECONNREFUSED / timeout → port not bound → not healthy
+//   - Set a tcpReadTimeout read deadline; wait for kubectl to close or send data
+//     → timeout (deadline exceeded) → kubectl held connection open → healthy
+//     → EOF / non-timeout error → kubectl closed connection → not healthy
+//
+// Known limitation: if a VPN silently drops packets (no RST), kubectl hangs trying
+// to reach the API server and holds the local connection open, causing a false-healthy
+// result. This resolves on its own only when OS TCP keepalives eventually expire
+// (minutes). Full coverage requires stderr monitoring (future work).
+func isTunnelHealthy(localPort int) bool {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", localPort), tcpDialTimeout)
+	if err != nil {
+		// ECONNREFUSED or timeout — port is not bound at all
+		return false
+	}
+	defer conn.Close()
+
+	// Wait briefly to see if kubectl closes the connection (broken upstream)
+	// or holds it open (healthy upstream).
+	conn.SetReadDeadline(time.Now().Add(tcpReadTimeout)) //nolint:errcheck
+	buf := make([]byte, 1)
+	_, readErr := conn.Read(buf)
+	if readErr == nil {
+		// kubectl actually sent data — unusual for port-forward but consider healthy
+		return true
+	}
+	netErr, ok := readErr.(net.Error)
+	return ok && netErr.Timeout() // deadline exceeded → kubectl held connection → healthy
+}
+
+// CheckDeadForwards returns config indices whose kubectl port-forward tunnels are
+// no longer healthy (process dead or tunnel broken).
 // Entries started within gracePeriod are skipped to avoid false positives
 // while kubectl is still initialising.
+//
+// Design: data is snapshotted under the mutex, then released before TCP probes so
+// that network operations never hold the lock.
 func (pf *PortForwarder) CheckDeadForwards(gracePeriod time.Duration) []int {
-	pf.Mutex.Lock()
-	defer pf.Mutex.Unlock()
+	// Snapshot under lock
+	type candidate struct {
+		index     int
+		localPort int
+		proc      *os.Process
+	}
 
-	var dead []int
+	pf.Mutex.Lock()
+	var candidates []candidate
 	now := time.Now()
 	for index, info := range pf.RunningForwards {
 		if now.Sub(info.startedAt) < gracePeriod {
 			continue // still within grace period
 		}
-		if !isProcessAlive(info.cmd.Process) {
-			logging.LogDebug("CheckDeadForwards: process for index %d (port %d) is no longer alive", index, info.localPort)
-			dead = append(dead, index)
+		candidates = append(candidates, candidate{index, info.localPort, info.cmd.Process})
+	}
+	pf.Mutex.Unlock() // release before any network I/O
+
+	var dead []int
+	for _, c := range candidates {
+		if !isProcessAlive(c.proc) {
+			logging.LogDebug("CheckDeadForwards: process for index %d (port %d) is no longer alive", c.index, c.localPort)
+			dead = append(dead, c.index)
+			continue
+		}
+		if !isTunnelHealthy(c.localPort) {
+			logging.LogDebug("CheckDeadForwards: tunnel probe failed for index %d (port %d)", c.index, c.localPort)
+			dead = append(dead, c.index)
 		}
 	}
 	return dead
