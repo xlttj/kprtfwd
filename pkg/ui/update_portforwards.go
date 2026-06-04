@@ -97,8 +97,8 @@ func (m *Model) updatePortForwards(msg tea.Msg) (tea.Model, tea.Cmd) {
 				groupName := m.getSelectedGroupName()
 				if state, exists := m.groupStates[groupName]; exists {
 					state.Expanded = !state.Expanded
-					// Refresh table with updated group state
-					m.portForwardsTable.SetRows(m.generateGroupedRows(m.configStore.GetAll()))
+					// Refresh through refreshTable so any active filter is preserved
+					m.refreshTable()
 				}
 				return m, nil
 			}
