@@ -3,6 +3,7 @@
 package k8s
 
 import (
+	"os"
 	"os/exec"
 	"syscall"
 )
@@ -25,4 +26,14 @@ func killCmdGroup(cmd *exec.Cmd) error {
 		return nil
 	}
 	return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+}
+
+// isProcessAlive reports whether proc is still running.
+// Uses POSIX signal 0, which checks for process existence without delivering
+// a real signal. Returns false if the process has already exited.
+func isProcessAlive(proc *os.Process) bool {
+	if proc == nil {
+		return false
+	}
+	return proc.Signal(syscall.Signal(0)) == nil
 }

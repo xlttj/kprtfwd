@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/xlttj/kprtfwd/pkg/config"
 	"github.com/xlttj/kprtfwd/pkg/logging"
@@ -118,22 +119,32 @@ func StartPortForward(params PortForwardParams) (*exec.Cmd, error) {
 		return nil, fmt.Errorf("kubectl start failed: %w", err)
 	}
 
-	// Check if the process has exited. Non-blocking check.
-	// cmd.ProcessState is nil if still running after Start()
-	if cmd.ProcessState != nil {
-		stderrStr := stderr.String()
-		logging.LogError("Port-forward process exited quickly (PID: %d). Stderr: %s", cmd.Process.Pid, stderrStr)
-		// Consider a specific sentinel error here too?
-		return nil, fmt.Errorf("kubectl exited quickly. Stderr: %s", stderrStr)
+	// Give kubectl a moment to fail fast. Common quick-exit cases:
+	//   - VPN not connected (EHOSTUNREACH → kubectl exits in <50ms)
+	//   - Invalid context / bad kubeconfig
+	//   - Port already in use (detected by kubectl itself)
+	// Note: cmd.ProcessState is only populated after cmd.Wait(), so checking
+	// it here (as the old code did) is always nil — it was dead code.
+	time.Sleep(200 * time.Millisecond)
+
+	if !isProcessAlive(cmd.Process) {
+		// Process died during startup. Call Wait() to reap the zombie and
+		// ensure the stderr pipe goroutine finishes flushing the buffer.
+		_ = cmd.Wait()
+		stderrStr := strings.TrimSpace(stderr.String())
+		logging.LogError("kubectl (PID %d) exited immediately after start. Stderr: %s", cmd.Process.Pid, stderrStr)
+		if stderrStr != "" {
+			return nil, fmt.Errorf("kubectl exited: %s", stderrStr)
+		}
+		return nil, fmt.Errorf("kubectl exited immediately (check VPN / kube context / port conflicts)")
 	}
 
-	// Do not treat immediate stderr as fatal; kubectl may emit warnings
+	// Do not treat initial stderr as fatal; kubectl may emit harmless warnings.
 	stderrStr := strings.TrimSpace(stderr.String())
 	if stderrStr != "" {
-		logging.LogDebug("kubectl port-forward initial stderr (non-fatal): %s", stderrStr)
+		logging.LogDebug("kubectl port-forward initial stderr (non-fatal, PID %d): %s", cmd.Process.Pid, stderrStr)
 	}
 
-	// If we reach here, Start() succeeded and process appears running
 	logging.LogDebug("Started port-forward process PID: %d, appears stable.", cmd.Process.Pid)
 	return cmd, nil
 }
@@ -339,12 +350,33 @@ func (pf *PortForwarder) startInternal(index int, cfg config.PortForwardConfig) 
 	}
 }
 
-// IsRunning checks if a port forward is currently running for the given index
+// IsRunning checks if a port forward is currently running for the given index.
+// It verifies the OS process is actually alive, not just that an entry exists in
+// the map. If the process has exited since it was last seen (e.g. because the
+// VPN dropped), the stale entry is removed and the zombie is reaped.
 func (pf *PortForwarder) IsRunning(index int) bool {
 	pf.Mutex.Lock()
 	defer pf.Mutex.Unlock()
-	_, exists := pf.RunningForwards[index]
-	return exists
+
+	info, exists := pf.RunningForwards[index]
+	if !exists {
+		return false
+	}
+
+	if !isProcessAlive(info.cmd.Process) {
+		// Process died without us knowing (VPN drop, pod restart, etc.).
+		// Clean up state and reap the zombie outside the lock.
+		cmd := info.cmd
+		if holder, ok := pf.activeLocalPorts[info.localPort]; ok && holder == index {
+			delete(pf.activeLocalPorts, info.localPort)
+		}
+		delete(pf.RunningForwards, index)
+		logging.LogDebug("IsRunning: process for index %d (port %d) has exited; cleaning up", index, info.localPort)
+		go func() { _ = cmd.Wait() }()
+		return false
+	}
+
+	return true
 }
 
 // CleanupAll stops all port-forwards
