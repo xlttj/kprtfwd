@@ -95,6 +95,11 @@ func StartPortForward(params PortForwardParams) (*exec.Cmd, error) {
 	}
 	cmd := exec.Command("kubectl", args...)
 
+	// Put kubectl in its own process group so that any child processes it
+	// spawns (SSO credential plugins, browser launchers) can be killed as a
+	// unit. See portforward_proc_unix.go / portforward_proc_windows.go.
+	setProcGroupAttrs(cmd)
+
 	var stderr bytes.Buffer
 
 	// Set stderr to capture output for checking
@@ -133,15 +138,20 @@ func StartPortForward(params PortForwardParams) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-// StopPortForward stops a port-forward process
+// StopPortForward stops a port-forward process and all child processes it has spawned.
+// Killing just cmd.Process is insufficient when kubectl has launched a child (e.g. an
+// SSO exec-credential plugin that opens a browser), because that child holds the write
+// end of the stderr pipe open, which causes cmd.Wait() to block forever.
+// killCmdGroup kills the entire process group, closing every write-end holder and
+// allowing Wait() to return immediately.
 func StopPortForward(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
-	logging.LogDebug("Stopping port-forward process PID: %d", cmd.Process.Pid)
+	logging.LogDebug("Stopping port-forward process group (PID: %d)", cmd.Process.Pid)
 
-	// Try graceful interrupt first, then kill
-	_ = cmd.Process.Kill()
+	// Kill the whole process group (kubectl + any SSO subprocesses)
+	_ = killCmdGroup(cmd)
 	// Reap the process to avoid zombies
 	_ = cmd.Wait()
 	return nil
