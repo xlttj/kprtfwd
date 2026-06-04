@@ -70,6 +70,7 @@ type Model struct {
 	discoveryFilterInput      textinput.Model
 	discoveryFilterMode       bool
 	discoveryExistingServices map[string]bool
+	discoveryLoading          bool // True while an async kubectl discovery operation is in flight
 
 	// Inline editing state for local ports in discovery
 	discoveryEditMode  bool            // Whether we're in inline edit mode
@@ -489,6 +490,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case StateProjectServiceSelection:
 			return m.updateProjectServiceSelection(msg)
 		}
+
+	// Async service-discovery results (run off the event loop so the UI never freezes)
+	case clustersLoadedMsg:
+		return m.handleClustersLoaded(msg)
+	case servicesDiscoveredMsg:
+		return m.handleServicesDiscovered(msg)
 
 	// Handle messages specific to certain operations/states
 	case error: // General error handling
