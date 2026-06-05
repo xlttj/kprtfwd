@@ -406,11 +406,18 @@ func (m *Model) Cleanup() {
 }
 
 type statusTickMsg time.Time
+type tunnelProbeMsg []int
 
 func statusTickCmd() tea.Cmd {
 	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
 		return statusTickMsg(t)
 	})
+}
+
+func probeTunnelsCmd(pf *k8s.PortForwarder) tea.Cmd {
+	return func() tea.Msg {
+		return tunnelProbeMsg(pf.ProbeAllTunnels())
+	}
 }
 
 func (m *Model) Init() tea.Cmd {
@@ -508,7 +515,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case statusTickMsg:
 		m.refreshTable()
-		return m, statusTickCmd()
+		return m, tea.Batch(statusTickCmd(), probeTunnelsCmd(m.portForwarder))
+
+	case tunnelProbeMsg:
+		if len(msg) > 0 {
+			m.portForwarder.MarkBroken([]int(msg))
+			m.refreshTable()
+		}
+		return m, nil
 
 	// Handle messages specific to certain operations/states
 	case error: // General error handling

@@ -389,6 +389,97 @@ func (pf *PortForwarder) IsError(index int) bool {
 	return failed
 }
 
+// isPortForwardHealthy dials localhost:localPort and determines whether kubectl's
+// tunnel is live. A healthy tunnel: kubectl holds the connection open waiting to
+// forward data → our read times out. A broken tunnel (VPN down, pod gone): kubectl
+// closes the connection immediately → we get EOF. Connection refused means kubectl
+// is no longer listening (also unhealthy).
+//
+// Limitation: silent packet-drop black-holes (VPN route gone, no RST) cannot be
+// detected this way because kubectl still appears to hold the connection.
+func isPortForwardHealthy(localPort int) bool {
+	address := fmt.Sprintf("127.0.0.1:%d", localPort)
+	conn, err := net.DialTimeout("tcp", address, 200*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	buf := make([]byte, 1)
+	_, err = conn.Read(buf)
+	if err == nil {
+		return true // received data — definitely healthy
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true // held open — tunnel is live
+	}
+	return false // EOF or other error — upstream unreachable
+}
+
+// ProbeAllTunnels checks every running forward's TCP tunnel health concurrently.
+// Returns the indices of forwards where the tunnel appears broken.
+// Blocking; call from a goroutine or tea.Cmd.
+func (pf *PortForwarder) ProbeAllTunnels() []int {
+	pf.Mutex.Lock()
+	toProbe := make(map[int]int) // index → localPort
+	for idx, info := range pf.RunningForwards {
+		toProbe[idx] = info.localPort
+	}
+	pf.Mutex.Unlock()
+
+	if len(toProbe) == 0 {
+		return nil
+	}
+
+	type result struct {
+		idx     int
+		healthy bool
+	}
+	ch := make(chan result, len(toProbe))
+	for idx, port := range toProbe {
+		go func(i, p int) {
+			ch <- result{i, isPortForwardHealthy(p)}
+		}(idx, port)
+	}
+
+	var broken []int
+	for range toProbe {
+		r := <-ch
+		if !r.healthy {
+			broken = append(broken, r.idx)
+		}
+	}
+	return broken
+}
+
+// MarkBroken kills and deregisters the forwards at the given indices, marking
+// each as errored. Used to record tunnels that the TCP health probe found broken.
+func (pf *PortForwarder) MarkBroken(indices []int) {
+	if len(indices) == 0 {
+		return
+	}
+	pf.Mutex.Lock()
+	defer pf.Mutex.Unlock()
+	for _, idx := range indices {
+		info, ok := pf.RunningForwards[idx]
+		if !ok {
+			continue
+		}
+		cmd := info.cmd
+		if holder, ok2 := pf.activeLocalPorts[info.localPort]; ok2 && holder == idx {
+			delete(pf.activeLocalPorts, info.localPort)
+		}
+		delete(pf.RunningForwards, idx)
+		pf.failedForwards[idx] = struct{}{}
+		logging.LogDebug("MarkBroken: tunnel broken for index %d (port %d); killing process", idx, info.localPort)
+		go func() {
+			_ = killCmdGroup(cmd)
+			_ = cmd.Wait()
+		}()
+	}
+}
+
 // StopAllRunning stops every currently running port-forward and returns how many
 // were stopped. Error state is cleared for each one (intentional action).
 func (pf *PortForwarder) StopAllRunning() int {
