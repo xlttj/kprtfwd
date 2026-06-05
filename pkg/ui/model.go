@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/xlttj/kprtfwd/pkg/config"
 	"github.com/xlttj/kprtfwd/pkg/k8s"
@@ -404,8 +405,16 @@ func (m *Model) Cleanup() {
 	}
 }
 
+type statusTickMsg time.Time
+
+func statusTickCmd() tea.Cmd {
+	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
+		return statusTickMsg(t)
+	})
+}
+
 func (m *Model) Init() tea.Cmd {
-	return nil
+	return statusTickCmd()
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -496,6 +505,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleClustersLoaded(msg)
 	case servicesDiscoveredMsg:
 		return m.handleServicesDiscovered(msg)
+
+	case statusTickMsg:
+		m.refreshTable()
+		return m, statusTickCmd()
 
 	// Handle messages specific to certain operations/states
 	case error: // General error handling
