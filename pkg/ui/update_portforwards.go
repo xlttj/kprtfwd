@@ -139,6 +139,7 @@ func (m *Model) updatePortForwards(msg tea.Msg) (tea.Model, tea.Cmd) {
 					} else {
 						m.errorMsg = fmt.Sprintf("Error starting %s: %v", cfg.Service, err)
 					}
+					m.refreshTable()
 					return m, nil
 				}
 				// Refresh table to show updated runtime status
