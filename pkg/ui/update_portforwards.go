@@ -215,6 +215,17 @@ func (m *Model) updatePortForwards(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.editInput.Focus()
 			m.portForwardsTable.Blur()
 			return m, nil
+		case "S": // Stop all running port-forwards
+			m.errorMsg = ""
+			m.statusMsg = ""
+			count := m.portForwarder.StopAllRunning()
+			if count > 0 {
+				m.statusMsg = fmt.Sprintf("Stopped %d port forward(s)", count)
+			} else {
+				m.statusMsg = "No running port forwards to stop"
+			}
+			m.refreshTable()
+			return m, nil
 		case ShortcutRestartForwards: // ctrl+r
 			m.errorMsg = "" // Clear any previous errors
 			return m.handlePortForwardsRestart()

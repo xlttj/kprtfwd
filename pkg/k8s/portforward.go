@@ -389,6 +389,22 @@ func (pf *PortForwarder) IsError(index int) bool {
 	return failed
 }
 
+// StopAllRunning stops every currently running port-forward and returns how many
+// were stopped. Error state is cleared for each one (intentional action).
+func (pf *PortForwarder) StopAllRunning() int {
+	pf.Mutex.Lock()
+	defer pf.Mutex.Unlock()
+
+	indices := make([]int, 0, len(pf.RunningForwards))
+	for idx := range pf.RunningForwards {
+		indices = append(indices, idx)
+	}
+	for _, idx := range indices {
+		_ = pf.stopInternal(idx)
+	}
+	return len(indices)
+}
+
 // CleanupAll stops all port-forwards
 func (pf *PortForwarder) CleanupAll() {
 	pf.Mutex.Lock()

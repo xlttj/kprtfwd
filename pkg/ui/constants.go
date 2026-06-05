@@ -12,7 +12,7 @@ const (
 
 // Action Lines / Key Hints
 const (
-	ActionPortForwardNav  = "↑/↓: Navigate | space: Toggle/Expand | e: Edit Port | g: Toggle Grouping | ctrl+d: Discover | ctrl+p: Projects | ctrl+r: Restart | q: Quit"
+	ActionPortForwardNav  = "↑/↓: Navigate | space: Toggle/Expand | e: Edit Port | g: Toggle Grouping | S: Stop All | ctrl+d: Discover | ctrl+p: Projects | ctrl+r: Restart | q: Quit"
 	ActionProjectSelector = "↑/↓: Navigate | Enter: Select Project | M: Manage Projects | Esc: Back"
 	ActionExit            = "ctrl+x: Exit"
 )
