@@ -33,6 +33,7 @@ type PortForwardParams struct {
 type runningInfo struct {
 	cmd       *exec.Cmd
 	localPort int
+	startedAt time.Time
 }
 
 // PortForwarder manages multiple port-forward processes
@@ -223,7 +224,7 @@ func (pf *PortForwarder) Start(index int, cfg config.PortForwardConfig) error {
 	if cmd != nil {
 		// Start succeeded — clear any previous error and store running info
 		delete(pf.failedForwards, index)
-		pf.RunningForwards[index] = &runningInfo{cmd: cmd, localPort: localPort}
+		pf.RunningForwards[index] = &runningInfo{cmd: cmd, localPort: localPort, startedAt: time.Now()}
 		logging.LogDebug("Successfully started and registered port-forward for index %d (PID: %d, Port: %d)", index, cmd.Process.Pid, localPort)
 		return nil
 	}
@@ -338,7 +339,7 @@ func (pf *PortForwarder) startInternal(index int, cfg config.PortForwardConfig) 
 	}
 	if cmd != nil {
 		delete(pf.failedForwards, index)
-		pf.RunningForwards[index] = &runningInfo{cmd: cmd, localPort: localPort}
+		pf.RunningForwards[index] = &runningInfo{cmd: cmd, localPort: localPort, startedAt: time.Now()}
 		return nil
 	}
 	if currentHolder, ok := pf.activeLocalPorts[localPort]; ok && currentHolder == index {
@@ -421,9 +422,14 @@ func isPortForwardHealthy(localPort int) bool {
 // Returns the indices of forwards where the tunnel appears broken.
 // Blocking; call from a goroutine or tea.Cmd.
 func (pf *PortForwarder) ProbeAllTunnels() []int {
+	const probeGrace = 5 * time.Second // don't probe a forward that just started
+
 	pf.Mutex.Lock()
 	toProbe := make(map[int]int) // index → localPort
 	for idx, info := range pf.RunningForwards {
+		if time.Since(info.startedAt) < probeGrace {
+			continue
+		}
 		toProbe[idx] = info.localPort
 	}
 	pf.Mutex.Unlock()
