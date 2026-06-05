@@ -36,6 +36,7 @@ const (
 const (
 	StatusStopped = "Stopped"
 	StatusRunning = "Running"
+	StatusError   = "Error  " // padded to same width as "Running"/"Stopped" to keep column alignment
 )
 
 // ASCII Visual Indicators - Compatible across all terminals
@@ -61,4 +62,9 @@ const (
 	ColorTitle      = "14"  // Cyan for titles
 	ColorHelp       = "245" // Grey for help text
 	ColorError      = "9"   // Red for errors
+
+	// Status column colors
+	ColorStatusRunning = "2"   // Green
+	ColorStatusStopped = "240" // Dim grey
+	ColorStatusError   = "9"   // Red
 )

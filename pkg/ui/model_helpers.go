@@ -8,12 +8,21 @@ import (
 	"github.com/xlttj/kprtfwd/pkg/logging"
 
 	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/lipgloss"
 )
 
-// styleStatusText applies color styling to status text
+// styleStatusText applies color styling to status text.
+// All three status strings are padded to the same visible width so that
+// the STATUS column stays aligned regardless of which value is shown.
 func styleStatusText(status string) string {
-	// Removed color styling to prevent table display issues
-	return status
+	switch status {
+	case StatusRunning:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color(ColorStatusRunning)).Render(status)
+	case StatusError:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color(ColorStatusError)).Render(status)
+	default: // StatusStopped
+		return lipgloss.NewStyle().Foreground(lipgloss.Color(ColorStatusStopped)).Render(status)
+	}
 }
 
 // generatePortForwardRows converts config slice to table.Row slice (ungrouped)
@@ -29,8 +38,6 @@ func (m *Model) generatePortForwardRows(configs []config.PortForwardConfig) []ta
 
 	for _, cfg := range actualConfigs {
 		// Determine actual runtime status by checking if port forward is running
-		statusText := StatusStopped
-
 		// Find the original index in the full config store using ID
 		originalIndex := -1
 		for j, origCfg := range allConfigs {
@@ -42,12 +49,18 @@ func (m *Model) generatePortForwardRows(configs []config.PortForwardConfig) []ta
 
 		if originalIndex == -1 {
 			logging.LogDebug("Warning: Could not find original index for config ID %s", cfg.ID)
-			continue // Skip this config if we can't find its index
+			continue
 		}
 
-		// Check actual runtime state from PortForwarder
+		// Determine display status: IsRunning does a live process check and
+		// updates failedForwards as a side effect when it detects an unexpected exit.
+		var statusText string
 		if m.portForwarder.IsRunning(originalIndex) {
 			statusText = StatusRunning
+		} else if m.portForwarder.IsError(originalIndex) {
+			statusText = StatusError
+		} else {
+			statusText = StatusStopped
 		}
 
 		rows = append(rows, table.Row{
@@ -173,11 +186,15 @@ func (m *Model) generateGroupedRows(configs []config.PortForwardConfig) []table.
 				cfg := item.config
 				index := item.index
 
-				// Determine actual runtime status by checking if port forward is running
-				statusText := StatusStopped
+				// IsRunning does the live signal-0 check and populates failedForwards on unexpected exit.
+				var statusText string
 				isRunning := m.portForwarder.IsRunning(index)
 				if isRunning {
 					statusText = StatusRunning
+				} else if m.portForwarder.IsError(index) {
+					statusText = StatusError
+				} else {
+					statusText = StatusStopped
 				}
 				logging.LogDebug("UI Refresh: Config %d (%s) - IsRunning=%t, Status='%s'", index, cfg.ID, isRunning, statusText)
 
