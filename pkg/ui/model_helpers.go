@@ -25,28 +25,13 @@ func (m *Model) generatePortForwardRows(configs []config.PortForwardConfig) []ta
 	}
 
 	rows := make([]table.Row, 0, len(actualConfigs))
-	allConfigs := m.configStore.GetAll()
 
 	for _, cfg := range actualConfigs {
 		// Determine actual runtime status by checking if port forward is running
 		statusText := StatusStopped
 
-		// Find the original index in the full config store using ID
-		originalIndex := -1
-		for j, origCfg := range allConfigs {
-			if origCfg.ID == cfg.ID {
-				originalIndex = j
-				break
-			}
-		}
-
-		if originalIndex == -1 {
-			logging.LogDebug("Warning: Could not find original index for config ID %s", cfg.ID)
-			continue // Skip this config if we can't find its index
-		}
-
 		// Check actual runtime state from PortForwarder
-		if m.portForwarder.IsRunning(originalIndex) {
+		if m.portForwarder.IsRunning(cfg.ID) {
 			statusText = StatusRunning
 		}
 
@@ -133,7 +118,7 @@ func (m *Model) generateGroupedRows(configs []config.PortForwardConfig) []table.
 		state.Active = 0
 		for _, item := range items {
 			// Check actual runtime state instead of config file status
-			if m.portForwarder.IsRunning(item.index) {
+			if m.portForwarder.IsRunning(item.config.ID) {
 				state.Active++
 			}
 		}
@@ -175,7 +160,7 @@ func (m *Model) generateGroupedRows(configs []config.PortForwardConfig) []table.
 
 				// Determine actual runtime status by checking if port forward is running
 				statusText := StatusStopped
-				isRunning := m.portForwarder.IsRunning(index)
+				isRunning := m.portForwarder.IsRunning(cfg.ID)
 				if isRunning {
 					statusText = StatusRunning
 				}

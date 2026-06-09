@@ -34,20 +34,20 @@ type runningInfo struct {
 	localPort int
 }
 
-// PortForwarder manages multiple port-forward processes
+// PortForwarder manages multiple port-forward processes.
+// Forwards are keyed by config ID (stable across config list reordering),
+// never by list index: indices shift when configs are added/removed/edited.
 type PortForwarder struct {
-	// RunningForwards map[int]*exec.Cmd // Old map
-	RunningForwards  map[int]*runningInfo // Map of config index to running info
-	activeLocalPorts map[int]int          // Map of active local port -> config index
-	Mutex            sync.Mutex           // Mutex to protect the maps
+	RunningForwards  map[string]*runningInfo // Map of config ID to running info
+	activeLocalPorts map[int]string          // Map of active local port -> config ID
+	Mutex            sync.Mutex              // Mutex to protect the maps
 }
 
 // NewPortForwarder creates a new port forwarder
 func NewPortForwarder() *PortForwarder {
 	return &PortForwarder{
-		// RunningForwards: make(map[int]*exec.Cmd),
-		RunningForwards:  make(map[int]*runningInfo),
-		activeLocalPorts: make(map[int]int),
+		RunningForwards:  make(map[string]*runningInfo),
+		activeLocalPorts: make(map[int]string),
 	}
 }
 
@@ -147,27 +147,28 @@ func StopPortForward(cmd *exec.Cmd) error {
 	return nil
 }
 
-// Start attempts to start the port-forward for the config at the given index.
-func (pf *PortForwarder) Start(index int, cfg config.PortForwardConfig) error {
+// Start attempts to start the port-forward for the given config.
+func (pf *PortForwarder) Start(cfg config.PortForwardConfig) error {
+	id := cfg.ID
 	localPort := cfg.PortLocal // Get local port for checks
 
 	pf.Mutex.Lock()
-	if _, exists := pf.RunningForwards[index]; exists {
-		logging.LogDebug("Port-forward for index %d already marked as running.", index)
+	if _, exists := pf.RunningForwards[id]; exists {
+		logging.LogDebug("Port-forward for '%s' already marked as running.", id)
 		pf.Mutex.Unlock()
 		return nil // Already running, not an error
 	}
 
 	// *** Check internal reservation first ***
-	if conflictingIndex, reserved := pf.activeLocalPorts[localPort]; reserved {
-		logging.LogError("Cannot start index %d: %v (port %d reserved by index %d)", index, ErrLocalPortReserved, localPort, conflictingIndex)
+	if conflictingID, reserved := pf.activeLocalPorts[localPort]; reserved {
+		logging.LogError("Cannot start '%s': %v (port %d reserved by '%s')", id, ErrLocalPortReserved, localPort, conflictingID)
 		pf.Mutex.Unlock()
 		return ErrLocalPortReserved // Return specific error
 	}
 
 	// *** Reserve the port internally ***
-	pf.activeLocalPorts[localPort] = index
-	logging.LogDebug("Reserved local port %d for index %d", localPort, index)
+	pf.activeLocalPorts[localPort] = id
+	logging.LogDebug("Reserved local port %d for '%s'", localPort, id)
 	pf.Mutex.Unlock() // Unlock *before* calling potentially blocking StartPortForward helper
 
 	// Fallback: Check if port is actually available using net.Listen (done inside StartPortForward)
@@ -189,42 +190,42 @@ func (pf *PortForwarder) Start(index int, cfg config.PortForwardConfig) error {
 
 	if err != nil {
 		// Start failed, release the reservation
-		if currentHolder, ok := pf.activeLocalPorts[localPort]; ok && currentHolder == index {
+		if currentHolder, ok := pf.activeLocalPorts[localPort]; ok && currentHolder == id {
 			delete(pf.activeLocalPorts, localPort)
-			logging.LogDebug("Released local port %d reservation for index %d due to start failure: %v", localPort, index, err)
+			logging.LogDebug("Released local port %d reservation for '%s' due to start failure: %v", localPort, id, err)
 		} else {
 			// Log if reservation was already gone or held by someone else (shouldn't happen ideally)
-			logging.LogError("Could not release reservation for port %d (index %d) after start failure. Current holder: %d, Exists: %t", localPort, index, currentHolder, ok)
+			logging.LogError("Could not release reservation for port %d ('%s') after start failure. Current holder: '%s', Exists: %t", localPort, id, currentHolder, ok)
 		}
 		return err // Return the original error from StartPortForward
 	}
 
 	if cmd != nil {
 		// Start succeeded, store running info
-		pf.RunningForwards[index] = &runningInfo{cmd: cmd, localPort: localPort}
+		pf.RunningForwards[id] = &runningInfo{cmd: cmd, localPort: localPort}
 		// Reservation in activeLocalPorts remains
-		logging.LogDebug("Successfully started and registered port-forward for index %d (PID: %d, Port: %d)", index, cmd.Process.Pid, localPort)
+		logging.LogDebug("Successfully started and registered port-forward for '%s' (PID: %d, Port: %d)", id, cmd.Process.Pid, localPort)
 		return nil // Success
 	} else {
 		// Should not happen if StartPortForward only returns nil cmd with non-nil error
 		// Release reservation as a precaution
-		if currentHolder, ok := pf.activeLocalPorts[localPort]; ok && currentHolder == index {
+		if currentHolder, ok := pf.activeLocalPorts[localPort]; ok && currentHolder == id {
 			delete(pf.activeLocalPorts, localPort)
-			logging.LogDebug("Released local port %d reservation for index %d due to nil cmd/err", localPort, index)
+			logging.LogDebug("Released local port %d reservation for '%s' due to nil cmd/err", localPort, id)
 		}
-		return fmt.Errorf("StartPortForward returned nil command without error for index %d", index)
+		return fmt.Errorf("StartPortForward returned nil command without error for '%s'", id)
 	}
 }
 
-// Stop attempts to stop the port-forward process for the given index.
-func (pf *PortForwarder) Stop(index int) error {
+// Stop attempts to stop the port-forward process for the given config ID.
+func (pf *PortForwarder) Stop(id string) error {
 	pf.Mutex.Lock()
 	defer pf.Mutex.Unlock()
 
-	runningInfo, exists := pf.RunningForwards[index]
+	runningInfo, exists := pf.RunningForwards[id]
 	if !exists {
 		// Not running (or not tracked), do nothing
-		logging.LogDebug("Stop: Port-forward for index %d not found or already stopped.", index)
+		logging.LogDebug("Stop: Port-forward for '%s' not found or already stopped.", id)
 		return nil
 	}
 
@@ -233,68 +234,61 @@ func (pf *PortForwarder) Stop(index int) error {
 
 	// Release internal reservation first
 	if currentHolder, reserved := pf.activeLocalPorts[localPort]; reserved {
-		if currentHolder == index {
+		if currentHolder == id {
 			delete(pf.activeLocalPorts, localPort)
-			logging.LogDebug("Stop: Released internal reservation for local port %d (index %d)", localPort, index)
+			logging.LogDebug("Stop: Released internal reservation for local port %d ('%s')", localPort, id)
 		} else {
 			// Log if reservation was held by someone else (indicates inconsistency)
-			logging.LogError("Stop: Port %d reservation for index %d was held by index %d! Inconsistency?", localPort, index, currentHolder)
+			logging.LogError("Stop: Port %d reservation for '%s' was held by '%s'! Inconsistency?", localPort, id, currentHolder)
 		}
 	} else {
 		// Log if no reservation existed (indicates inconsistency)
-		logging.LogError("Stop: No internal reservation found for local port %d (index %d) during stop! Inconsistency?", localPort, index)
+		logging.LogError("Stop: No internal reservation found for local port %d ('%s') during stop! Inconsistency?", localPort, id)
 	}
 
 	// Now stop the actual process
 	err := StopPortForward(runningInfo.cmd) // Call helper
 	if err != nil {
 		// Log the error but proceed to remove from map
-		logging.LogError("Stop: Error stopping port-forward process for index %d (PID: %d, Port: %d): %v", index, runningInfo.cmd.Process.Pid, localPort, err)
+		logging.LogError("Stop: Error stopping port-forward process for '%s' (PID: %d, Port: %d): %v", id, runningInfo.cmd.Process.Pid, localPort, err)
 	}
 
 	// Remove from running map
-	delete(pf.RunningForwards, index)
-	logging.LogDebug("Stop: Stopped and deregistered port-forward for index %d (Port: %d)", index, localPort)
+	delete(pf.RunningForwards, id)
+	logging.LogDebug("Stop: Stopped and deregistered port-forward for '%s' (Port: %d)", id, localPort)
 	return err // Return the error from StopPortForward helper
 }
 
-// SyncPortForwards is now a no-op since status is not stored in config
-// Port forwards are managed entirely through UI interactions (Start/Stop methods)
-// This method is kept for interface compatibility but does nothing
-func (pf *PortForwarder) SyncPortForwards(configs []config.PortForwardConfig) map[int]error {
-	logging.LogDebug("SyncPortForwards called - no action taken (runtime state only)")
-	return make(map[int]error) // Return empty map
-}
-
 // stopInternal stops a forward assuming the lock is already held.
-func (pf *PortForwarder) stopInternal(index int) error {
-	runningInfo, exists := pf.RunningForwards[index]
+func (pf *PortForwarder) stopInternal(id string) error {
+	runningInfo, exists := pf.RunningForwards[id]
 	if !exists {
 		return nil // Already stopped
 	}
 	localPort := runningInfo.localPort
-	if currentHolder, reserved := pf.activeLocalPorts[localPort]; reserved && currentHolder == index {
+	if currentHolder, reserved := pf.activeLocalPorts[localPort]; reserved && currentHolder == id {
 		delete(pf.activeLocalPorts, localPort)
 	}
 	err := StopPortForward(runningInfo.cmd) // Call helper
-	delete(pf.RunningForwards, index)
-	logging.LogDebug("stopInternal: Stopped index %d (Port: %d)", index, localPort)
+	delete(pf.RunningForwards, id)
+	logging.LogDebug("stopInternal: Stopped '%s' (Port: %d)", id, localPort)
 	return err
 }
 
 // startInternal starts a forward assuming the lock is already held for map checks/updates.
-func (pf *PortForwarder) startInternal(index int, cfg config.PortForwardConfig) error {
+func (pf *PortForwarder) startInternal(cfg config.PortForwardConfig) error {
+	id := cfg.ID
 	localPort := cfg.PortLocal
-	if _, exists := pf.RunningForwards[index]; exists {
+	if _, exists := pf.RunningForwards[id]; exists {
 		return nil // Already running
 	}
-	if conflictingIndex, reserved := pf.activeLocalPorts[localPort]; reserved {
-		return fmt.Errorf("%w: port %d requested by index %d, but reserved by index %d", ErrLocalPortReserved, localPort, index, conflictingIndex)
+	if conflictingID, reserved := pf.activeLocalPorts[localPort]; reserved {
+		return fmt.Errorf("%w: port %d requested by '%s', but reserved by '%s'", ErrLocalPortReserved, localPort, id, conflictingID)
 	}
 
 	// Reserve port
-	pf.activeLocalPorts[localPort] = index
-	logging.LogDebug("startInternal: Reserved port %d for index %d", localPort, index)
+	pf.activeLocalPorts[localPort] = id
+	logging.LogDebug("startInternal: Reserved port %d for '%s'", localPort, id)
 
 	// Unlock *briefly* only for the potentially blocking call
 	pf.Mutex.Unlock()
@@ -311,29 +305,29 @@ func (pf *PortForwarder) startInternal(index int, cfg config.PortForwardConfig) 
 
 	if err != nil {
 		// Failed, release reservation
-		if currentHolder, ok := pf.activeLocalPorts[localPort]; ok && currentHolder == index {
+		if currentHolder, ok := pf.activeLocalPorts[localPort]; ok && currentHolder == id {
 			delete(pf.activeLocalPorts, localPort)
 		}
 		return err // Return error from helper
 	}
 	if cmd != nil {
 		// Succeeded, add to running map
-		pf.RunningForwards[index] = &runningInfo{cmd: cmd, localPort: localPort}
+		pf.RunningForwards[id] = &runningInfo{cmd: cmd, localPort: localPort}
 		return nil // Success
 	} else {
 		// Failed (nil cmd/err case), release reservation
-		if currentHolder, ok := pf.activeLocalPorts[localPort]; ok && currentHolder == index {
+		if currentHolder, ok := pf.activeLocalPorts[localPort]; ok && currentHolder == id {
 			delete(pf.activeLocalPorts, localPort)
 		}
-		return fmt.Errorf("StartPortForward returned nil cmd/err for index %d", index)
+		return fmt.Errorf("StartPortForward returned nil cmd/err for '%s'", id)
 	}
 }
 
-// IsRunning checks if a port forward is currently running for the given index
-func (pf *PortForwarder) IsRunning(index int) bool {
+// IsRunning checks if a port forward is currently running for the given config ID
+func (pf *PortForwarder) IsRunning(id string) bool {
 	pf.Mutex.Lock()
 	defer pf.Mutex.Unlock()
-	_, exists := pf.RunningForwards[index]
+	_, exists := pf.RunningForwards[id]
 	return exists
 }
 
@@ -341,23 +335,23 @@ func (pf *PortForwarder) IsRunning(index int) bool {
 func (pf *PortForwarder) CleanupAll() {
 	pf.Mutex.Lock()
 	defer pf.Mutex.Unlock()
-	indices := make([]int, 0, len(pf.RunningForwards))
-	for idx := range pf.RunningForwards {
-		indices = append(indices, idx)
+	ids := make([]string, 0, len(pf.RunningForwards))
+	for id := range pf.RunningForwards {
+		ids = append(ids, id)
 	}
-	for _, idx := range indices {
-		logging.LogDebug("CleanupAll: Stopping index %d", idx)
-		_ = pf.stopInternal(idx) // Call internal stop
+	for _, id := range ids {
+		logging.LogDebug("CleanupAll: Stopping '%s'", id)
+		_ = pf.stopInternal(id) // Call internal stop
 	}
-	pf.RunningForwards = make(map[int]*runningInfo)
-	pf.activeLocalPorts = make(map[int]int)
+	pf.RunningForwards = make(map[string]*runningInfo)
+	pf.activeLocalPorts = make(map[int]string)
 	logging.LogDebug("CleanupAll finished.")
 }
 
 // RestartResult represents the outcome of a restart operation
 type RestartResult struct {
-	RestartedCount int           // Number of port forwards restarted
-	Errors         map[int]error // Errors by config index
+	RestartedCount int              // Number of port forwards restarted
+	Errors         map[string]error // Errors by config ID
 }
 
 // RestartRunningForwards restarts all currently running port forwards
@@ -368,47 +362,51 @@ func (pf *PortForwarder) RestartRunningForwards(configs []config.PortForwardConf
 
 	result := &RestartResult{
 		RestartedCount: 0,
-		Errors:         make(map[int]error),
+		Errors:         make(map[string]error),
 	}
 
-	// Get a snapshot of currently running indices
-	runningIndices := []int{}
-	for index := range pf.RunningForwards {
-		runningIndices = append(runningIndices, index)
+	configsByID := make(map[string]config.PortForwardConfig, len(configs))
+	for _, cfg := range configs {
+		configsByID[cfg.ID] = cfg
 	}
 
-	logging.LogDebug("RestartRunningForwards: Found %d running port forwards to restart", len(runningIndices))
+	// Get a snapshot of currently running IDs
+	runningIDs := []string{}
+	for id := range pf.RunningForwards {
+		runningIDs = append(runningIDs, id)
+	}
+
+	logging.LogDebug("RestartRunningForwards: Found %d running port forwards to restart", len(runningIDs))
 
 	// Restart each running port forward
-	for _, index := range runningIndices {
-		// Get the config for this index
-		if index >= len(configs) {
-			logging.LogError("RestartRunningForwards: Index %d is out of bounds (configs length: %d)", index, len(configs))
-			result.Errors[index] = fmt.Errorf("index %d out of bounds", index)
+	for _, id := range runningIDs {
+		cfg, found := configsByID[id]
+		if !found {
+			logging.LogError("RestartRunningForwards: Config '%s' no longer exists", id)
+			result.Errors[id] = fmt.Errorf("config '%s' no longer exists", id)
 			continue
 		}
-		cfg := configs[index]
 
-		logging.LogDebug("RestartRunningForwards: Restarting port forward %d (%s)", index, cfg.Service)
+		logging.LogDebug("RestartRunningForwards: Restarting port forward '%s' (%s)", id, cfg.Service)
 
 		// Stop the current port forward
-		stopErr := pf.stopInternal(index)
+		stopErr := pf.stopInternal(id)
 		if stopErr != nil {
-			logging.LogError("RestartRunningForwards: Failed to stop port forward %d: %v", index, stopErr)
-			result.Errors[index] = fmt.Errorf("failed to stop: %w", stopErr)
+			logging.LogError("RestartRunningForwards: Failed to stop port forward '%s': %v", id, stopErr)
+			result.Errors[id] = fmt.Errorf("failed to stop: %w", stopErr)
 			continue
 		}
 
 		// Start it again with the same config
-		startErr := pf.startInternal(index, cfg)
+		startErr := pf.startInternal(cfg)
 		if startErr != nil {
-			logging.LogError("RestartRunningForwards: Failed to start port forward %d: %v", index, startErr)
-			result.Errors[index] = fmt.Errorf("failed to restart: %w", startErr)
+			logging.LogError("RestartRunningForwards: Failed to start port forward '%s': %v", id, startErr)
+			result.Errors[id] = fmt.Errorf("failed to restart: %w", startErr)
 			continue
 		}
 
 		result.RestartedCount++
-		logging.LogDebug("RestartRunningForwards: Successfully restarted port forward %d (%s)", index, cfg.Service)
+		logging.LogDebug("RestartRunningForwards: Successfully restarted port forward '%s' (%s)", id, cfg.Service)
 	}
 
 	logging.LogDebug("RestartRunningForwards: Complete - Restarted: %d, Errors: %d", result.RestartedCount, len(result.Errors))

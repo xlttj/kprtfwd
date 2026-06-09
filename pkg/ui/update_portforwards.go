@@ -122,17 +122,17 @@ func (m *Model) updatePortForwards(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			// Check current runtime state to determine toggle action
-			if m.portForwarder.IsRunning(selectedIdx) { // Currently running - stop it
-				err := m.portForwarder.Stop(selectedIdx)
+			if m.portForwarder.IsRunning(cfg.ID) { // Currently running - stop it
+				err := m.portForwarder.Stop(cfg.ID)
 				if err != nil {
-					logging.LogError("Error stopping port-forward %d: %v", selectedIdx, err)
+					logging.LogError("Error stopping port-forward '%s': %v", cfg.ID, err)
 					m.errorMsg = fmt.Sprintf("Error stopping %s: %v", cfg.Service, err)
 				}
 				// Refresh table to show updated runtime status
 				m.refreshTable()
 				return m, nil
 			} else { // Currently stopped - start it
-				err := m.portForwarder.Start(selectedIdx, cfg)
+				err := m.portForwarder.Start(cfg)
 				if err != nil {
 					if errors.Is(err, k8s.ErrPortInUse) {
 						m.errorMsg = fmt.Sprintf("Cannot start %s: %v", cfg.Service, err)
@@ -171,7 +171,7 @@ func (m *Model) updatePortForwards(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			// Check if the port forward is running
-			if !m.portForwarder.IsRunning(selectedIdx) {
+			if !m.portForwarder.IsRunning(cfg.ID) {
 				m.errorMsg = fmt.Sprintf("Cannot open URL: %s is not running", cfg.Service)
 				return m, nil
 			}
@@ -287,11 +287,11 @@ func (m *Model) commitPortEdit() (tea.Model, tea.Cmd) {
 	}
 
 	// Stop the port forward if it's currently running
-	wasRunning := m.portForwarder.IsRunning(m.editConfigIndex)
+	wasRunning := m.portForwarder.IsRunning(cfg.ID)
 	if wasRunning {
-		err := m.portForwarder.Stop(m.editConfigIndex)
+		err := m.portForwarder.Stop(cfg.ID)
 		if err != nil {
-			logging.LogError("Error stopping port-forward %d for edit: %v", m.editConfigIndex, err)
+			logging.LogError("Error stopping port-forward '%s' for edit: %v", cfg.ID, err)
 			m.errorMsg = fmt.Sprintf("Error stopping %s for editing: %v", cfg.Service, err)
 			m.editMode = false
 			m.editInput.Blur()
@@ -326,22 +326,11 @@ func (m *Model) commitPortEdit() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		// Find the new index after adding the config back
-		newIndex, found := m.configStore.GetIndexByID(updatedCfg.ID)
-		if !found {
-			logging.LogError("Error: Could not find newly added config with ID %s", updatedCfg.ID)
-			m.errorMsg = "Error: Could not locate updated config"
-			m.editMode = false
-			m.editInput.Blur()
-			m.portForwardsTable.Focus()
-			return m, nil
-		}
-
 		// If it was running before, start it with the new port
 		if wasRunning {
-			err = m.portForwarder.Start(newIndex, updatedCfg)
+			err = m.portForwarder.Start(updatedCfg)
 			if err != nil {
-				logging.LogError("Error restarting port-forward %d after edit: %v", newIndex, err)
+				logging.LogError("Error restarting port-forward '%s' after edit: %v", updatedCfg.ID, err)
 				m.errorMsg = fmt.Sprintf("Updated port but failed to restart %s: %v", cfg.Service, err)
 			} else {
 				m.statusMsg = fmt.Sprintf("Updated %s local port to %d and restarted", cfg.Service, newPort)

@@ -303,38 +303,14 @@ func NewModel() *Model {
 		return nil // Can't proceed without a config store
 	}
 
+	// --- Initialize PortForwarder ---
+	pf := k8s.NewPortForwarder()
+
 	// Get initial configs slice
 	initialCfgs := cfgStore.GetAll()
 
-	// --- Initialize PortForwarder and Sync ---
-	pf := k8s.NewPortForwarder()
-	// Call sync with the initially loaded configs
-	startFailures := pf.SyncPortForwards(initialCfgs)
-
-	// *** Handle Start Failures ***
-	// Since SyncPortForwards is now a no-op, startFailures should be empty,
-	// but we'll keep this logic for compatibility
-	if len(startFailures) > 0 {
-		logging.LogError("SyncPortForwards reported %d start failures during initialization", len(startFailures))
-		for index, startErr := range startFailures {
-			// Retrieve the config that failed
-			failedCfg, exists := cfgStore.Get(index)
-			if !exists {
-				// This shouldn't happen if index came from the initial list
-				logging.LogError("Internal inconsistency: Config index %d from startFailures not found in store", index)
-				continue
-			}
-			// Note: Since status is no longer in config, we just log the failure
-			logging.LogDebug("Config %d (%s/%s) sync start failure: %v", index, failedCfg.Namespace, failedCfg.Service, startErr)
-		}
-	}
-
-	// Get the potentially updated configs *after* handling failures
-	finalInitialCfgs := cfgStore.GetAll()
-
-	// *** Log configs AFTER sync and failure handling ***
 	logging.LogDebug("NewModel: Configs loaded before UI init:")
-	for i, cfg := range finalInitialCfgs {
+	for i, cfg := range initialCfgs {
 		logging.LogDebug("  Index %d: %s/%s", i, cfg.Namespace, cfg.Service)
 	}
 
@@ -387,7 +363,7 @@ func NewModel() *Model {
 	pfCols := m.calculateColumnWidths()
 	pfTable := table.New(
 		table.WithColumns(pfCols),
-		table.WithRows(m.generateGroupedRows(finalInitialCfgs)), // Use grouped rows
+		table.WithRows(m.generateGroupedRows(initialCfgs)), // Use grouped rows
 		table.WithFocused(true),
 		table.WithHeight(10),
 		table.WithStyles(s),
@@ -564,11 +540,11 @@ func (m *Model) formatRestartSummary(result *k8s.RestartResult) string {
 	if len(result.Errors) > 0 {
 		// Show errors first
 		errorMsgs := []string{}
-		for idx, err := range result.Errors {
-			if cfg, exists := m.configStore.Get(idx); exists {
+		for id, err := range result.Errors {
+			if cfg, exists := m.configStore.GetConfigByID(id); exists {
 				errorMsgs = append(errorMsgs, fmt.Sprintf("%s: %v", cfg.Service, err))
 			} else {
-				errorMsgs = append(errorMsgs, fmt.Sprintf("Index %d: %v", idx, err))
+				errorMsgs = append(errorMsgs, fmt.Sprintf("%s: %v", id, err))
 			}
 		}
 		return fmt.Sprintf("Restart errors: %s", strings.Join(errorMsgs, "; "))
