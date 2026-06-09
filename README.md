@@ -267,7 +267,7 @@ Enable debug logging for troubleshooting:
 DEBUG=1 kprtfwd
 ```
 
-This will create detailed logs in `./kprtfwd.log` showing:
+This will create detailed logs in `~/.kprtfwd/logs/kprtfwd.log` showing:
 - Port forward startup/shutdown events  
 - Configuration loading and parsing
 - Kubernetes API interactions

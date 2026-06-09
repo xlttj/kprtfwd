@@ -70,7 +70,7 @@ func HandlePruneCommand() {
 		if cfg.Context != actualContext {
 			continue
 		}
-		if !wildcardMatch(cfg.Namespace, *namespaceFilter) {
+		if !discovery.MatchesWildcardPattern(cfg.Namespace, *namespaceFilter) {
 			continue
 		}
 		key := cfg.Namespace + "/" + cfg.Service
@@ -106,29 +106,6 @@ func HandlePruneCommand() {
 		deleted++
 	}
 	fmt.Printf("🧹 Removed %d stale service(s).\n", deleted)
-}
-
-// wildcardMatch checks if text matches a wildcard pattern
-func wildcardMatch(text, pattern string) bool {
-	if pattern == "*" {
-		return true
-	}
-	if pattern == "" {
-		return text == ""
-	}
-	if strings.HasPrefix(pattern, "*") && strings.HasSuffix(pattern, "*") {
-		mid := pattern[1 : len(pattern)-1]
-		return strings.Contains(text, mid)
-	}
-	if strings.HasPrefix(pattern, "*") {
-		suf := pattern[1:]
-		return strings.HasSuffix(text, suf)
-	}
-	if strings.HasSuffix(pattern, "*") {
-		pre := pattern[:len(pattern)-1]
-		return strings.HasPrefix(text, pre)
-	}
-	return text == pattern
 }
 
 // getContextDisplay formats the context name for display

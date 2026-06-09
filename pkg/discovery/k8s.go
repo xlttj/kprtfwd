@@ -48,7 +48,7 @@ func DiscoverServices(opts Options) (*DiscoveryResult, error) {
 	// Get the current context if none specified
 	context := opts.Context
 	if context == "" {
-		currentContext, err := getCurrentContext()
+		currentContext, err := CurrentContext()
 		if err != nil {
 			return nil, fmt.Errorf("failed to get current context: %w", err)
 		}
@@ -134,8 +134,8 @@ func DiscoverServices(opts Options) (*DiscoveryResult, error) {
 	}, nil
 }
 
-// getCurrentContext gets the current kubectl context
-func getCurrentContext() (string, error) {
+// CurrentContext gets the current kubectl context
+func CurrentContext() (string, error) {
 	// Create context with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -200,7 +200,7 @@ func discoverNamespaces(kubeContext, filter string) ([]string, error) {
 	// Filter namespaces based on the pattern
 	var matchingNamespaces []string
 	for _, ns := range allNamespaces {
-		if matchesWildcardPattern(ns, filter) {
+		if MatchesWildcardPattern(ns, filter) {
 			matchingNamespaces = append(matchingNamespaces, ns)
 		}
 	}
@@ -307,9 +307,9 @@ func getAllServicesInContext(kubeContext string) ([]ServiceInfo, error) {
 	return services, nil
 }
 
-// matchesWildcardPattern checks if a string matches a wildcard pattern
+// MatchesWildcardPattern checks if a string matches a wildcard pattern
 // Supports * at the beginning, end, or both
-func matchesWildcardPattern(text, pattern string) bool {
+func MatchesWildcardPattern(text, pattern string) bool {
 	if pattern == "*" {
 		return true
 	}

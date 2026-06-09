@@ -208,7 +208,7 @@ func (m *Model) initializeClusterSelection() error {
 	m.discoverySelectedCluster = 0
 
 	// Find current context and select it by default
-	currentContext, err := getCurrentContext()
+	currentContext, err := discovery.CurrentContext()
 	if err == nil {
 		for i, cluster := range clusters {
 			if cluster == currentContext {
