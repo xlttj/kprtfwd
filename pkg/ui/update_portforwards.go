@@ -97,8 +97,8 @@ func (m *Model) updatePortForwards(msg tea.Msg) (tea.Model, tea.Cmd) {
 				groupName := m.getSelectedGroupName()
 				if state, exists := m.groupStates[groupName]; exists {
 					state.Expanded = !state.Expanded
-					// Refresh table with updated group state
-					m.portForwardsTable.SetRows(m.generateGroupedRows(m.configStore.GetAll()))
+					// Refresh through refreshTable so any active filter is preserved
+					m.refreshTable()
 				}
 				return m, nil
 			}
@@ -139,6 +139,8 @@ func (m *Model) updatePortForwards(msg tea.Msg) (tea.Model, tea.Cmd) {
 					} else {
 						m.errorMsg = fmt.Sprintf("Error starting %s: %v", cfg.Service, err)
 					}
+					// Refresh so the failed forward shows its Error status immediately
+					m.refreshTable()
 					return m, nil
 				}
 				// Refresh table to show updated runtime status
@@ -214,6 +216,17 @@ func (m *Model) updatePortForwards(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.editInput.SetValue(fmt.Sprintf("%d", cfg.PortLocal))
 			m.editInput.Focus()
 			m.portForwardsTable.Blur()
+			return m, nil
+		case "S": // Stop all running port-forwards
+			m.errorMsg = ""
+			m.statusMsg = ""
+			count := m.portForwarder.StopAllRunning()
+			if count > 0 {
+				m.statusMsg = fmt.Sprintf("Stopped %d port forward(s)", count)
+			} else {
+				m.statusMsg = "No running port forwards to stop"
+			}
+			m.refreshTable()
 			return m, nil
 		case ShortcutRestartForwards: // ctrl+r
 			m.errorMsg = "" // Clear any previous errors

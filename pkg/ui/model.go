@@ -388,10 +388,21 @@ const statusRefreshInterval = 2 * time.Second
 // statusTickMsg drives the periodic runtime-status refresh.
 type statusTickMsg time.Time
 
+// tunnelProbeMsg carries the config IDs whose TCP tunnel a background probe
+// found broken (e.g. VPN dropped without killing kubectl).
+type tunnelProbeMsg []string
+
 func statusTickCmd() tea.Cmd {
 	return tea.Tick(statusRefreshInterval, func(t time.Time) tea.Msg {
 		return statusTickMsg(t)
 	})
+}
+
+// probeTunnelsCmd runs the (blocking) tunnel health probe off the event loop.
+func probeTunnelsCmd(pf *k8s.PortForwarder) tea.Cmd {
+	return func() tea.Msg {
+		return tunnelProbeMsg(pf.ProbeAllTunnels())
+	}
 }
 
 func (m *Model) Init() tea.Cmd {
@@ -402,9 +413,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case statusTickMsg:
 		// Sync displayed status with actual process state; the PortForwarder
-		// watcher goroutines deregister forwards whose process exited.
+		// watcher goroutines deregister forwards whose process exited. Also
+		// kick off a tunnel health probe to catch VPN drops that leave kubectl
+		// running but the tunnel dead.
 		m.refreshTable()
-		return m, statusTickCmd()
+		return m, tea.Batch(statusTickCmd(), probeTunnelsCmd(m.portForwarder))
+
+	case tunnelProbeMsg:
+		if len(msg) > 0 {
+			m.portForwarder.MarkBroken([]string(msg))
+			m.refreshTable()
+		}
+		return m, nil
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width

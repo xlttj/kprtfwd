@@ -20,6 +20,12 @@ var ErrPortInUse = errors.New("local port already in use")
 // Sentinel error for port reserved internally by the application
 var ErrLocalPortReserved = errors.New("local port is already reserved by another active forward")
 
+// startupProbeDelay is how long StartPortForward waits before checking that
+// kubectl is still alive. It lets fast failures (VPN down, bad context, port
+// conflict kubectl detects itself) surface synchronously as a start error
+// instead of flickering Running until the next status tick.
+const startupProbeDelay = 200 * time.Millisecond
+
 // PortForwardParams contains the essential parameters for starting a port-forward.
 type PortForwardParams struct {
 	Context    string
@@ -33,6 +39,7 @@ type PortForwardParams struct {
 type runningInfo struct {
 	cmd       *exec.Cmd
 	localPort int
+	startedAt time.Time     // when the process was registered; used to grace-skip health probes
 	stopping  bool          // set (under PortForwarder.Mutex) before an intentional kill
 	done      chan struct{} // closed by the watcher once the process is reaped
 }
@@ -43,9 +50,10 @@ type runningInfo struct {
 type PortForwarder struct {
 	RunningForwards  map[string]*runningInfo // Map of config ID to running info
 	activeLocalPorts map[int]string          // Map of active local port -> config ID
-	// Mutex protects the two maps above. It must never be held across
-	// blocking calls (spawning kubectl, waiting on a process); only the
-	// non-blocking Kill signal may be sent while holding it.
+	failedForwards   map[string]struct{}     // IDs that exited unexpectedly or failed to start
+	// Mutex protects the maps above. It must never be held across blocking
+	// calls (spawning kubectl, waiting on a process); only the non-blocking
+	// Kill signal may be sent while holding it.
 	Mutex sync.Mutex
 }
 
@@ -54,6 +62,7 @@ func NewPortForwarder() *PortForwarder {
 	return &PortForwarder{
 		RunningForwards:  make(map[string]*runningInfo),
 		activeLocalPorts: make(map[int]string),
+		failedForwards:   make(map[string]struct{}),
 	}
 }
 
@@ -126,6 +135,12 @@ func StartPortForward(params PortForwardParams) (*exec.Cmd, error) {
 	}
 	cmd := exec.Command("kubectl", args...)
 
+	// Put kubectl in its own process group so that any child processes it
+	// spawns (SSO exec-credential plugins, browser launchers) can be killed as
+	// a unit. Otherwise a child holding the stderr pipe open keeps cmd.Wait()
+	// blocked forever. See portforward_proc_unix.go / portforward_proc_windows.go.
+	setProcGroupAttrs(cmd)
+
 	var stderr bytes.Buffer
 
 	// Set stderr to capture output for checking
@@ -144,21 +159,39 @@ func StartPortForward(params PortForwardParams) (*exec.Cmd, error) {
 		return nil, fmt.Errorf("kubectl start failed: %w", err)
 	}
 
-	// The stderr buffer must not be read here: exec's copy goroutine writes
-	// to it until the process exits, so it is only safe to read after Wait
-	// returns (the watcher logs it on unexpected exit).
+	// Fast-failure detection (VPN down, invalid context, port conflict kubectl
+	// detects itself) is done by the caller via the watcher's done channel, not
+	// here: cmd.ProcessState is only set after Wait, and a signal-0 liveness
+	// check is defeated by zombies (an exited-but-unreaped process still
+	// answers). The stderr buffer must not be read on this success path either —
+	// exec's copy goroutine keeps writing to it until the process exits, so it
+	// is only safe to read after Wait returns.
 	logging.LogDebug("Started port-forward process PID: %d", cmd.Process.Pid)
 	return cmd, nil
 }
 
-// killProcess terminates a port-forward process without reaping it.
-// The watcher goroutine owns cmd.Wait, so this must never Wait.
+// drainStderr returns the captured stderr of a finished command. It must only
+// be called after cmd.Wait() has returned, when exec's copy goroutine is done.
+func drainStderr(cmd *exec.Cmd) string {
+	if cmd == nil {
+		return ""
+	}
+	if buf, ok := cmd.Stderr.(*bytes.Buffer); ok {
+		return strings.TrimSpace(buf.String())
+	}
+	return ""
+}
+
+// killProcess terminates a port-forward process group without reaping it.
+// The watcher goroutine owns cmd.Wait, so this must never Wait. Killing the
+// whole group (not just kubectl) closes every write-end of the stderr pipe,
+// including SSO credential subprocesses, so the watcher's Wait returns promptly.
 func killProcess(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
-	logging.LogDebug("Killing port-forward process PID: %d", cmd.Process.Pid)
-	return cmd.Process.Kill()
+	logging.LogDebug("Killing port-forward process group PID: %d", cmd.Process.Pid)
+	return killCmdGroup(cmd)
 }
 
 // watch reaps the kubectl process and cleans up tracking state when it exits
@@ -166,13 +199,17 @@ func killProcess(cmd *exec.Cmd) error {
 // deletion, ...). Exactly one watcher owns cmd.Wait per started process.
 func (pf *PortForwarder) watch(id string, info *runningInfo) {
 	err := info.cmd.Wait()
-	if info.done != nil {
-		close(info.done) // the process is reaped; its sockets are released
-	}
+	// Clean up tracking state first, then signal done. Closing done last means
+	// a waiter (Start's quick-exit check, RestartRunningForwards) observes
+	// fully-settled state — and a reaped process whose socket is released.
 	pf.handleProcessExit(id, info, err)
+	if info.done != nil {
+		close(info.done)
+	}
 }
 
-// handleProcessExit deregisters a forward whose process exited on its own.
+// handleProcessExit deregisters a forward whose process exited on its own and
+// records it as errored so the UI can show an Error status.
 func (pf *PortForwarder) handleProcessExit(id string, info *runningInfo, waitErr error) {
 	pf.Mutex.Lock()
 	defer pf.Mutex.Unlock()
@@ -182,22 +219,18 @@ func (pf *PortForwarder) handleProcessExit(id string, info *runningInfo, waitErr
 		return
 	}
 	if current, exists := pf.RunningForwards[id]; !exists || current != info {
-		// The ID was deregistered or is owned by a newer process now.
+		// The ID was deregistered (e.g. by MarkBroken) or is owned by a newer
+		// process now; whoever superseded us is responsible for its state.
 		return
 	}
 	delete(pf.RunningForwards, id)
 	if holder, reserved := pf.activeLocalPorts[info.localPort]; reserved && holder == id {
 		delete(pf.activeLocalPorts, info.localPort)
 	}
+	pf.failedForwards[id] = struct{}{}
 
 	// Safe to read only now: exec's copy goroutine finished when Wait returned.
-	stderrStr := ""
-	if info.cmd != nil {
-		if buf, ok := info.cmd.Stderr.(*bytes.Buffer); ok {
-			stderrStr = strings.TrimSpace(buf.String())
-		}
-	}
-	logging.LogError("Port-forward '%s' (port %d) exited unexpectedly: %v (stderr: %s)", id, info.localPort, waitErr, stderrStr)
+	logging.LogError("Port-forward '%s' (port %d) exited unexpectedly: %v (stderr: %s)", id, info.localPort, waitErr, drainStderr(info.cmd))
 }
 
 // Start attempts to start the port-forward for the given config.
@@ -239,10 +272,9 @@ func (pf *PortForwarder) Start(cfg config.PortForwardConfig) error {
 
 	// --- Handle outcome ---
 	pf.Mutex.Lock() // Re-acquire lock to update state
-	defer pf.Mutex.Unlock()
 
-	if err != nil {
-		// Start failed, release the reservation
+	if err != nil || cmd == nil {
+		// Start failed, release the reservation and record error state
 		if currentHolder, ok := pf.activeLocalPorts[localPort]; ok && currentHolder == id {
 			delete(pf.activeLocalPorts, localPort)
 			logging.LogDebug("Released local port %d reservation for '%s' due to start failure: %v", localPort, id, err)
@@ -250,25 +282,36 @@ func (pf *PortForwarder) Start(cfg config.PortForwardConfig) error {
 			// Log if reservation was already gone or held by someone else (shouldn't happen ideally)
 			logging.LogError("Could not release reservation for port %d ('%s') after start failure. Current holder: '%s', Exists: %t", localPort, id, currentHolder, ok)
 		}
-		return err // Return the original error from StartPortForward
-	}
-
-	if cmd != nil {
-		// Start succeeded, store running info
-		info := &runningInfo{cmd: cmd, localPort: localPort, done: make(chan struct{})}
-		pf.RunningForwards[id] = info
-		go pf.watch(id, info)
-		// Reservation in activeLocalPorts remains
-		logging.LogDebug("Successfully started and registered port-forward for '%s' (PID: %d, Port: %d)", id, cmd.Process.Pid, localPort)
-		return nil // Success
-	} else {
-		// Should not happen if StartPortForward only returns nil cmd with non-nil error
-		// Release reservation as a precaution
-		if currentHolder, ok := pf.activeLocalPorts[localPort]; ok && currentHolder == id {
-			delete(pf.activeLocalPorts, localPort)
-			logging.LogDebug("Released local port %d reservation for '%s' due to nil cmd/err", localPort, id)
+		pf.failedForwards[id] = struct{}{}
+		pf.Mutex.Unlock()
+		if err != nil {
+			return err // Return the original error from StartPortForward
 		}
 		return fmt.Errorf("StartPortForward returned nil command without error for '%s'", id)
+	}
+
+	// Start succeeded — clear any previous error and register the forward.
+	delete(pf.failedForwards, id)
+	info := &runningInfo{cmd: cmd, localPort: localPort, startedAt: time.Now(), done: make(chan struct{})}
+	pf.RunningForwards[id] = info
+	go pf.watch(id, info)
+	logging.LogDebug("Successfully started and registered port-forward for '%s' (PID: %d, Port: %d)", id, cmd.Process.Pid, localPort)
+	pf.Mutex.Unlock()
+
+	// Quick-exit detection: give kubectl a moment to fail fast (VPN down, bad
+	// context, port conflict it detects itself). If the watcher reaps the
+	// process within the grace window, it exited immediately — surface that as
+	// a start error so the UI shows Error now instead of flickering Running
+	// until the next status tick. The watcher has already marked it failed and
+	// deregistered it (done is closed only after that cleanup completes).
+	select {
+	case <-info.done:
+		if stderrStr := drainStderr(cmd); stderrStr != "" {
+			return fmt.Errorf("kubectl exited: %s", stderrStr)
+		}
+		return fmt.Errorf("kubectl exited immediately (check VPN / kube context / port conflicts)")
+	case <-time.After(startupProbeDelay):
+		return nil // survived startup; treat as running
 	}
 }
 
@@ -278,7 +321,9 @@ func (pf *PortForwarder) Stop(id string) error {
 
 	info, exists := pf.RunningForwards[id]
 	if !exists {
-		// Not running (or not tracked), do nothing
+		// Not running (or not tracked). Still clear any error state, since an
+		// explicit stop is an intentional action.
+		delete(pf.failedForwards, id)
 		pf.Mutex.Unlock()
 		logging.LogDebug("Stop: Port-forward for '%s' not found or already stopped.", id)
 		return nil
@@ -305,6 +350,9 @@ func (pf *PortForwarder) Stop(id string) error {
 		logging.LogError("Stop: No internal reservation found for local port %d ('%s') during stop! Inconsistency?", localPort, id)
 	}
 
+	// Intentional stop clears error state.
+	delete(pf.failedForwards, id)
+
 	// Remove from running map
 	delete(pf.RunningForwards, id)
 	pf.Mutex.Unlock()
@@ -322,13 +370,15 @@ func (pf *PortForwarder) Stop(id string) error {
 func (pf *PortForwarder) stopInternal(id string) error {
 	info, exists := pf.RunningForwards[id]
 	if !exists {
-		return nil // Already stopped
+		delete(pf.failedForwards, id) // intentional stop clears error state
+		return nil                    // Already stopped
 	}
 	info.stopping = true
 	localPort := info.localPort
 	if currentHolder, reserved := pf.activeLocalPorts[localPort]; reserved && currentHolder == id {
 		delete(pf.activeLocalPorts, localPort)
 	}
+	delete(pf.failedForwards, id) // intentional stop clears error state
 	delete(pf.RunningForwards, id)
 	// Kill is a non-blocking signal; the watcher goroutine reaps the process.
 	err := killProcess(info.cmd)
@@ -342,6 +392,31 @@ func (pf *PortForwarder) IsRunning(id string) bool {
 	defer pf.Mutex.Unlock()
 	_, exists := pf.RunningForwards[id]
 	return exists
+}
+
+// IsError reports whether the port-forward with the given ID is in an error
+// state — it either failed to start or its process exited unexpectedly. The
+// flag is cleared once the forward is intentionally stopped or restarts cleanly.
+func (pf *PortForwarder) IsError(id string) bool {
+	pf.Mutex.Lock()
+	defer pf.Mutex.Unlock()
+	_, failed := pf.failedForwards[id]
+	return failed
+}
+
+// StopAllRunning stops every currently running port-forward and returns how
+// many were stopped. Error state is cleared for each (intentional action).
+func (pf *PortForwarder) StopAllRunning() int {
+	pf.Mutex.Lock()
+	defer pf.Mutex.Unlock()
+	ids := make([]string, 0, len(pf.RunningForwards))
+	for id := range pf.RunningForwards {
+		ids = append(ids, id)
+	}
+	for _, id := range ids {
+		_ = pf.stopInternal(id)
+	}
+	return len(ids)
 }
 
 // CleanupAll stops all port-forwards
@@ -358,7 +433,106 @@ func (pf *PortForwarder) CleanupAll() {
 	}
 	pf.RunningForwards = make(map[string]*runningInfo)
 	pf.activeLocalPorts = make(map[int]string)
+	pf.failedForwards = make(map[string]struct{})
 	logging.LogDebug("CleanupAll finished.")
+}
+
+// isPortForwardHealthy dials localhost:localPort and determines whether kubectl's
+// tunnel is live. A healthy tunnel: kubectl holds the connection open waiting to
+// forward data → our read times out. A broken tunnel (VPN down, pod gone): kubectl
+// closes the connection immediately → we get EOF. Connection refused means kubectl
+// is no longer listening (also unhealthy).
+//
+// Limitation: silent packet-drop black-holes (VPN route gone, no RST) cannot be
+// detected this way because kubectl still appears to hold the connection.
+func isPortForwardHealthy(localPort int) bool {
+	address := fmt.Sprintf("127.0.0.1:%d", localPort)
+	conn, err := net.DialTimeout("tcp", address, 200*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	buf := make([]byte, 1)
+	_, err = conn.Read(buf)
+	if err == nil {
+		return true // received data — definitely healthy
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true // held open — tunnel is live
+	}
+	return false // EOF or other error — upstream unreachable
+}
+
+// ProbeAllTunnels checks every running forward's TCP tunnel health concurrently
+// and returns the IDs of forwards whose tunnel appears broken. Forwards started
+// within the grace period are skipped so a just-started tunnel isn't flagged
+// before kubectl has finished establishing it. Blocking; call from a goroutine
+// or tea.Cmd.
+func (pf *PortForwarder) ProbeAllTunnels() []string {
+	const probeGrace = 5 * time.Second // don't probe a forward that just started
+
+	pf.Mutex.Lock()
+	toProbe := make(map[string]int) // id → localPort
+	for id, info := range pf.RunningForwards {
+		if time.Since(info.startedAt) < probeGrace {
+			continue
+		}
+		toProbe[id] = info.localPort
+	}
+	pf.Mutex.Unlock()
+
+	if len(toProbe) == 0 {
+		return nil
+	}
+
+	type result struct {
+		id      string
+		healthy bool
+	}
+	ch := make(chan result, len(toProbe))
+	for id, port := range toProbe {
+		go func(i string, p int) {
+			ch <- result{i, isPortForwardHealthy(p)}
+		}(id, port)
+	}
+
+	var broken []string
+	for range toProbe {
+		r := <-ch
+		if !r.healthy {
+			broken = append(broken, r.id)
+		}
+	}
+	return broken
+}
+
+// MarkBroken kills and deregisters the forwards with the given IDs, marking each
+// as errored. Used to record tunnels that the TCP health probe found broken.
+// The killed process is reaped by its own watcher goroutine.
+func (pf *PortForwarder) MarkBroken(ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	pf.Mutex.Lock()
+	defer pf.Mutex.Unlock()
+	for _, id := range ids {
+		info, ok := pf.RunningForwards[id]
+		if !ok {
+			continue
+		}
+		if holder, ok2 := pf.activeLocalPorts[info.localPort]; ok2 && holder == id {
+			delete(pf.activeLocalPorts, info.localPort)
+		}
+		delete(pf.RunningForwards, id)
+		pf.failedForwards[id] = struct{}{}
+		logging.LogDebug("MarkBroken: tunnel broken for '%s' (port %d); killing process", id, info.localPort)
+		// Non-blocking kill under the lock (allowed by the mutex contract);
+		// the forward's watcher owns Wait and will reap it, then see the entry
+		// is gone and leave the error state we just set in place.
+		_ = killProcess(info.cmd)
+	}
 }
 
 // RestartResult represents the outcome of a restart operation

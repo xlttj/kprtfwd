@@ -33,6 +33,21 @@ func installFakeKubectl(t *testing.T) {
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
+// installFailingKubectl puts a fake kubectl that exits immediately with an
+// error on PATH, simulating a fast failure (VPN down / bad context).
+func installFailingKubectl(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake kubectl shell script requires a Unix-like OS")
+	}
+	dir := t.TempDir()
+	script := "#!/bin/sh\necho 'Unable to connect to the server' >&2\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write fake kubectl: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
 // freeLocalPort returns a TCP port that is currently free on localhost.
 func freeLocalPort(t *testing.T) int {
 	t.Helper()
@@ -59,13 +74,14 @@ func currentPid(t *testing.T, pf *PortForwarder, id string) int {
 
 // markRunning simulates an active forward without spawning a real kubectl
 // process (killProcess treats a nil cmd as already exited). The done channel
-// is pre-closed since there is no watcher to close it.
+// is pre-closed since there is no watcher to close it. startedAt is set in the
+// past so the entry is past the tunnel-probe grace period by default.
 func markRunning(pf *PortForwarder, id string, localPort int) {
 	done := make(chan struct{})
 	close(done)
 	pf.Mutex.Lock()
 	defer pf.Mutex.Unlock()
-	pf.RunningForwards[id] = &runningInfo{cmd: nil, localPort: localPort, done: done}
+	pf.RunningForwards[id] = &runningInfo{cmd: nil, localPort: localPort, done: done, startedAt: time.Now().Add(-time.Hour)}
 	pf.activeLocalPorts[localPort] = id
 }
 
@@ -326,5 +342,127 @@ func TestRestartReportsDeletedConfigByID(t *testing.T) {
 	}
 	if _, ok := result.Errors["ctx.ns.deleted"]; !ok {
 		t.Fatalf("expected error keyed by ID 'ctx.ns.deleted', got: %v", result.Errors)
+	}
+}
+
+// A fast kubectl failure (VPN down / bad context) must surface synchronously as
+// a start error and leave the forward in the Error state, not Running.
+func TestStartFailureMarksErrorState(t *testing.T) {
+	installFailingKubectl(t)
+
+	pf := NewPortForwarder()
+	cfg := config.PortForwardConfig{
+		ID: "ctx.ns.web", Context: "ctx", Namespace: "ns",
+		Service: "web", PortRemote: 80, PortLocal: freeLocalPort(t),
+	}
+	if err := pf.Start(cfg); err == nil {
+		t.Fatal("expected Start to fail when kubectl exits immediately")
+	}
+	if pf.IsRunning(cfg.ID) {
+		t.Fatal("failed forward must not be Running")
+	}
+	if !pf.IsError(cfg.ID) {
+		t.Fatal("failed forward must be in Error state")
+	}
+	pf.Mutex.Lock()
+	_, reserved := pf.activeLocalPorts[cfg.PortLocal]
+	pf.Mutex.Unlock()
+	if reserved {
+		t.Fatal("failed start must release the port reservation")
+	}
+}
+
+// A successful start clears a prior Error state.
+func TestSuccessfulStartClearsErrorState(t *testing.T) {
+	installFakeKubectl(t)
+
+	pf := NewPortForwarder()
+	defer pf.CleanupAll()
+	pf.Mutex.Lock()
+	pf.failedForwards["ctx.ns.web"] = struct{}{}
+	pf.Mutex.Unlock()
+
+	cfg := config.PortForwardConfig{
+		ID: "ctx.ns.web", Context: "ctx", Namespace: "ns",
+		Service: "web", PortRemote: 80, PortLocal: freeLocalPort(t),
+	}
+	if err := pf.Start(cfg); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	if pf.IsError(cfg.ID) {
+		t.Fatal("a clean start must clear the Error state")
+	}
+}
+
+// An intentional stop is never an error: it clears any prior Error state.
+func TestStopClearsErrorState(t *testing.T) {
+	pf := NewPortForwarder()
+	pf.Mutex.Lock()
+	pf.failedForwards["ctx.ns.web"] = struct{}{}
+	pf.Mutex.Unlock()
+
+	if err := pf.Stop("ctx.ns.web"); err != nil {
+		t.Fatalf("Stop returned error: %v", err)
+	}
+	if pf.IsError("ctx.ns.web") {
+		t.Fatal("Stop must clear the Error state")
+	}
+}
+
+func TestStopAllRunning(t *testing.T) {
+	pf := NewPortForwarder()
+	markRunning(pf, "ctx.ns.web", 8080)
+	markRunning(pf, "ctx.ns.api", 8081)
+
+	if n := pf.StopAllRunning(); n != 2 {
+		t.Fatalf("expected 2 forwards stopped, got %d", n)
+	}
+	if pf.IsRunning("ctx.ns.web") || pf.IsRunning("ctx.ns.api") {
+		t.Fatal("no forward should be running after StopAllRunning")
+	}
+	if n := pf.StopAllRunning(); n != 0 {
+		t.Fatalf("expected 0 on second call, got %d", n)
+	}
+}
+
+// MarkBroken deregisters a forward whose tunnel the probe found broken and
+// records it as errored, releasing its port.
+func TestMarkBrokenDeregistersAndMarksError(t *testing.T) {
+	pf := NewPortForwarder()
+	markRunning(pf, "ctx.ns.web", 8080)
+	markRunning(pf, "ctx.ns.api", 8081)
+
+	pf.MarkBroken([]string{"ctx.ns.web"})
+
+	if pf.IsRunning("ctx.ns.web") {
+		t.Fatal("broken forward must be deregistered")
+	}
+	if !pf.IsError("ctx.ns.web") {
+		t.Fatal("broken forward must be in Error state")
+	}
+	if !pf.IsRunning("ctx.ns.api") {
+		t.Fatal("unrelated forward must stay running")
+	}
+	pf.Mutex.Lock()
+	_, reserved := pf.activeLocalPorts[8080]
+	pf.Mutex.Unlock()
+	if reserved {
+		t.Fatal("MarkBroken must release the broken forward's port reservation")
+	}
+}
+
+// Forwards still within the startup grace period must not be probed (kubectl
+// may not have finished establishing the tunnel yet).
+func TestProbeAllTunnelsSkipsRecentlyStarted(t *testing.T) {
+	pf := NewPortForwarder()
+	done := make(chan struct{})
+	close(done)
+	pf.Mutex.Lock()
+	pf.RunningForwards["ctx.ns.web"] = &runningInfo{localPort: 8080, done: done, startedAt: time.Now()}
+	pf.activeLocalPorts[8080] = "ctx.ns.web"
+	pf.Mutex.Unlock()
+
+	if broken := pf.ProbeAllTunnels(); broken != nil {
+		t.Fatalf("recently started forward must be skipped, got broken=%v", broken)
 	}
 }

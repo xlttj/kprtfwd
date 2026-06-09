@@ -8,12 +8,21 @@ import (
 	"github.com/xlttj/kprtfwd/pkg/logging"
 
 	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/lipgloss"
 )
 
-// styleStatusText applies color styling to status text
+// styleStatusText colors the status text by state so Running/Stopped/Error are
+// distinguishable at a glance. The status strings are padded to equal width
+// (see constants) so the STATUS column stays aligned regardless of value.
 func styleStatusText(status string) string {
-	// Removed color styling to prevent table display issues
-	return status
+	switch status {
+	case StatusRunning:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color(ColorStatusRunning)).Render(status)
+	case StatusError:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color(ColorStatusError)).Render(status)
+	default: // StatusStopped
+		return lipgloss.NewStyle().Foreground(lipgloss.Color(ColorStatusStopped)).Render(status)
+	}
 }
 
 // generatePortForwardRows converts config slice to table.Row slice (ungrouped)
@@ -27,12 +36,14 @@ func (m *Model) generatePortForwardRows(configs []config.PortForwardConfig) []ta
 	rows := make([]table.Row, 0, len(actualConfigs))
 
 	for _, cfg := range actualConfigs {
-		// Determine actual runtime status by checking if port forward is running
-		statusText := StatusStopped
-
-		// Check actual runtime state from PortForwarder
+		// Determine actual runtime status by checking the PortForwarder.
+		var statusText string
 		if m.portForwarder.IsRunning(cfg.ID) {
 			statusText = StatusRunning
+		} else if m.portForwarder.IsError(cfg.ID) {
+			statusText = StatusError
+		} else {
+			statusText = StatusStopped
 		}
 
 		rows = append(rows, table.Row{
@@ -158,11 +169,15 @@ func (m *Model) generateGroupedRows(configs []config.PortForwardConfig) []table.
 				cfg := item.config
 				index := item.index
 
-				// Determine actual runtime status by checking if port forward is running
-				statusText := StatusStopped
+				// Determine actual runtime status by checking the PortForwarder.
 				isRunning := m.portForwarder.IsRunning(cfg.ID)
+				var statusText string
 				if isRunning {
 					statusText = StatusRunning
+				} else if m.portForwarder.IsError(cfg.ID) {
+					statusText = StatusError
+				} else {
+					statusText = StatusStopped
 				}
 				logging.LogDebug("UI Refresh: Config %d (%s) - IsRunning=%t, Status='%s'", index, cfg.ID, isRunning, statusText)
 
