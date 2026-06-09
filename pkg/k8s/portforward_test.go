@@ -270,6 +270,47 @@ func TestRestartRunningForwardsReplacesProcess(t *testing.T) {
 	}
 }
 
+// Configs carrying values kubectl would parse as flags must be rejected
+// before any process is spawned, and the port reservation released so the
+// port stays usable.
+func TestStartRejectsFlagInjectionValues(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  config.PortForwardConfig
+	}{
+		{"service flag", config.PortForwardConfig{
+			ID: "a", Context: "ctx", Namespace: "ns",
+			Service: "--kubeconfig=/tmp/evil", PortRemote: 80, PortLocal: 18080}},
+		{"namespace flag", config.PortForwardConfig{
+			ID: "b", Context: "ctx", Namespace: "-oyaml",
+			Service: "web", PortRemote: 80, PortLocal: 18080}},
+		{"context flag", config.PortForwardConfig{
+			ID: "c", Context: "--token=steal", Namespace: "ns",
+			Service: "web", PortRemote: 80, PortLocal: 18080}},
+		{"remote port out of range", config.PortForwardConfig{
+			ID: "d", Context: "ctx", Namespace: "ns",
+			Service: "web", PortRemote: 0, PortLocal: 18080}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pf := NewPortForwarder()
+			if err := pf.Start(tc.cfg); err == nil {
+				t.Fatal("expected Start to reject the config")
+			}
+			if pf.IsRunning(tc.cfg.ID) {
+				t.Fatal("rejected forward must not be marked running")
+			}
+			pf.Mutex.Lock()
+			_, reserved := pf.activeLocalPorts[tc.cfg.PortLocal]
+			pf.Mutex.Unlock()
+			if reserved {
+				t.Fatal("rejected forward must not keep its port reservation")
+			}
+		})
+	}
+}
+
 func TestRestartReportsDeletedConfigByID(t *testing.T) {
 	pf := NewPortForwarder()
 	markRunning(pf, "ctx.ns.deleted", 8080)

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/xlttj/kprtfwd/pkg/config"
 	"github.com/xlttj/kprtfwd/pkg/logging"
 )
 
@@ -163,6 +164,10 @@ func getCurrentContext() (string, error) {
 
 // discoverNamespaces finds namespaces matching the given filter pattern
 func discoverNamespaces(kubeContext, filter string) ([]string, error) {
+	if err := config.ValidateContextName(kubeContext); err != nil {
+		return nil, err
+	}
+
 	// Create context with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -210,6 +215,10 @@ func discoverNamespaces(kubeContext, filter string) ([]string, error) {
 // getAllServicesInContext retrieves all services from all namespaces in a context
 // This is much more efficient than calling getServicesInNamespace for each namespace individually
 func getAllServicesInContext(kubeContext string) ([]ServiceInfo, error) {
+	if err := config.ValidateContextName(kubeContext); err != nil {
+		return nil, err
+	}
+
 	// Create context with timeout - use longer timeout since this gets all services
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -243,85 +252,17 @@ func getAllServicesInContext(kubeContext string) ([]ServiceInfo, error) {
 	// Convert to our ServiceInfo format
 	var services []ServiceInfo
 	for _, k8sService := range serviceList.Items {
-		// Convert ports
-		var ports []ServicePort
-		for _, k8sPort := range k8sService.Spec.Ports {
-			targetPort := ""
-			if k8sPort.TargetPort != nil {
-				switch tp := k8sPort.TargetPort.(type) {
-				case float64:
-					targetPort = fmt.Sprintf("%.0f", tp)
-				case string:
-					targetPort = tp
-				default:
-					targetPort = fmt.Sprintf("%v", tp)
-				}
-			}
-
-			port := ServicePort{
-				Name:       k8sPort.Name,
-				Port:       k8sPort.Port,
-				TargetPort: targetPort,
-				Protocol:   k8sPort.Protocol,
-			}
-			ports = append(ports, port)
+		// Trust boundary: names come from cluster output and end up persisted
+		// and on future kubectl command lines. Skip anything malformed.
+		if err := config.ValidateKubernetesName("namespace", k8sService.Metadata.Namespace); err != nil {
+			logging.LogError("Discovery: skipping service %q: %v", k8sService.Metadata.Name, err)
+			continue
 		}
-
-		// Skip services without ports
-		if len(ports) == 0 {
+		if err := config.ValidateKubernetesName("service", k8sService.Metadata.Name); err != nil {
+			logging.LogError("Discovery: skipping service in namespace %q: %v", k8sService.Metadata.Namespace, err)
 			continue
 		}
 
-		service := ServiceInfo{
-			Name:        k8sService.Metadata.Name,
-			Namespace:   k8sService.Metadata.Namespace,
-			Ports:       ports,
-			Labels:      k8sService.Metadata.Labels,
-			Annotations: k8sService.Metadata.Annotations,
-			Type:        k8sService.Spec.Type,
-		}
-
-		services = append(services, service)
-	}
-
-	return services, nil
-}
-
-// getServicesInNamespace retrieves all services from a specific namespace
-func getServicesInNamespace(kubeContext, namespace string) ([]ServiceInfo, error) {
-	// Create context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	args := []string{"get", "services", "-n", namespace, "-o", "json"}
-	if kubeContext != "" {
-		args = append([]string{"--context", kubeContext}, args...)
-	}
-
-	cmd := exec.CommandContext(ctx, "kubectl", args...)
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("kubectl get services in namespace %s timed out after 30 seconds", namespace)
-		}
-		return nil, fmt.Errorf("kubectl get services failed: %w (stderr: %s)", err, stderr.String())
-	}
-
-	// Parse JSON response
-	var serviceList K8sServiceList
-	err = json.Unmarshal(stdout.Bytes(), &serviceList)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse kubectl output: %w", err)
-	}
-
-	// Convert to our ServiceInfo format
-	var services []ServiceInfo
-	for _, k8sService := range serviceList.Items {
 		// Convert ports
 		var ports []ServicePort
 		for _, k8sPort := range k8sService.Spec.Ports {

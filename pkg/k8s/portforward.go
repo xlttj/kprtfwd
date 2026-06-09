@@ -79,8 +79,33 @@ func isPortAvailable(port int) bool {
 	return true
 }
 
+// validateParams rejects parameters that kubectl could parse as flags (or
+// that cannot exist in a cluster) before they reach the command line.
+// Defense-in-depth: namespace and service names originate from cluster
+// output during discovery and are persisted in the local config store.
+func validateParams(params PortForwardParams) error {
+	if err := config.ValidateContextName(params.Context); err != nil {
+		return err
+	}
+	if err := config.ValidateKubernetesName("namespace", params.Namespace); err != nil {
+		return err
+	}
+	if err := config.ValidateKubernetesName("service", params.Service); err != nil {
+		return err
+	}
+	if err := config.ValidatePort("local port", params.PortLocal); err != nil {
+		return err
+	}
+	return config.ValidatePort("remote port", params.PortRemote)
+}
+
 // StartPortForward starts a port-forward for a specific set of parameters.
 func StartPortForward(params PortForwardParams) (*exec.Cmd, error) {
+	if err := validateParams(params); err != nil {
+		logging.LogError("Refusing to start port-forward: %v", err)
+		return nil, err
+	}
+
 	// *** Pre-check if local target port is available ***
 	if !isPortAvailable(params.PortLocal) {
 		// Return the specific sentinel error

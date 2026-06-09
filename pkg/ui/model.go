@@ -180,8 +180,8 @@ func (m *Model) calculateDiscoveryServiceColumns() []table.Column {
 
 	// Remaining width distributed among SERVICE:PORT, NAMESPACE, TYPE - same logic as project management
 	remainingWidth := availableWidth - minSel - minRemote - minLocal
-	serviceWidth := remainingWidth * 40 / 100   // 40% for SERVICE:PORT (same as SERVICE in project mgmt)
-	namespaceWidth := remainingWidth * 30 / 100 // 30% for NAMESPACE (same as project mgmt)
+	serviceWidth := remainingWidth * 40 / 100                   // 40% for SERVICE:PORT (same as SERVICE in project mgmt)
+	namespaceWidth := remainingWidth * 30 / 100                 // 30% for NAMESPACE (same as project mgmt)
 	typeWidth := remainingWidth - serviceWidth - namespaceWidth // Rest for TYPE
 
 	// Ensure minimums - same as project management

@@ -272,4 +272,3 @@ func (m *Model) refreshTable() {
 		m.portForwardsTable.SetRows(m.generatePortForwardRows(configs))
 	}
 }
-
