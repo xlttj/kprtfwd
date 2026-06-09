@@ -32,6 +32,7 @@ type PortForwardParams struct {
 type runningInfo struct {
 	cmd       *exec.Cmd
 	localPort int
+	stopping  bool // set (under PortForwarder.Mutex) before an intentional kill
 }
 
 // PortForwarder manages multiple port-forward processes.
@@ -113,15 +114,6 @@ func StartPortForward(params PortForwardParams) (*exec.Cmd, error) {
 		return nil, fmt.Errorf("kubectl start failed: %w", err)
 	}
 
-	// Check if the process has exited. Non-blocking check.
-	// cmd.ProcessState is nil if still running after Start()
-	if cmd.ProcessState != nil {
-		stderrStr := stderr.String()
-		logging.LogError("Port-forward process exited quickly (PID: %d). Stderr: %s", cmd.Process.Pid, stderrStr)
-		// Consider a specific sentinel error here too?
-		return nil, fmt.Errorf("kubectl exited quickly. Stderr: %s", stderrStr)
-	}
-
 	// Do not treat immediate stderr as fatal; kubectl may emit warnings
 	stderrStr := strings.TrimSpace(stderr.String())
 	if stderrStr != "" {
@@ -133,18 +125,42 @@ func StartPortForward(params PortForwardParams) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-// StopPortForward stops a port-forward process
-func StopPortForward(cmd *exec.Cmd) error {
+// killProcess terminates a port-forward process without reaping it.
+// The watcher goroutine owns cmd.Wait, so this must never Wait.
+func killProcess(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
-	logging.LogDebug("Stopping port-forward process PID: %d", cmd.Process.Pid)
+	logging.LogDebug("Killing port-forward process PID: %d", cmd.Process.Pid)
+	return cmd.Process.Kill()
+}
 
-	// Try graceful interrupt first, then kill
-	_ = cmd.Process.Kill()
-	// Reap the process to avoid zombies
-	_ = cmd.Wait()
-	return nil
+// watch reaps the kubectl process and cleans up tracking state when it exits
+// without Stop having been called (VPN drop, expired credentials, pod
+// deletion, ...). Exactly one watcher owns cmd.Wait per started process.
+func (pf *PortForwarder) watch(id string, info *runningInfo) {
+	err := info.cmd.Wait()
+	pf.handleProcessExit(id, info, err)
+}
+
+// handleProcessExit deregisters a forward whose process exited on its own.
+func (pf *PortForwarder) handleProcessExit(id string, info *runningInfo, waitErr error) {
+	pf.Mutex.Lock()
+	defer pf.Mutex.Unlock()
+
+	if info.stopping {
+		// Intentional stop; Stop/stopInternal already cleaned up the maps.
+		return
+	}
+	if current, exists := pf.RunningForwards[id]; !exists || current != info {
+		// The ID was deregistered or is owned by a newer process now.
+		return
+	}
+	delete(pf.RunningForwards, id)
+	if holder, reserved := pf.activeLocalPorts[info.localPort]; reserved && holder == id {
+		delete(pf.activeLocalPorts, info.localPort)
+	}
+	logging.LogError("Port-forward '%s' (port %d) exited unexpectedly: %v", id, info.localPort, waitErr)
 }
 
 // Start attempts to start the port-forward for the given config.
@@ -202,7 +218,9 @@ func (pf *PortForwarder) Start(cfg config.PortForwardConfig) error {
 
 	if cmd != nil {
 		// Start succeeded, store running info
-		pf.RunningForwards[id] = &runningInfo{cmd: cmd, localPort: localPort}
+		info := &runningInfo{cmd: cmd, localPort: localPort}
+		pf.RunningForwards[id] = info
+		go pf.watch(id, info)
 		// Reservation in activeLocalPorts remains
 		logging.LogDebug("Successfully started and registered port-forward for '%s' (PID: %d, Port: %d)", id, cmd.Process.Pid, localPort)
 		return nil // Success
@@ -220,17 +238,21 @@ func (pf *PortForwarder) Start(cfg config.PortForwardConfig) error {
 // Stop attempts to stop the port-forward process for the given config ID.
 func (pf *PortForwarder) Stop(id string) error {
 	pf.Mutex.Lock()
-	defer pf.Mutex.Unlock()
 
-	runningInfo, exists := pf.RunningForwards[id]
+	info, exists := pf.RunningForwards[id]
 	if !exists {
 		// Not running (or not tracked), do nothing
+		pf.Mutex.Unlock()
 		logging.LogDebug("Stop: Port-forward for '%s' not found or already stopped.", id)
 		return nil
 	}
 
+	// Mark as intentionally stopping so the watcher doesn't treat the
+	// process exit as a failure.
+	info.stopping = true
+
 	// Get local port from stored info
-	localPort := runningInfo.localPort
+	localPort := info.localPort
 
 	// Release internal reservation first
 	if currentHolder, reserved := pf.activeLocalPorts[localPort]; reserved {
@@ -246,31 +268,33 @@ func (pf *PortForwarder) Stop(id string) error {
 		logging.LogError("Stop: No internal reservation found for local port %d ('%s') during stop! Inconsistency?", localPort, id)
 	}
 
-	// Now stop the actual process
-	err := StopPortForward(runningInfo.cmd) // Call helper
-	if err != nil {
-		// Log the error but proceed to remove from map
-		logging.LogError("Stop: Error stopping port-forward process for '%s' (PID: %d, Port: %d): %v", id, runningInfo.cmd.Process.Pid, localPort, err)
-	}
-
 	// Remove from running map
 	delete(pf.RunningForwards, id)
+	pf.Mutex.Unlock()
+
+	// Kill outside the lock; the watcher goroutine reaps the process.
+	err := killProcess(info.cmd)
+	if err != nil {
+		logging.LogError("Stop: Error killing port-forward process for '%s' (Port: %d): %v", id, localPort, err)
+	}
 	logging.LogDebug("Stop: Stopped and deregistered port-forward for '%s' (Port: %d)", id, localPort)
-	return err // Return the error from StopPortForward helper
+	return err
 }
 
 // stopInternal stops a forward assuming the lock is already held.
 func (pf *PortForwarder) stopInternal(id string) error {
-	runningInfo, exists := pf.RunningForwards[id]
+	info, exists := pf.RunningForwards[id]
 	if !exists {
 		return nil // Already stopped
 	}
-	localPort := runningInfo.localPort
+	info.stopping = true
+	localPort := info.localPort
 	if currentHolder, reserved := pf.activeLocalPorts[localPort]; reserved && currentHolder == id {
 		delete(pf.activeLocalPorts, localPort)
 	}
-	err := StopPortForward(runningInfo.cmd) // Call helper
 	delete(pf.RunningForwards, id)
+	// Kill is a non-blocking signal; the watcher goroutine reaps the process.
+	err := killProcess(info.cmd)
 	logging.LogDebug("stopInternal: Stopped '%s' (Port: %d)", id, localPort)
 	return err
 }
@@ -312,7 +336,9 @@ func (pf *PortForwarder) startInternal(cfg config.PortForwardConfig) error {
 	}
 	if cmd != nil {
 		// Succeeded, add to running map
-		pf.RunningForwards[id] = &runningInfo{cmd: cmd, localPort: localPort}
+		info := &runningInfo{cmd: cmd, localPort: localPort}
+		pf.RunningForwards[id] = info
+		go pf.watch(id, info)
 		return nil // Success
 	} else {
 		// Failed (nil cmd/err case), release reservation

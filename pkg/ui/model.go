@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/xlttj/kprtfwd/pkg/config"
 	"github.com/xlttj/kprtfwd/pkg/k8s"
@@ -379,12 +380,32 @@ func (m *Model) Cleanup() {
 	}
 }
 
+// statusRefreshInterval is how often the table re-checks runtime status, so
+// forwards whose kubectl process died on its own (VPN drop, expired
+// credentials) flip to Stopped without requiring user input.
+const statusRefreshInterval = 2 * time.Second
+
+// statusTickMsg drives the periodic runtime-status refresh.
+type statusTickMsg time.Time
+
+func statusTickCmd() tea.Cmd {
+	return tea.Tick(statusRefreshInterval, func(t time.Time) tea.Msg {
+		return statusTickMsg(t)
+	})
+}
+
 func (m *Model) Init() tea.Cmd {
-	return nil
+	return statusTickCmd()
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case statusTickMsg:
+		// Sync displayed status with actual process state; the PortForwarder
+		// watcher goroutines deregister forwards whose process exited.
+		m.refreshTable()
+		return m, statusTickCmd()
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
