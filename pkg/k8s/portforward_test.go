@@ -3,19 +3,69 @@ package k8s
 import (
 	"errors"
 	"fmt"
+	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
 	"github.com/xlttj/kprtfwd/pkg/config"
 )
 
-// markRunning simulates an active forward without spawning a real kubectl
-// process (StopPortForward treats a nil cmd as already exited).
-func markRunning(pf *PortForwarder, id string, localPort int) {
+// installFakeKubectl puts a fake long-running kubectl on PATH so Start spawns
+// a real, harmless process.
+func installFakeKubectl(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake kubectl shell script requires a Unix-like OS")
+	}
+	sleepPath, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skip("sleep binary not available")
+	}
+	dir := t.TempDir()
+	script := fmt.Sprintf("#!/bin/sh\nexec %s 30\n", sleepPath)
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write fake kubectl: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// freeLocalPort returns a TCP port that is currently free on localhost.
+func freeLocalPort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to find a free port: %v", err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	return port
+}
+
+// currentPid returns the PID of the process backing the given forward.
+func currentPid(t *testing.T, pf *PortForwarder, id string) int {
+	t.Helper()
 	pf.Mutex.Lock()
 	defer pf.Mutex.Unlock()
-	pf.RunningForwards[id] = &runningInfo{cmd: nil, localPort: localPort}
+	info := pf.RunningForwards[id]
+	if info == nil || info.cmd == nil || info.cmd.Process == nil {
+		t.Fatalf("no running process for '%s'", id)
+	}
+	return info.cmd.Process.Pid
+}
+
+// markRunning simulates an active forward without spawning a real kubectl
+// process (killProcess treats a nil cmd as already exited). The done channel
+// is pre-closed since there is no watcher to close it.
+func markRunning(pf *PortForwarder, id string, localPort int) {
+	done := make(chan struct{})
+	close(done)
+	pf.Mutex.Lock()
+	defer pf.Mutex.Unlock()
+	pf.RunningForwards[id] = &runningInfo{cmd: nil, localPort: localPort, done: done}
 	pf.activeLocalPorts[localPort] = id
 }
 
@@ -183,6 +233,41 @@ func TestWatcherCleansUpAfterRealProcessExit(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("watcher did not deregister the forward after its process exited")
+}
+
+// End-to-end restart: the running process must be killed, reaped, and
+// replaced by a new one on the same port, without errors. This exercises the
+// snapshot/Stop/wait-for-reap/Start sequence that replaced the old
+// hold-the-lock-across-the-loop implementation.
+func TestRestartRunningForwardsReplacesProcess(t *testing.T) {
+	installFakeKubectl(t)
+
+	pf := NewPortForwarder()
+	defer pf.CleanupAll()
+
+	cfg := config.PortForwardConfig{
+		ID: "ctx.ns.web", Context: "ctx", Namespace: "ns",
+		Service: "web", PortRemote: 80, PortLocal: freeLocalPort(t),
+	}
+	if err := pf.Start(cfg); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	oldPid := currentPid(t, pf, cfg.ID)
+
+	result := pf.RestartRunningForwards([]config.PortForwardConfig{cfg})
+
+	if len(result.Errors) != 0 {
+		t.Fatalf("restart reported errors: %v", result.Errors)
+	}
+	if result.RestartedCount != 1 {
+		t.Fatalf("expected 1 restart, got %d", result.RestartedCount)
+	}
+	if !pf.IsRunning(cfg.ID) {
+		t.Fatal("forward should be running after restart")
+	}
+	if newPid := currentPid(t, pf, cfg.ID); newPid == oldPid {
+		t.Fatal("restart must replace the process, but the PID is unchanged")
+	}
 }
 
 func TestRestartReportsDeletedConfigByID(t *testing.T) {
