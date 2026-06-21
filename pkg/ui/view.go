@@ -115,7 +115,8 @@ func (m *Model) viewPortForwards() string {
 		bottom = helpStyle.Render(help)
 	}
 
-	// Generate message text (error or status)
+	// Generate message text (error or status). Priority: a transient message
+	// from the last action, then the failure reason of the selected Error row.
 	var messageText string
 	if m.errorMsg != "" {
 		errorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(ColorError))
@@ -124,6 +125,9 @@ func (m *Model) viewPortForwards() string {
 		// Use a different color for status messages (green for success)
 		statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("10")) // Green
 		messageText = statusStyle.Render(m.statusMsg)
+	} else if reason := m.selectedErrorReason(); reason != "" {
+		errorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(ColorError))
+		messageText = errorStyle.Render(fmt.Sprintf("ERROR: %s", reason))
 	}
 
 	// Generate output with message, filter, and edit view

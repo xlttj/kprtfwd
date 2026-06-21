@@ -251,6 +251,27 @@ func (m *Model) getConfigIndexFromTableRow() (int, error) {
 	return row.ConfigIndex, nil
 }
 
+// selectedErrorReason returns a "service: reason" string describing why the
+// currently selected port-forward is in an error state, or "" if the selection
+// is not an errored forward. This lets the user read the failure detail
+// (kubectl stderr, a broken-tunnel notice, ...) by moving the cursor onto a red
+// "Error" row, complementing the full record written to the log file.
+func (m *Model) selectedErrorReason() string {
+	idx, err := m.getConfigIndexFromTableRow()
+	if err != nil {
+		return ""
+	}
+	cfg, err := m.configStore.GetWithError(idx)
+	if err != nil {
+		return ""
+	}
+	reason := m.portForwarder.ErrorReason(cfg.ID)
+	if reason == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s: %s", cfg.Service, reason)
+}
+
 // isGroupHeaderSelected returns true if a group header is currently selected
 func (m *Model) isGroupHeaderSelected() bool {
 	selectedIdx := m.portForwardsTable.Cursor()

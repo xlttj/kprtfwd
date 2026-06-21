@@ -567,8 +567,8 @@ func (m *Model) handlePortForwardsRestart() (tea.Model, tea.Cmd) {
 	// Get current configurations
 	configs := m.configStore.GetAll()
 
-	// Restart all running port forwards
-	result := m.portForwarder.RestartRunningForwards(configs)
+	// Restart all running and errored port forwards
+	result := m.portForwarder.RestartForwards(configs)
 
 	// Update UI state to reflect any changes
 	m.refreshTable()
@@ -600,7 +600,7 @@ func (m *Model) formatRestartSummary(result *k8s.RestartResult) string {
 
 	// Show successful restart summary
 	if result.RestartedCount == 0 {
-		return "No running port forwards to restart"
+		return "No running or errored port forwards to restart"
 	}
 
 	return fmt.Sprintf("Restarted %d port forward(s)", result.RestartedCount)

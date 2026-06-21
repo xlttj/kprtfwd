@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -255,7 +256,7 @@ func TestWatcherCleansUpAfterRealProcessExit(t *testing.T) {
 // replaced by a new one on the same port, without errors. This exercises the
 // snapshot/Stop/wait-for-reap/Start sequence that replaced the old
 // hold-the-lock-across-the-loop implementation.
-func TestRestartRunningForwardsReplacesProcess(t *testing.T) {
+func TestRestartForwardsReplacesProcess(t *testing.T) {
 	installFakeKubectl(t)
 
 	pf := NewPortForwarder()
@@ -270,7 +271,7 @@ func TestRestartRunningForwardsReplacesProcess(t *testing.T) {
 	}
 	oldPid := currentPid(t, pf, cfg.ID)
 
-	result := pf.RestartRunningForwards([]config.PortForwardConfig{cfg})
+	result := pf.RestartForwards([]config.PortForwardConfig{cfg})
 
 	if len(result.Errors) != 0 {
 		t.Fatalf("restart reported errors: %v", result.Errors)
@@ -333,7 +334,7 @@ func TestRestartReportsDeletedConfigByID(t *testing.T) {
 
 	// The running forward's config no longer exists; restart must report it
 	// under its ID instead of restarting whichever config holds its old index.
-	result := pf.RestartRunningForwards([]config.PortForwardConfig{
+	result := pf.RestartForwards([]config.PortForwardConfig{
 		{ID: "ctx.ns.other", Context: "ctx", Namespace: "ns", Service: "other", PortRemote: 80, PortLocal: 9090},
 	})
 
@@ -379,7 +380,7 @@ func TestSuccessfulStartClearsErrorState(t *testing.T) {
 	pf := NewPortForwarder()
 	defer pf.CleanupAll()
 	pf.Mutex.Lock()
-	pf.failedForwards["ctx.ns.web"] = struct{}{}
+	pf.failedForwards["ctx.ns.web"] = "previous failure"
 	pf.Mutex.Unlock()
 
 	cfg := config.PortForwardConfig{
@@ -398,7 +399,7 @@ func TestSuccessfulStartClearsErrorState(t *testing.T) {
 func TestStopClearsErrorState(t *testing.T) {
 	pf := NewPortForwarder()
 	pf.Mutex.Lock()
-	pf.failedForwards["ctx.ns.web"] = struct{}{}
+	pf.failedForwards["ctx.ns.web"] = "previous failure"
 	pf.Mutex.Unlock()
 
 	if err := pf.Stop("ctx.ns.web"); err != nil {
@@ -464,5 +465,68 @@ func TestProbeAllTunnelsSkipsRecentlyStarted(t *testing.T) {
 
 	if broken := pf.ProbeAllTunnels(); broken != nil {
 		t.Fatalf("recently started forward must be skipped, got broken=%v", broken)
+	}
+}
+
+// Ctrl+R must recover an errored forward, not just restart running ones. A
+// forward that failed to start is in failedForwards (not RunningForwards), so
+// RestartForwards has to consider both sets.
+func TestRestartForwardsRecoversErroredForward(t *testing.T) {
+	installFakeKubectl(t)
+
+	pf := NewPortForwarder()
+	defer pf.CleanupAll()
+
+	cfg := config.PortForwardConfig{
+		ID: "ctx.ns.web", Context: "ctx", Namespace: "ns",
+		Service: "web", PortRemote: 80, PortLocal: freeLocalPort(t),
+	}
+	// Put it directly into the error state, as a failed start would.
+	pf.Mutex.Lock()
+	pf.failedForwards[cfg.ID] = "kubectl exited: boom"
+	pf.Mutex.Unlock()
+
+	if pf.IsRunning(cfg.ID) {
+		t.Fatal("precondition: forward must not be running")
+	}
+
+	result := pf.RestartForwards([]config.PortForwardConfig{cfg})
+
+	if len(result.Errors) != 0 {
+		t.Fatalf("restart reported errors: %v", result.Errors)
+	}
+	if result.RestartedCount != 1 {
+		t.Fatalf("expected the errored forward to be restarted, got count %d", result.RestartedCount)
+	}
+	if !pf.IsRunning(cfg.ID) {
+		t.Fatal("errored forward should be running after Ctrl+R restart")
+	}
+	if pf.IsError(cfg.ID) {
+		t.Fatal("a successful restart must clear the error state")
+	}
+}
+
+// The failure reason is retained and exposed so the UI can show it.
+func TestErrorReasonExposesFailureDetail(t *testing.T) {
+	installFailingKubectl(t)
+
+	pf := NewPortForwarder()
+	cfg := config.PortForwardConfig{
+		ID: "ctx.ns.web", Context: "ctx", Namespace: "ns",
+		Service: "web", PortRemote: 80, PortLocal: freeLocalPort(t),
+	}
+	if err := pf.Start(cfg); err == nil {
+		t.Fatal("expected start to fail")
+	}
+	reason := pf.ErrorReason(cfg.ID)
+	if reason == "" {
+		t.Fatal("ErrorReason must return a non-empty reason for a failed forward")
+	}
+	if !strings.Contains(reason, "Unable to connect to the server") {
+		t.Fatalf("expected kubectl stderr in the reason, got: %q", reason)
+	}
+	// A non-errored forward has no reason.
+	if r := pf.ErrorReason("nonexistent"); r != "" {
+		t.Fatalf("expected empty reason for unknown id, got: %q", r)
 	}
 }
