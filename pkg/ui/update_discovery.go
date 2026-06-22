@@ -327,6 +327,7 @@ func (m *Model) initializeServiceSelectionTable() {
 			table.WithRows(rows),
 			table.WithFocused(true),
 			table.WithHeight(tableHeight),
+			table.WithKeyMap(navTableKeyMap()),
 			table.WithStyles(s),
 		)
 	}

@@ -213,6 +213,7 @@ func (m *Model) buildClusterTable(clusters []string, current string) {
 		table.WithRows(rows),
 		table.WithFocused(true),
 		table.WithHeight(min(len(rows)+2, m.height-6)),
+		table.WithKeyMap(navTableKeyMap()),
 		table.WithStyles(s),
 	)
 }

@@ -368,6 +368,7 @@ func NewModel() *Model {
 		table.WithRows(m.generateGroupedRows(initialCfgs)), // Use grouped rows
 		table.WithFocused(true),
 		table.WithHeight(10),
+		table.WithKeyMap(navTableKeyMap()),
 		table.WithStyles(s),
 	)
 	m.portForwardsTable = pfTable

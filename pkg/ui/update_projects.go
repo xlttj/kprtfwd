@@ -81,6 +81,7 @@ func (m *Model) initializeProjectSelector() {
 		table.WithRows(rows),
 		table.WithFocused(true),
 		table.WithHeight(min(len(rows)+2, m.height-6)),
+		table.WithKeyMap(navTableKeyMap()),
 	)
 
 	// Apply table styles
