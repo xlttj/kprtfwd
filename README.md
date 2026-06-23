@@ -9,9 +9,10 @@ A terminal-based UI application for managing Kubernetes port forwards with proje
 - **Project Management** - Group port forwards into projects for easy activation
 - **Browser Integration** - Open HTTP URLs directly from running port forwards
 - **Context Grouping** - Organize port forwards by Kubernetes context
-- **Real-time Status** - See which port forwards are actually running
+- **Real-time Status** - See which forwards are running, stopped, or errored, with automatic health checks
 - **Smart Filtering** - Search and filter port forwards by any field
-- **Port Forward Restart** - Restart running port forwards when connectivity is lost
+- **Self-healing** - Detects dropped connections and broken tunnels, and auto-restarts transient failures with backoff
+- **Port Forward Restart** - Manually restart running or errored forwards (Ctrl+R) when connectivity is lost
 - **Cross-platform** - Works on macOS, Linux, and Windows
 
 ## 📋 Table of Contents
@@ -32,6 +33,7 @@ A terminal-based UI application for managing Kubernetes port forwards with proje
 
 - kubectl configured with access to your Kubernetes clusters
 - Access to the Kubernetes contexts you want to port-forward from
+- Go 1.25.10 or newer — only needed to install via `go install` or build from source (with the default `GOTOOLCHAIN=auto`, the toolchain is fetched automatically)
 
 ### Homebrew (macOS) - Recommended
 
@@ -74,6 +76,10 @@ Service discovery is fully integrated into the TUI. It scans your Kubernetes
 cluster for services and lets you interactively select which ones to add as
 port-forward configurations. Discovered services are saved to the local SQLite
 store automatically—no YAML export/import required.
+
+The cluster and service lookups run in the background so the UI stays
+responsive even on large clusters; a loading screen is shown while they run and
+you can cancel with Esc.
 
 ### How to open discovery
 
@@ -163,12 +169,15 @@ You create and manage projects entirely in the TUI:
 | Key | Action |
 |-----|--------|
 | **↑/↓** or **j/k** | Navigate through port forwards |
+| **PgUp/PgDn**, **Home/End** | Page through / jump to start or end of the list |
 | **Space** | Toggle individual port forward on/off |
+| **e** | Edit the local port of the selected forward |
 | **o** | Open HTTP URL in browser (running forwards only) |
 | **g** | Toggle between grouped/ungrouped view |
 | **/** | Enter filter mode |
+| **S** | Stop all running port forwards |
 | **Ctrl+P** | Open project selector |
-|| **Ctrl+R** | Restart running port forwards |
+| **Ctrl+R** | Restart running and errored port forwards |
 | **q** | Quit application |
 | **Esc** | Clear active filter |
 
@@ -194,9 +203,11 @@ You create and manage projects entirely in the TUI:
 ## 🔧 Features (Detailed)
 
 ### 1. Real-time Status Display
-- **Running** (green): Port forward is active and healthy
-- **Stopped** (red): Port forward is not running
-- Status updates automatically when you start/stop forwards
+- **Running** (green): Port forward is active
+- **Stopped** (grey): Port forward is not running
+- **Error** (red): Port forward failed to start or exited unexpectedly (e.g. VPN drop, pod restart, broken tunnel)
+- Status refreshes automatically every couple of seconds, including forwards that died or whose tunnel went down on their own
+- Select an **Error** row to see the failure reason (kubectl's message) in the footer; full details are written to the log file
 
 ### 2. Browser Integration
 - Press **o** on any running HTTP service to open it in your default browser
@@ -215,14 +226,16 @@ You create and manage projects entirely in the TUI:
 - Works with both grouped and ungrouped views
 - Respects active project filtering
 
-### 5. Port Forward Restart
-- Press **Ctrl+R** to restart all running port forwards
+### 5. Port Forward Restart & Auto-Restart
+- Press **Ctrl+R** to restart all running **and errored** port forwards
 - Useful when network connectivity is lost (e.g., VPN disconnect)
-- Stops and restarts all currently active port forwards
-- Shows summary of restarted forwards and any errors
+- Shows a summary of restarted forwards and any errors
+- **Automatic restart**: forwards that were running and then broke (VPN drop, pod restart, tunnel reset) are retried automatically with exponential backoff, up to 5 attempts. A failed row shows `(auto-retry n/5)` in the footer while it recovers.
+- Initial-start failures (e.g. a misconfigured service) are *not* auto-retried — they stay in **Error** for a manual **Ctrl+R**, so kprtfwd never spins on a permanent failure
 
 ### 6. Error Handling
-- Clear error messages for common issues
+- Failed forwards are marked **Error** with the reason shown in the footer when selected, and recorded in the log file
+- Detects forwards whose kubectl process exited or whose tunnel went dead (via a TCP health probe)
 - Port conflicts detection
 - Invalid configuration warnings
 - Kubernetes connectivity issues
