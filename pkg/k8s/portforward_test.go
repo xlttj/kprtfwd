@@ -530,3 +530,169 @@ func TestErrorReasonExposesFailureDetail(t *testing.T) {
 		t.Fatalf("expected empty reason for unknown id, got: %q", r)
 	}
 }
+
+func TestBackoffDelay(t *testing.T) {
+	cases := map[int]time.Duration{
+		0: 2 * time.Second,
+		1: 4 * time.Second,
+		2: 8 * time.Second,
+		3: 16 * time.Second,
+		4: 30 * time.Second, // 32s capped to 30s
+		5: 30 * time.Second,
+	}
+	for prior, want := range cases {
+		if got := backoffDelay(prior); got != want {
+			t.Errorf("backoffDelay(%d) = %s, want %s", prior, got, want)
+		}
+	}
+}
+
+// A forward that was genuinely running and then exited is a transient break and
+// must be scheduled for auto-restart.
+func TestTransientBreakSchedulesRetry(t *testing.T) {
+	pf := NewPortForwarder()
+	markRunning(pf, "ctx.ns.web", 8080) // startedAt is an hour ago
+	pf.Mutex.Lock()
+	info := pf.RunningForwards["ctx.ns.web"]
+	pf.Mutex.Unlock()
+
+	pf.handleProcessExit("ctx.ns.web", info, fmt.Errorf("signal: killed"))
+
+	if _, scheduled := pf.RetryStatus("ctx.ns.web"); !scheduled {
+		t.Fatal("a transient break must schedule an auto-restart")
+	}
+	if !pf.IsError("ctx.ns.web") {
+		t.Fatal("a broken forward must be in Error state")
+	}
+}
+
+// A process that dies during the startup probe window is an initial-start
+// failure (likely misconfig) and must NOT be auto-restarted.
+func TestStartupFailureDoesNotScheduleRetry(t *testing.T) {
+	pf := NewPortForwarder()
+	done := make(chan struct{})
+	close(done)
+	info := &runningInfo{localPort: 8080, done: done, startedAt: time.Now()} // just started
+	pf.Mutex.Lock()
+	pf.RunningForwards["ctx.ns.web"] = info
+	pf.activeLocalPorts[8080] = "ctx.ns.web"
+	pf.Mutex.Unlock()
+
+	pf.handleProcessExit("ctx.ns.web", info, fmt.Errorf("exit status 1"))
+
+	if _, scheduled := pf.RetryStatus("ctx.ns.web"); scheduled {
+		t.Fatal("an immediate startup failure must not be auto-restarted")
+	}
+	if !pf.IsError("ctx.ns.web") {
+		t.Fatal("the forward must still be in Error state")
+	}
+}
+
+func TestMarkBrokenSchedulesRetry(t *testing.T) {
+	pf := NewPortForwarder()
+	markRunning(pf, "ctx.ns.web", 8080)
+
+	pf.MarkBroken([]string{"ctx.ns.web"})
+
+	if _, scheduled := pf.RetryStatus("ctx.ns.web"); !scheduled {
+		t.Fatal("a broken tunnel must schedule an auto-restart")
+	}
+}
+
+// AutoRestart must respect the backoff: a forward whose next attempt is in the
+// future is not touched.
+func TestAutoRestartRespectsBackoff(t *testing.T) {
+	pf := NewPortForwarder()
+	pf.Mutex.Lock()
+	pf.failedForwards["ctx.ns.web"] = "boom"
+	pf.retrying["ctx.ns.web"] = &retryInfo{attempts: 1, nextAttempt: time.Now().Add(time.Hour)}
+	pf.Mutex.Unlock()
+
+	cfg := config.PortForwardConfig{ID: "ctx.ns.web", Namespace: "ns", Service: "web", PortRemote: 80, PortLocal: 8080}
+	recovered := pf.AutoRestart([]config.PortForwardConfig{cfg})
+
+	if len(recovered) != 0 {
+		t.Fatalf("nothing should be restarted before backoff elapses, got %v", recovered)
+	}
+	if attempts, scheduled := pf.RetryStatus("ctx.ns.web"); !scheduled || attempts != 1 {
+		t.Fatalf("schedule must be untouched, got attempts=%d scheduled=%v", attempts, scheduled)
+	}
+}
+
+// When the backoff has elapsed, AutoRestart brings the forward back up and
+// clears its error and retry state.
+func TestAutoRestartRecoversWhenDue(t *testing.T) {
+	installFakeKubectl(t)
+
+	pf := NewPortForwarder()
+	defer pf.CleanupAll()
+
+	cfg := config.PortForwardConfig{
+		ID: "ctx.ns.web", Context: "ctx", Namespace: "ns",
+		Service: "web", PortRemote: 80, PortLocal: freeLocalPort(t),
+	}
+	pf.Mutex.Lock()
+	pf.failedForwards[cfg.ID] = "tunnel broke"
+	pf.retrying[cfg.ID] = &retryInfo{attempts: 1, nextAttempt: time.Now().Add(-time.Second)} // due
+	pf.Mutex.Unlock()
+
+	recovered := pf.AutoRestart([]config.PortForwardConfig{cfg})
+
+	if len(recovered) != 1 || recovered[0] != cfg.ID {
+		t.Fatalf("expected %q to be recovered, got %v", cfg.ID, recovered)
+	}
+	if !pf.IsRunning(cfg.ID) {
+		t.Fatal("forward should be running after a successful auto-restart")
+	}
+	if pf.IsError(cfg.ID) {
+		t.Fatal("error state must be cleared after recovery")
+	}
+	if _, scheduled := pf.RetryStatus(cfg.ID); scheduled {
+		t.Fatal("retry schedule must be cleared after recovery")
+	}
+}
+
+// After the attempt cap, AutoRestart gives up and leaves the forward in Error
+// with no further retries scheduled.
+func TestAutoRestartGivesUpAfterMaxAttempts(t *testing.T) {
+	installFailingKubectl(t)
+
+	pf := NewPortForwarder()
+	defer pf.CleanupAll()
+
+	cfg := config.PortForwardConfig{
+		ID: "ctx.ns.web", Context: "ctx", Namespace: "ns",
+		Service: "web", PortRemote: 80, PortLocal: freeLocalPort(t),
+	}
+	pf.Mutex.Lock()
+	pf.failedForwards[cfg.ID] = "tunnel broke"
+	pf.retrying[cfg.ID] = &retryInfo{attempts: autoRestartMaxAttempts - 1, nextAttempt: time.Now().Add(-time.Second)}
+	pf.Mutex.Unlock()
+
+	recovered := pf.AutoRestart([]config.PortForwardConfig{cfg})
+
+	if len(recovered) != 0 {
+		t.Fatalf("a failing restart must not report recovery, got %v", recovered)
+	}
+	if _, scheduled := pf.RetryStatus(cfg.ID); scheduled {
+		t.Fatal("retry schedule must be dropped after hitting the attempt cap")
+	}
+	if !pf.IsError(cfg.ID) {
+		t.Fatal("forward must remain in Error after giving up")
+	}
+}
+
+func TestStopClearsRetrySchedule(t *testing.T) {
+	pf := NewPortForwarder()
+	markRunning(pf, "ctx.ns.web", 8080)
+	pf.Mutex.Lock()
+	pf.retrying["ctx.ns.web"] = &retryInfo{attempts: 0, nextAttempt: time.Now()}
+	pf.Mutex.Unlock()
+
+	if err := pf.Stop("ctx.ns.web"); err != nil {
+		t.Fatalf("Stop returned error: %v", err)
+	}
+	if _, scheduled := pf.RetryStatus("ctx.ns.web"); scheduled {
+		t.Fatal("an intentional stop must cancel any pending auto-restart")
+	}
+}

@@ -394,6 +394,10 @@ type statusTickMsg time.Time
 // found broken (e.g. VPN dropped without killing kubectl).
 type tunnelProbeMsg []string
 
+// autoRestartMsg carries the config IDs that a background auto-restart attempt
+// successfully brought back up.
+type autoRestartMsg []string
+
 func statusTickCmd() tea.Cmd {
 	return tea.Tick(statusRefreshInterval, func(t time.Time) tea.Msg {
 		return statusTickMsg(t)
@@ -407,6 +411,14 @@ func probeTunnelsCmd(pf *k8s.PortForwarder) tea.Cmd {
 	}
 }
 
+// autoRestartCmd runs the (blocking) auto-restart pass off the event loop,
+// retrying transiently-broken forwards whose backoff has elapsed.
+func autoRestartCmd(pf *k8s.PortForwarder, configs []config.PortForwardConfig) tea.Cmd {
+	return func() tea.Msg {
+		return autoRestartMsg(pf.AutoRestart(configs))
+	}
+}
+
 func (m *Model) Init() tea.Cmd {
 	return statusTickCmd()
 }
@@ -417,14 +429,31 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Sync displayed status with actual process state; the PortForwarder
 		// watcher goroutines deregister forwards whose process exited. Also
 		// kick off a tunnel health probe to catch VPN drops that leave kubectl
-		// running but the tunnel dead.
+		// running but the tunnel dead, and an auto-restart pass to recover
+		// transiently-broken forwards whose backoff has elapsed.
 		m.refreshTable()
-		return m, tea.Batch(statusTickCmd(), probeTunnelsCmd(m.portForwarder))
+		configs := m.configStore.GetAll()
+		return m, tea.Batch(
+			statusTickCmd(),
+			probeTunnelsCmd(m.portForwarder),
+			autoRestartCmd(m.portForwarder, configs),
+		)
 
 	case tunnelProbeMsg:
 		if len(msg) > 0 {
 			m.portForwarder.MarkBroken([]string(msg))
 			m.refreshTable()
+		}
+		return m, nil
+
+	case autoRestartMsg:
+		if len(msg) > 0 {
+			m.refreshTable()
+			if len(msg) == 1 {
+				m.statusMsg = "Auto-restarted 1 port forward"
+			} else {
+				m.statusMsg = fmt.Sprintf("Auto-restarted %d port forwards", len(msg))
+			}
 		}
 		return m, nil
 

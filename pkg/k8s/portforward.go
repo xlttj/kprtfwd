@@ -44,6 +44,35 @@ type runningInfo struct {
 	done      chan struct{} // closed by the watcher once the process is reaped
 }
 
+// Auto-restart policy for forwards that were running and then broke
+// (VPN drop, pod restart, tunnel reset). Initial-start failures are NOT
+// auto-retried — those usually mean a misconfiguration and would spin forever.
+const (
+	autoRestartMaxAttempts = 5
+	autoRestartBaseDelay   = 2 * time.Second
+	autoRestartMaxDelay    = 30 * time.Second
+)
+
+// AutoRestartMaxAttempts is the cap on auto-restart attempts before a forward
+// is left in Error for manual recovery. Exposed for the UI's progress display.
+func AutoRestartMaxAttempts() int { return autoRestartMaxAttempts }
+
+// retryInfo tracks the auto-restart backoff state for one forward.
+type retryInfo struct {
+	attempts    int       // attempts made so far
+	nextAttempt time.Time // earliest time for the next attempt
+}
+
+// backoffDelay returns the wait before the attempt following the given number
+// of prior attempts: 2s, 4s, 8s, 16s, capped at 30s.
+func backoffDelay(priorAttempts int) time.Duration {
+	d := autoRestartBaseDelay << priorAttempts
+	if d > autoRestartMaxDelay || d <= 0 { // <=0 guards against shift overflow
+		return autoRestartMaxDelay
+	}
+	return d
+}
+
 // PortForwarder manages multiple port-forward processes.
 // Forwards are keyed by config ID (stable across config list reordering),
 // never by list index: indices shift when configs are added/removed/edited.
@@ -51,6 +80,7 @@ type PortForwarder struct {
 	RunningForwards  map[string]*runningInfo // Map of config ID to running info
 	activeLocalPorts map[int]string          // Map of active local port -> config ID
 	failedForwards   map[string]string       // ID -> human-readable reason it exited unexpectedly or failed to start
+	retrying         map[string]*retryInfo   // ID -> auto-restart backoff state (transient breaks only)
 	// Mutex protects the maps above. It must never be held across blocking
 	// calls (spawning kubectl, waiting on a process); only the non-blocking
 	// Kill signal may be sent while holding it.
@@ -63,7 +93,25 @@ func NewPortForwarder() *PortForwarder {
 		RunningForwards:  make(map[string]*runningInfo),
 		activeLocalPorts: make(map[int]string),
 		failedForwards:   make(map[string]string),
+		retrying:         make(map[string]*retryInfo),
 	}
+}
+
+// markRetryEligibleLocked schedules an auto-restart for a forward that broke
+// transiently, unless one is already scheduled (so attempt counting isn't
+// reset by repeated break notifications). Caller must hold the mutex.
+func (pf *PortForwarder) markRetryEligibleLocked(id string) {
+	if _, ok := pf.retrying[id]; ok {
+		return // already scheduled; the auto-restart driver owns the counter
+	}
+	pf.retrying[id] = &retryInfo{attempts: 0, nextAttempt: time.Now().Add(backoffDelay(0))}
+	logging.LogDebug("Scheduled auto-restart for '%s' in %s", id, backoffDelay(0))
+}
+
+// clearRetryLocked removes any auto-restart schedule for a forward. Caller must
+// hold the mutex. Used when a forward is intentionally stopped or comes back up.
+func (pf *PortForwarder) clearRetryLocked(id string) {
+	delete(pf.retrying, id)
 }
 
 // isPortAvailable checks if a TCP port is available to listen on localhost.
@@ -236,6 +284,13 @@ func (pf *PortForwarder) handleProcessExit(id string, info *runningInfo, waitErr
 	}
 	pf.failedForwards[id] = reason
 	logging.LogError("Port-forward '%s' (port %d) exited unexpectedly: %v (stderr: %s)", id, info.localPort, waitErr, stderrStr)
+
+	// Auto-restart only forwards that were genuinely running and then broke. A
+	// process that dies during the startup probe window is an initial-start
+	// failure (usually a misconfiguration), so it is left for manual Ctrl+R.
+	if time.Since(info.startedAt) >= startupProbeDelay {
+		pf.markRetryEligibleLocked(id)
+	}
 }
 
 // Start attempts to start the port-forward for the given config.
@@ -319,7 +374,11 @@ func (pf *PortForwarder) Start(cfg config.PortForwardConfig) error {
 		}
 		return fmt.Errorf("kubectl exited immediately (check VPN / kube context / port conflicts)")
 	case <-time.After(startupProbeDelay):
-		return nil // survived startup; treat as running
+		// Survived startup; treat as running and cancel any pending auto-restart.
+		pf.Mutex.Lock()
+		pf.clearRetryLocked(id)
+		pf.Mutex.Unlock()
+		return nil
 	}
 }
 
@@ -332,6 +391,7 @@ func (pf *PortForwarder) Stop(id string) error {
 		// Not running (or not tracked). Still clear any error state, since an
 		// explicit stop is an intentional action.
 		delete(pf.failedForwards, id)
+		pf.clearRetryLocked(id)
 		pf.Mutex.Unlock()
 		logging.LogDebug("Stop: Port-forward for '%s' not found or already stopped.", id)
 		return nil
@@ -358,8 +418,9 @@ func (pf *PortForwarder) Stop(id string) error {
 		logging.LogError("Stop: No internal reservation found for local port %d ('%s') during stop! Inconsistency?", localPort, id)
 	}
 
-	// Intentional stop clears error state.
+	// Intentional stop clears error state and any pending auto-restart.
 	delete(pf.failedForwards, id)
+	pf.clearRetryLocked(id)
 
 	// Remove from running map
 	delete(pf.RunningForwards, id)
@@ -379,7 +440,8 @@ func (pf *PortForwarder) stopInternal(id string) error {
 	info, exists := pf.RunningForwards[id]
 	if !exists {
 		delete(pf.failedForwards, id) // intentional stop clears error state
-		return nil                    // Already stopped
+		pf.clearRetryLocked(id)
+		return nil // Already stopped
 	}
 	info.stopping = true
 	localPort := info.localPort
@@ -387,6 +449,7 @@ func (pf *PortForwarder) stopInternal(id string) error {
 		delete(pf.activeLocalPorts, localPort)
 	}
 	delete(pf.failedForwards, id) // intentional stop clears error state
+	pf.clearRetryLocked(id)
 	delete(pf.RunningForwards, id)
 	// Kill is a non-blocking signal; the watcher goroutine reaps the process.
 	err := killProcess(info.cmd)
@@ -451,6 +514,7 @@ func (pf *PortForwarder) CleanupAll() {
 	pf.RunningForwards = make(map[string]*runningInfo)
 	pf.activeLocalPorts = make(map[int]string)
 	pf.failedForwards = make(map[string]string)
+	pf.retrying = make(map[string]*retryInfo)
 	logging.LogDebug("CleanupAll finished.")
 }
 
@@ -544,12 +608,88 @@ func (pf *PortForwarder) MarkBroken(ids []string) {
 		}
 		delete(pf.RunningForwards, id)
 		pf.failedForwards[id] = fmt.Sprintf("tunnel health check failed on local port %d (VPN down or upstream unreachable)", info.localPort)
+		// A broken tunnel is a transient failure of a running forward, so it is
+		// eligible for auto-restart.
+		pf.markRetryEligibleLocked(id)
 		logging.LogError("MarkBroken: tunnel broken for '%s' (port %d); killing process", id, info.localPort)
 		// Non-blocking kill under the lock (allowed by the mutex contract);
 		// the forward's watcher owns Wait and will reap it, then see the entry
 		// is gone and leave the error state we just set in place.
 		_ = killProcess(info.cmd)
 	}
+}
+
+// RetryStatus reports whether an auto-restart is scheduled for the given ID and
+// how many attempts have been made so far. Used by the UI to show retry progress.
+func (pf *PortForwarder) RetryStatus(id string) (attempts int, scheduled bool) {
+	pf.Mutex.Lock()
+	defer pf.Mutex.Unlock()
+	if ri, ok := pf.retrying[id]; ok {
+		return ri.attempts, true
+	}
+	return 0, false
+}
+
+// AutoRestart attempts to restart forwards whose backoff timer has elapsed,
+// for transient breaks only (process exit after running, or a broken tunnel).
+// It returns the IDs that successfully came back up. Each failed attempt backs
+// off further; after autoRestartMaxAttempts the schedule is dropped and the
+// forward stays in Error until a manual Ctrl+R. Blocking (Start probes kubectl
+// for ~startupProbeDelay per due forward); call from a goroutine or tea.Cmd.
+func (pf *PortForwarder) AutoRestart(configs []config.PortForwardConfig) []string {
+	configsByID := make(map[string]config.PortForwardConfig, len(configs))
+	for _, cfg := range configs {
+		configsByID[cfg.ID] = cfg
+	}
+
+	now := time.Now()
+	pf.Mutex.Lock()
+	var due []string
+	for id, ri := range pf.retrying {
+		if !now.Before(ri.nextAttempt) { // now >= nextAttempt
+			due = append(due, id)
+		}
+	}
+	pf.Mutex.Unlock()
+
+	var recovered []string
+	for _, id := range due {
+		cfg, ok := configsByID[id]
+		if !ok {
+			// Config was deleted; abandon the retry.
+			pf.Mutex.Lock()
+			pf.clearRetryLocked(id)
+			pf.Mutex.Unlock()
+			continue
+		}
+		if pf.IsRunning(id) {
+			// Already back up by some other path; drop the schedule.
+			pf.Mutex.Lock()
+			pf.clearRetryLocked(id)
+			pf.Mutex.Unlock()
+			continue
+		}
+
+		logging.LogDebug("AutoRestart: attempting restart of '%s'", id)
+		err := pf.Start(cfg) // clears the retry schedule itself on confirmed success
+
+		pf.Mutex.Lock()
+		if err == nil {
+			recovered = append(recovered, id)
+			logging.LogDebug("AutoRestart: '%s' recovered", id)
+		} else if ri, stillScheduled := pf.retrying[id]; stillScheduled {
+			ri.attempts++
+			if ri.attempts >= autoRestartMaxAttempts {
+				pf.clearRetryLocked(id)
+				logging.LogError("AutoRestart: giving up on '%s' after %d attempts; leaving in Error", id, ri.attempts)
+			} else {
+				ri.nextAttempt = time.Now().Add(backoffDelay(ri.attempts))
+				logging.LogDebug("AutoRestart: '%s' attempt %d failed (%v); next try in %s", id, ri.attempts, err, backoffDelay(ri.attempts))
+			}
+		}
+		pf.Mutex.Unlock()
+	}
+	return recovered
 }
 
 // RestartResult represents the outcome of a restart operation

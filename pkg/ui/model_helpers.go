@@ -5,6 +5,7 @@ import (
 	"sort"
 
 	"github.com/xlttj/kprtfwd/pkg/config"
+	"github.com/xlttj/kprtfwd/pkg/k8s"
 	"github.com/xlttj/kprtfwd/pkg/logging"
 
 	"github.com/charmbracelet/bubbles/table"
@@ -268,6 +269,11 @@ func (m *Model) selectedErrorReason() string {
 	reason := m.portForwarder.ErrorReason(cfg.ID)
 	if reason == "" {
 		return ""
+	}
+	// If an auto-restart is scheduled for this forward, show the progress so the
+	// user knows it will recover on its own (transient breaks only).
+	if attempts, scheduled := m.portForwarder.RetryStatus(cfg.ID); scheduled {
+		return fmt.Sprintf("%s: %s (auto-retry %d/%d)", cfg.Service, reason, attempts, k8s.AutoRestartMaxAttempts())
 	}
 	return fmt.Sprintf("%s: %s", cfg.Service, reason)
 }
