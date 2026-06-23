@@ -359,6 +359,11 @@ func (m *Model) commitPortEdit() (tea.Model, tea.Cmd) {
 	m.editMode = false
 	m.editInput.Blur()
 	m.portForwardsTable.Focus()
+	// If a filter is active, rebuild its cached result from the updated store;
+	// otherwise the edited port would keep showing the stale cached value.
+	if m.filterMode || m.filterInput.Value() != "" {
+		m.applyFilter()
+	}
 	m.refreshTable()
 	return m, nil
 }
