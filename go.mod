@@ -1,6 +1,6 @@
 module github.com/xlttj/kprtfwd
 
-go 1.24.2
+go 1.25.10
 
 require (
 	github.com/charmbracelet/bubbles v1.0.0
