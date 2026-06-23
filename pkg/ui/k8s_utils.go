@@ -36,31 +36,3 @@ func getAvailableClusters() ([]string, error) {
 
 	return contexts, nil
 }
-
-// getCurrentContext gets the current kubectl context
-func getCurrentContext() (string, error) {
-	// Create context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "kubectl", "config", "current-context")
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("kubectl current-context timed out after 10 seconds")
-		}
-		return "", fmt.Errorf("kubectl current-context failed: %w (stderr: %s)", err, stderr.String())
-	}
-
-	context := strings.TrimSpace(stdout.String())
-	if context == "" {
-		return "", fmt.Errorf("no current context set")
-	}
-
-	return context, nil
-}

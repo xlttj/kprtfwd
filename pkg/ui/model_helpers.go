@@ -5,15 +5,25 @@ import (
 	"sort"
 
 	"github.com/xlttj/kprtfwd/pkg/config"
+	"github.com/xlttj/kprtfwd/pkg/k8s"
 	"github.com/xlttj/kprtfwd/pkg/logging"
 
 	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/lipgloss"
 )
 
-// styleStatusText applies color styling to status text
+// styleStatusText colors the status text by state so Running/Stopped/Error are
+// distinguishable at a glance. The status strings are padded to equal width
+// (see constants) so the STATUS column stays aligned regardless of value.
 func styleStatusText(status string) string {
-	// Removed color styling to prevent table display issues
-	return status
+	switch status {
+	case StatusRunning:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color(ColorStatusRunning)).Render(status)
+	case StatusError:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color(ColorStatusError)).Render(status)
+	default: // StatusStopped
+		return lipgloss.NewStyle().Foreground(lipgloss.Color(ColorStatusStopped)).Render(status)
+	}
 }
 
 // generatePortForwardRows converts config slice to table.Row slice (ungrouped)
@@ -25,29 +35,16 @@ func (m *Model) generatePortForwardRows(configs []config.PortForwardConfig) []ta
 	}
 
 	rows := make([]table.Row, 0, len(actualConfigs))
-	allConfigs := m.configStore.GetAll()
 
 	for _, cfg := range actualConfigs {
-		// Determine actual runtime status by checking if port forward is running
-		statusText := StatusStopped
-
-		// Find the original index in the full config store using ID
-		originalIndex := -1
-		for j, origCfg := range allConfigs {
-			if origCfg.ID == cfg.ID {
-				originalIndex = j
-				break
-			}
-		}
-
-		if originalIndex == -1 {
-			logging.LogDebug("Warning: Could not find original index for config ID %s", cfg.ID)
-			continue // Skip this config if we can't find its index
-		}
-
-		// Check actual runtime state from PortForwarder
-		if m.portForwarder.IsRunning(originalIndex) {
+		// Determine actual runtime status by checking the PortForwarder.
+		var statusText string
+		if m.portForwarder.IsRunning(cfg.ID) {
 			statusText = StatusRunning
+		} else if m.portForwarder.IsError(cfg.ID) {
+			statusText = StatusError
+		} else {
+			statusText = StatusStopped
 		}
 
 		rows = append(rows, table.Row{
@@ -133,7 +130,7 @@ func (m *Model) generateGroupedRows(configs []config.PortForwardConfig) []table.
 		state.Active = 0
 		for _, item := range items {
 			// Check actual runtime state instead of config file status
-			if m.portForwarder.IsRunning(item.index) {
+			if m.portForwarder.IsRunning(item.config.ID) {
 				state.Active++
 			}
 		}
@@ -173,11 +170,15 @@ func (m *Model) generateGroupedRows(configs []config.PortForwardConfig) []table.
 				cfg := item.config
 				index := item.index
 
-				// Determine actual runtime status by checking if port forward is running
-				statusText := StatusStopped
-				isRunning := m.portForwarder.IsRunning(index)
+				// Determine actual runtime status by checking the PortForwarder.
+				isRunning := m.portForwarder.IsRunning(cfg.ID)
+				var statusText string
 				if isRunning {
 					statusText = StatusRunning
+				} else if m.portForwarder.IsError(cfg.ID) {
+					statusText = StatusError
+				} else {
+					statusText = StatusStopped
 				}
 				logging.LogDebug("UI Refresh: Config %d (%s) - IsRunning=%t, Status='%s'", index, cfg.ID, isRunning, statusText)
 
@@ -251,6 +252,32 @@ func (m *Model) getConfigIndexFromTableRow() (int, error) {
 	return row.ConfigIndex, nil
 }
 
+// selectedErrorReason returns a "service: reason" string describing why the
+// currently selected port-forward is in an error state, or "" if the selection
+// is not an errored forward. This lets the user read the failure detail
+// (kubectl stderr, a broken-tunnel notice, ...) by moving the cursor onto a red
+// "Error" row, complementing the full record written to the log file.
+func (m *Model) selectedErrorReason() string {
+	idx, err := m.getConfigIndexFromTableRow()
+	if err != nil {
+		return ""
+	}
+	cfg, err := m.configStore.GetWithError(idx)
+	if err != nil {
+		return ""
+	}
+	reason := m.portForwarder.ErrorReason(cfg.ID)
+	if reason == "" {
+		return ""
+	}
+	// If an auto-restart is scheduled for this forward, show the progress so the
+	// user knows it will recover on its own (transient breaks only).
+	if attempts, scheduled := m.portForwarder.RetryStatus(cfg.ID); scheduled {
+		return fmt.Sprintf("%s: %s (auto-retry %d/%d)", cfg.Service, reason, attempts, k8s.AutoRestartMaxAttempts())
+	}
+	return fmt.Sprintf("%s: %s", cfg.Service, reason)
+}
+
 // isGroupHeaderSelected returns true if a group header is currently selected
 func (m *Model) isGroupHeaderSelected() bool {
 	selectedIdx := m.portForwardsTable.Cursor()
@@ -287,4 +314,3 @@ func (m *Model) refreshTable() {
 		m.portForwardsTable.SetRows(m.generatePortForwardRows(configs))
 	}
 }
-

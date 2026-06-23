@@ -87,7 +87,7 @@ func (dr *DiscoveryResult) GenerateConfig() []config.PortForwardConfig {
 func generateServiceID(context string, service ServiceInfo, port ServicePort) string {
 	// Clean context name
 	contextPart := sanitizeIDPart(context)
-	
+
 	// Clean namespace name
 	namespacePart := sanitizeIDPart(service.Namespace)
 

@@ -18,6 +18,19 @@ import (
 func (m *Model) updateServiceDiscovery(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	keyStr := msg.String()
 
+	// While an async kubectl operation is in flight, only allow cancelling.
+	// (Ctrl+C is already handled globally.) This keeps the UI responsive
+	// instead of queuing navigation/enter against a stale or empty table.
+	if m.discoveryLoading {
+		if keyStr == "esc" {
+			m.discoveryLoading = false
+			m.uiState = StatePortForwards
+			m.statusMsg = ""
+			m.errorMsg = ""
+		}
+		return m, nil
+	}
+
 	// Handle edit mode for local port editing
 	if m.discoveryPhase == PhaseServiceSelection && m.discoveryEditMode {
 		return m.handleDiscoveryEditMode(msg)
@@ -94,9 +107,15 @@ func (m *Model) handleClusterSelectionKeys(keyStr string, msg tea.KeyMsg) (tea.M
 func (m *Model) handleServiceSelectionKeys(keyStr string, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch keyStr {
 	case "esc":
-		// Return to cluster selection
+		// Return to cluster selection. Clusters are already cached, so rebuild
+		// the table locally (no kubectl call, no freeze) and keep the prior
+		// selection highlighted.
 		m.discoveryPhase = PhaseClusterSelection
-		m.initializeClusterSelection()
+		current := ""
+		if m.discoverySelectedCluster >= 0 && m.discoverySelectedCluster < len(m.discoveryClusters) {
+			current = m.discoveryClusters[m.discoverySelectedCluster]
+		}
+		m.buildClusterTable(m.discoveryClusters, current)
 		return m, nil
 
 	case "enter":
@@ -182,79 +201,15 @@ func (m *Model) enterServiceDiscovery() (tea.Model, tea.Cmd) {
 	m.discoveryEditInput.CharLimit = 5
 	m.discoveryEditInput.Width = 8
 
-	// Get available clusters and initialize cluster selection
-	err := m.initializeClusterSelection()
-	if err != nil {
-		m.errorMsg = fmt.Sprintf("Failed to get clusters: %v", err)
-		m.uiState = StatePortForwards
-		return m, nil
-	}
-
-	return m, nil
+	// Kick off the cluster list fetch asynchronously so the UI stays responsive.
+	m.discoveryLoading = true
+	m.statusMsg = "Loading clusters..."
+	return m, loadClustersCmd()
 }
 
-// initializeClusterSelection gets available clusters and creates the selection table
-func (m *Model) initializeClusterSelection() error {
-	clusters, err := getAvailableClusters()
-	if err != nil {
-		return err
-	}
-
-	if len(clusters) == 0 {
-		return fmt.Errorf("no Kubernetes contexts found")
-	}
-
-	m.discoveryClusters = clusters
-	m.discoverySelectedCluster = 0
-
-	// Find current context and select it by default
-	currentContext, err := getCurrentContext()
-	if err == nil {
-		for i, cluster := range clusters {
-			if cluster == currentContext {
-				m.discoverySelectedCluster = i
-				break
-			}
-		}
-	}
-
-	// Create table rows for clusters
-	rows := make([]table.Row, len(clusters))
-	for i, cluster := range clusters {
-		status := IndicatorUnselected
-		if i == m.discoverySelectedCluster {
-			status = IndicatorSelected
-		}
-		rows[i] = table.Row{cluster, status}
-	}
-
-	// Create and configure the cluster selection table with dynamic columns
-	columns := m.calculateClusterSelectionColumns()
-
-	// Apply table styles
-	s := table.DefaultStyles()
-	s.Header = s.Header.
-		BorderStyle(lipgloss.NormalBorder()).
-		BorderForeground(lipgloss.Color(ColorBorder)).
-		BorderBottom(true).
-		Bold(false)
-	s.Selected = s.Selected.
-		Foreground(lipgloss.Color(ColorSelectedFg)).
-		Background(lipgloss.Color(ColorSelectedBg)).
-		Bold(false)
-
-	m.discoveryTable = table.New(
-		table.WithColumns(columns),
-		table.WithRows(rows),
-		table.WithFocused(true),
-		table.WithHeight(min(len(rows)+2, m.height-6)),
-		table.WithStyles(s),
-	)
-
-	return nil
-}
-
-// handleClusterSelection processes cluster selection and starts service discovery
+// handleClusterSelection starts asynchronous service discovery for the selected
+// cluster. The kubectl work runs in discoverServicesCmd; results are applied in
+// handleServicesDiscovered.
 func (m *Model) handleClusterSelection() (tea.Model, tea.Cmd) {
 	selectedIdx := m.discoveryTable.Cursor()
 	if selectedIdx >= len(m.discoveryClusters) {
@@ -264,97 +219,11 @@ func (m *Model) handleClusterSelection() (tea.Model, tea.Cmd) {
 
 	selectedCluster := m.discoveryClusters[selectedIdx]
 	m.discoverySelectedCluster = selectedIdx
+	m.errorMsg = ""
 	m.statusMsg = fmt.Sprintf("Discovering services in cluster '%s'...", selectedCluster)
+	m.discoveryLoading = true
 
-	// Discover services in the selected cluster
-	opts := discovery.Options{
-		Context:         selectedCluster,
-		NamespaceFilter: "*", // Discover all namespaces
-		Verbose:         false,
-	}
-
-	result, err := discovery.DiscoverServices(opts)
-	if err != nil {
-		m.errorMsg = fmt.Sprintf("Service discovery failed: %v", err)
-		return m, nil
-	}
-
-	if result.TotalCount == 0 {
-		m.errorMsg = fmt.Sprintf("No services found in cluster '%s'", selectedCluster)
-		return m, nil
-	}
-
-	// Get existing configs to check for pre-existing services
-	existingConfigs := m.configStore.GetAll()
-	existingServiceMap := make(map[string]bool)
-	for _, cfg := range existingConfigs {
-		if cfg.Context == selectedCluster {
-			// Create a key for existing service identification
-			key := fmt.Sprintf("%s/%s", cfg.Namespace, cfg.Service)
-			existingServiceMap[key] = true
-		}
-	}
-
-	// Store the existing service map for later use in confirmation
-	m.discoveryExistingServices = existingServiceMap
-
-	// Convert discovered services to individual port selections
-	var portSelections []PortSelection
-	for _, discoveredService := range result.Services {
-		// Create a selection for each port on each service
-		for _, port := range discoveredService.ServiceInfo.Ports {
-			// Generate ID for this specific port
-			generatedID := generateServicePortID(selectedCluster, discoveredService.ServiceInfo, port)
-
-			// Default local port to remote port
-			localPort := int(port.Port)
-
-			// Check if this specific port already exists in config
-			alreadyExists := false
-			existingConfigIndex := -1
-			for i, cfg := range existingConfigs {
-				if cfg.Context == selectedCluster &&
-					cfg.Namespace == discoveredService.ServiceInfo.Namespace &&
-					cfg.Service == discoveredService.ServiceInfo.Name &&
-					cfg.PortRemote == int(port.Port) {
-					alreadyExists = true
-					existingConfigIndex = i
-					// Use the existing local port, not the remote port
-					localPort = cfg.PortLocal
-					break
-				}
-			}
-
-			portSelection := PortSelection{
-				ServiceName:      discoveredService.ServiceInfo.Name,
-				ServiceNamespace: discoveredService.ServiceInfo.Namespace,
-				ServiceType:      discoveredService.ServiceInfo.Type,
-				ServiceLabels:    discoveredService.ServiceInfo.Labels,
-				Port: ServicePortInfo{
-					Name:       port.Name,
-					Port:       port.Port,
-					TargetPort: port.TargetPort,
-					Protocol:   port.Protocol,
-				},
-				Selected:            alreadyExists, // Pre-select if already in config
-				LocalPort:           localPort,
-				GeneratedID:         generatedID,
-				ExistingConfigIndex: existingConfigIndex, // Store config index or -1 if new
-			}
-
-			portSelections = append(portSelections, portSelection)
-		}
-	}
-
-	// Store the port selections
-	m.discoveryPorts = portSelections
-
-	// Move to service selection phase
-	m.discoveryPhase = PhaseServiceSelection
-	m.statusMsg = fmt.Sprintf("Found %d ports in cluster '%s'", len(m.discoveryPorts), selectedCluster)
-	m.refreshDiscoveryTable()
-
-	return m, nil
+	return m, discoverServicesCmd(selectedCluster)
 }
 
 // refreshDiscoveryTable updates the discovery table based on current phase
@@ -458,6 +327,7 @@ func (m *Model) initializeServiceSelectionTable() {
 			table.WithRows(rows),
 			table.WithFocused(true),
 			table.WithHeight(tableHeight),
+			table.WithKeyMap(navTableKeyMap()),
 			table.WithStyles(s),
 		)
 	}

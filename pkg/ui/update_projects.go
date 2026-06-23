@@ -81,6 +81,7 @@ func (m *Model) initializeProjectSelector() {
 		table.WithRows(rows),
 		table.WithFocused(true),
 		table.WithHeight(min(len(rows)+2, m.height-6)),
+		table.WithKeyMap(navTableKeyMap()),
 	)
 
 	// Apply table styles
@@ -153,14 +154,14 @@ func (m *Model) stopAllRunningPortForwards() {
 	allConfigs := m.configStore.GetAll()
 	stoppedCount := 0
 
-	for i := range allConfigs {
-		if m.portForwarder.IsRunning(i) {
-			err := m.portForwarder.Stop(i)
+	for _, cfg := range allConfigs {
+		if m.portForwarder.IsRunning(cfg.ID) {
+			err := m.portForwarder.Stop(cfg.ID)
 			if err != nil {
-				logging.LogError("Failed to stop port forward %d during project selection: %v", i, err)
+				logging.LogError("Failed to stop port forward '%s' during project selection: %v", cfg.ID, err)
 			} else {
 				stoppedCount++
-				logging.LogDebug("Stopped port forward %d during project selection", i)
+				logging.LogDebug("Stopped port forward '%s' during project selection", cfg.ID)
 			}
 		}
 	}
@@ -181,50 +182,33 @@ func (m *Model) startProjectPortForwards(project config.Project) (int, []string)
 	for _, forwardID := range project.Forwards {
 		logging.LogDebug("Project '%s': Processing forward ID '%s'", project.Name, forwardID)
 
-		// Get the config index for this forward ID
-		index, found := m.configStore.GetIndexByID(forwardID)
+		// Check if already running
+		if m.portForwarder.IsRunning(forwardID) {
+			logging.LogDebug("Project '%s': Forward '%s' is already running, skipping", project.Name, forwardID)
+			startedCount++
+			continue
+		}
+
+		// Get the config for starting the port forward
+		cfg, found := m.configStore.GetConfigByID(forwardID)
 		if !found {
 			errorMsg := fmt.Sprintf("Port forward ID '%s' not found", forwardID)
 			errorMessages = append(errorMessages, errorMsg)
 			logging.LogError("Project '%s': %s", project.Name, errorMsg)
 			continue
 		}
-		logging.LogDebug("Project '%s': Found forward ID '%s' at index %d", project.Name, forwardID, index)
-
-		// Check if already running
-		if m.portForwarder.IsRunning(index) {
-			logging.LogDebug("Project '%s': Forward '%s' (index %d) is already running, skipping", project.Name, forwardID, index)
-			startedCount++
-			continue
-		}
-
-		// Get the config for starting the port forward
-		cfg, err := m.configStore.GetWithError(index)
-		if err != nil {
-			errorMsg := fmt.Sprintf("Failed to get config for '%s': %v", forwardID, err)
-			errorMessages = append(errorMessages, errorMsg)
-			logging.LogError("Project '%s': %s", project.Name, errorMsg)
-			continue
-		}
-		logging.LogDebug("Project '%s': Retrieved config for '%s' (index %d): %s:%d -> %s:%d", project.Name, forwardID, index, cfg.Context, cfg.PortLocal, cfg.Service, cfg.PortRemote)
+		logging.LogDebug("Project '%s': Retrieved config for '%s': %s:%d -> %s:%d", project.Name, forwardID, cfg.Context, cfg.PortLocal, cfg.Service, cfg.PortRemote)
 
 		// Start the port forward
-		logging.LogDebug("Project '%s': Attempting to start '%s' (index %d)", project.Name, forwardID, index)
-		err = m.portForwarder.Start(index, cfg)
+		logging.LogDebug("Project '%s': Attempting to start '%s'", project.Name, forwardID)
+		err := m.portForwarder.Start(cfg)
 		if err != nil {
 			errorMsg := fmt.Sprintf("Failed to start '%s': %v", forwardID, err)
 			errorMessages = append(errorMessages, errorMsg)
 			logging.LogError("Project '%s': %s", project.Name, errorMsg)
 		} else {
 			startedCount++
-			logging.LogDebug("Project '%s': Successfully started port forward '%s' (index %d)", project.Name, forwardID, index)
-
-			// Verify it's actually running
-			if m.portForwarder.IsRunning(index) {
-				logging.LogDebug("Project '%s': Verified '%s' (index %d) is running", project.Name, forwardID, index)
-			} else {
-				logging.LogError("Project '%s': Started '%s' (index %d) but IsRunning() returned false!", project.Name, forwardID, index)
-			}
+			logging.LogDebug("Project '%s': Successfully started port forward '%s'", project.Name, forwardID)
 		}
 	}
 

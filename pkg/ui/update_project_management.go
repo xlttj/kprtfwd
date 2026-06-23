@@ -46,6 +46,7 @@ func (m *Model) initializeProjectManagement() {
 		table.WithRows(rows),
 		table.WithFocused(true),
 		table.WithHeight(min(len(rows)+2, m.height-8)),
+		table.WithKeyMap(navTableKeyMap()),
 	)
 
 	// Apply table styles
@@ -246,6 +247,7 @@ func (m *Model) initializeProjectServiceSelection() {
 		table.WithRows(rows),
 		table.WithFocused(true),
 		table.WithHeight(min(len(rows)+2, m.height-10)),
+		table.WithKeyMap(navTableKeyMap()),
 	)
 
 	// Apply table styles

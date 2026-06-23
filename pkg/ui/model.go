@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/xlttj/kprtfwd/pkg/config"
 	"github.com/xlttj/kprtfwd/pkg/k8s"
@@ -70,6 +71,7 @@ type Model struct {
 	discoveryFilterInput      textinput.Model
 	discoveryFilterMode       bool
 	discoveryExistingServices map[string]bool
+	discoveryLoading          bool // True while an async kubectl discovery operation is in flight
 
 	// Inline editing state for local ports in discovery
 	discoveryEditMode  bool            // Whether we're in inline edit mode
@@ -179,8 +181,8 @@ func (m *Model) calculateDiscoveryServiceColumns() []table.Column {
 
 	// Remaining width distributed among SERVICE:PORT, NAMESPACE, TYPE - same logic as project management
 	remainingWidth := availableWidth - minSel - minRemote - minLocal
-	serviceWidth := remainingWidth * 40 / 100   // 40% for SERVICE:PORT (same as SERVICE in project mgmt)
-	namespaceWidth := remainingWidth * 30 / 100 // 30% for NAMESPACE (same as project mgmt)
+	serviceWidth := remainingWidth * 40 / 100                   // 40% for SERVICE:PORT (same as SERVICE in project mgmt)
+	namespaceWidth := remainingWidth * 30 / 100                 // 30% for NAMESPACE (same as project mgmt)
 	typeWidth := remainingWidth - serviceWidth - namespaceWidth // Rest for TYPE
 
 	// Ensure minimums - same as project management
@@ -303,38 +305,14 @@ func NewModel() *Model {
 		return nil // Can't proceed without a config store
 	}
 
+	// --- Initialize PortForwarder ---
+	pf := k8s.NewPortForwarder()
+
 	// Get initial configs slice
 	initialCfgs := cfgStore.GetAll()
 
-	// --- Initialize PortForwarder and Sync ---
-	pf := k8s.NewPortForwarder()
-	// Call sync with the initially loaded configs
-	startFailures := pf.SyncPortForwards(initialCfgs)
-
-	// *** Handle Start Failures ***
-	// Since SyncPortForwards is now a no-op, startFailures should be empty,
-	// but we'll keep this logic for compatibility
-	if len(startFailures) > 0 {
-		logging.LogError("SyncPortForwards reported %d start failures during initialization", len(startFailures))
-		for index, startErr := range startFailures {
-			// Retrieve the config that failed
-			failedCfg, exists := cfgStore.Get(index)
-			if !exists {
-				// This shouldn't happen if index came from the initial list
-				logging.LogError("Internal inconsistency: Config index %d from startFailures not found in store", index)
-				continue
-			}
-			// Note: Since status is no longer in config, we just log the failure
-			logging.LogDebug("Config %d (%s/%s) sync start failure: %v", index, failedCfg.Namespace, failedCfg.Service, startErr)
-		}
-	}
-
-	// Get the potentially updated configs *after* handling failures
-	finalInitialCfgs := cfgStore.GetAll()
-
-	// *** Log configs AFTER sync and failure handling ***
 	logging.LogDebug("NewModel: Configs loaded before UI init:")
-	for i, cfg := range finalInitialCfgs {
+	for i, cfg := range initialCfgs {
 		logging.LogDebug("  Index %d: %s/%s", i, cfg.Namespace, cfg.Service)
 	}
 
@@ -387,9 +365,10 @@ func NewModel() *Model {
 	pfCols := m.calculateColumnWidths()
 	pfTable := table.New(
 		table.WithColumns(pfCols),
-		table.WithRows(m.generateGroupedRows(finalInitialCfgs)), // Use grouped rows
+		table.WithRows(m.generateGroupedRows(initialCfgs)), // Use grouped rows
 		table.WithFocused(true),
 		table.WithHeight(10),
+		table.WithKeyMap(navTableKeyMap()),
 		table.WithStyles(s),
 	)
 	m.portForwardsTable = pfTable
@@ -403,12 +382,87 @@ func (m *Model) Cleanup() {
 	}
 }
 
+// statusRefreshInterval is how often the table re-checks runtime status, so
+// forwards whose kubectl process died on its own (VPN drop, expired
+// credentials) flip to Stopped without requiring user input.
+const statusRefreshInterval = 2 * time.Second
+
+// statusTickMsg drives the periodic runtime-status refresh.
+type statusTickMsg time.Time
+
+// tunnelProbeMsg carries the config IDs whose TCP tunnel a background probe
+// found broken (e.g. VPN dropped without killing kubectl).
+type tunnelProbeMsg []string
+
+// autoRestartMsg carries the config IDs that a background auto-restart attempt
+// successfully brought back up.
+type autoRestartMsg []string
+
+func statusTickCmd() tea.Cmd {
+	return tea.Tick(statusRefreshInterval, func(t time.Time) tea.Msg {
+		return statusTickMsg(t)
+	})
+}
+
+// probeTunnelsCmd runs the (blocking) tunnel health probe off the event loop.
+func probeTunnelsCmd(pf *k8s.PortForwarder) tea.Cmd {
+	return func() tea.Msg {
+		return tunnelProbeMsg(pf.ProbeAllTunnels())
+	}
+}
+
+// autoRestartCmd runs the (blocking) auto-restart pass off the event loop,
+// retrying transiently-broken forwards whose backoff has elapsed.
+func autoRestartCmd(pf *k8s.PortForwarder, configs []config.PortForwardConfig) tea.Cmd {
+	return func() tea.Msg {
+		return autoRestartMsg(pf.AutoRestart(configs))
+	}
+}
+
 func (m *Model) Init() tea.Cmd {
-	return nil
+	return statusTickCmd()
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case statusTickMsg:
+		// Sync displayed status with actual process state; the PortForwarder
+		// watcher goroutines deregister forwards whose process exited. Also
+		// kick off a tunnel health probe to catch VPN drops that leave kubectl
+		// running but the tunnel dead, and an auto-restart pass to recover
+		// transiently-broken forwards whose backoff has elapsed.
+		m.refreshTable()
+		configs := m.configStore.GetAll()
+		return m, tea.Batch(
+			statusTickCmd(),
+			probeTunnelsCmd(m.portForwarder),
+			autoRestartCmd(m.portForwarder, configs),
+		)
+
+	case tunnelProbeMsg:
+		if len(msg) > 0 {
+			m.portForwarder.MarkBroken([]string(msg))
+			m.refreshTable()
+		}
+		return m, nil
+
+	case autoRestartMsg:
+		if len(msg) > 0 {
+			m.refreshTable()
+			if len(msg) == 1 {
+				m.statusMsg = "Auto-restarted 1 port forward"
+			} else {
+				m.statusMsg = fmt.Sprintf("Auto-restarted %d port forwards", len(msg))
+			}
+		}
+		return m, nil
+
+	// Async service-discovery results (run off the event loop so the UI never freezes)
+	case clustersLoadedMsg:
+		return m.handleClustersLoaded(msg)
+	case servicesDiscoveredMsg:
+		return m.handleServicesDiscovered(msg)
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -543,8 +597,8 @@ func (m *Model) handlePortForwardsRestart() (tea.Model, tea.Cmd) {
 	// Get current configurations
 	configs := m.configStore.GetAll()
 
-	// Restart all running port forwards
-	result := m.portForwarder.RestartRunningForwards(configs)
+	// Restart all running and errored port forwards
+	result := m.portForwarder.RestartForwards(configs)
 
 	// Update UI state to reflect any changes
 	m.refreshTable()
@@ -564,11 +618,11 @@ func (m *Model) formatRestartSummary(result *k8s.RestartResult) string {
 	if len(result.Errors) > 0 {
 		// Show errors first
 		errorMsgs := []string{}
-		for idx, err := range result.Errors {
-			if cfg, exists := m.configStore.Get(idx); exists {
+		for id, err := range result.Errors {
+			if cfg, exists := m.configStore.GetConfigByID(id); exists {
 				errorMsgs = append(errorMsgs, fmt.Sprintf("%s: %v", cfg.Service, err))
 			} else {
-				errorMsgs = append(errorMsgs, fmt.Sprintf("Index %d: %v", idx, err))
+				errorMsgs = append(errorMsgs, fmt.Sprintf("%s: %v", id, err))
 			}
 		}
 		return fmt.Sprintf("Restart errors: %s", strings.Join(errorMsgs, "; "))
@@ -576,7 +630,7 @@ func (m *Model) formatRestartSummary(result *k8s.RestartResult) string {
 
 	// Show successful restart summary
 	if result.RestartedCount == 0 {
-		return "No running port forwards to restart"
+		return "No running or errored port forwards to restart"
 	}
 
 	return fmt.Sprintf("Restarted %d port forward(s)", result.RestartedCount)

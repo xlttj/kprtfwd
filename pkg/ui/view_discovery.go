@@ -9,6 +9,12 @@ import (
 
 // renderServiceDiscoveryView renders the service discovery interface
 func (m *Model) renderServiceDiscoveryView() string {
+	// While a kubectl operation runs in the background, show a lightweight
+	// loading screen instead of a stale/empty table.
+	if m.discoveryLoading {
+		return m.renderDiscoveryLoadingView()
+	}
+
 	switch m.discoveryPhase {
 	case PhaseClusterSelection:
 		return m.renderClusterSelectionView()
@@ -17,6 +23,31 @@ func (m *Model) renderServiceDiscoveryView() string {
 	default:
 		return "Unknown discovery phase"
 	}
+}
+
+// renderDiscoveryLoadingView shows progress while async discovery work is in flight.
+func (m *Model) renderDiscoveryLoadingView() string {
+	var content strings.Builder
+
+	titleStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color(ColorTitle)).
+		MarginBottom(1)
+	helpStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(ColorHelp))
+
+	content.WriteString(titleStyle.Render("Service Discovery"))
+	content.WriteString("\n\n")
+
+	message := m.statusMsg
+	if message == "" {
+		message = "Loading..."
+	}
+	content.WriteString(helpStyle.Render(message))
+	content.WriteString("\n\n")
+	content.WriteString(helpStyle.Render("Please wait — Esc to cancel, Ctrl+C to quit"))
+
+	return content.String()
 }
 
 // renderClusterSelectionView renders the cluster selection phase

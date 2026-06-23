@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/xlttj/kprtfwd/pkg/config"
 	"github.com/xlttj/kprtfwd/pkg/logging"
@@ -18,6 +19,12 @@ var ErrPortInUse = errors.New("local port already in use")
 
 // Sentinel error for port reserved internally by the application
 var ErrLocalPortReserved = errors.New("local port is already reserved by another active forward")
+
+// startupProbeDelay is how long StartPortForward waits before checking that
+// kubectl is still alive. It lets fast failures (VPN down, bad context, port
+// conflict kubectl detects itself) surface synchronously as a start error
+// instead of flickering Running until the next status tick.
+const startupProbeDelay = 200 * time.Millisecond
 
 // PortForwardParams contains the essential parameters for starting a port-forward.
 type PortForwardParams struct {
@@ -32,23 +39,79 @@ type PortForwardParams struct {
 type runningInfo struct {
 	cmd       *exec.Cmd
 	localPort int
+	startedAt time.Time     // when the process was registered; used to grace-skip health probes
+	stopping  bool          // set (under PortForwarder.Mutex) before an intentional kill
+	done      chan struct{} // closed by the watcher once the process is reaped
 }
 
-// PortForwarder manages multiple port-forward processes
+// Auto-restart policy for forwards that were running and then broke
+// (VPN drop, pod restart, tunnel reset). Initial-start failures are NOT
+// auto-retried — those usually mean a misconfiguration and would spin forever.
+const (
+	autoRestartMaxAttempts = 5
+	autoRestartBaseDelay   = 2 * time.Second
+	autoRestartMaxDelay    = 30 * time.Second
+)
+
+// AutoRestartMaxAttempts is the cap on auto-restart attempts before a forward
+// is left in Error for manual recovery. Exposed for the UI's progress display.
+func AutoRestartMaxAttempts() int { return autoRestartMaxAttempts }
+
+// retryInfo tracks the auto-restart backoff state for one forward.
+type retryInfo struct {
+	attempts    int       // attempts made so far
+	nextAttempt time.Time // earliest time for the next attempt
+}
+
+// backoffDelay returns the wait before the attempt following the given number
+// of prior attempts: 2s, 4s, 8s, 16s, capped at 30s.
+func backoffDelay(priorAttempts int) time.Duration {
+	d := autoRestartBaseDelay << priorAttempts
+	if d > autoRestartMaxDelay || d <= 0 { // <=0 guards against shift overflow
+		return autoRestartMaxDelay
+	}
+	return d
+}
+
+// PortForwarder manages multiple port-forward processes.
+// Forwards are keyed by config ID (stable across config list reordering),
+// never by list index: indices shift when configs are added/removed/edited.
 type PortForwarder struct {
-	// RunningForwards map[int]*exec.Cmd // Old map
-	RunningForwards  map[int]*runningInfo // Map of config index to running info
-	activeLocalPorts map[int]int          // Map of active local port -> config index
-	Mutex            sync.Mutex           // Mutex to protect the maps
+	RunningForwards  map[string]*runningInfo // Map of config ID to running info
+	activeLocalPorts map[int]string          // Map of active local port -> config ID
+	failedForwards   map[string]string       // ID -> human-readable reason it exited unexpectedly or failed to start
+	retrying         map[string]*retryInfo   // ID -> auto-restart backoff state (transient breaks only)
+	// Mutex protects the maps above. It must never be held across blocking
+	// calls (spawning kubectl, waiting on a process); only the non-blocking
+	// Kill signal may be sent while holding it.
+	Mutex sync.Mutex
 }
 
 // NewPortForwarder creates a new port forwarder
 func NewPortForwarder() *PortForwarder {
 	return &PortForwarder{
-		// RunningForwards: make(map[int]*exec.Cmd),
-		RunningForwards:  make(map[int]*runningInfo),
-		activeLocalPorts: make(map[int]int),
+		RunningForwards:  make(map[string]*runningInfo),
+		activeLocalPorts: make(map[int]string),
+		failedForwards:   make(map[string]string),
+		retrying:         make(map[string]*retryInfo),
 	}
+}
+
+// markRetryEligibleLocked schedules an auto-restart for a forward that broke
+// transiently, unless one is already scheduled (so attempt counting isn't
+// reset by repeated break notifications). Caller must hold the mutex.
+func (pf *PortForwarder) markRetryEligibleLocked(id string) {
+	if _, ok := pf.retrying[id]; ok {
+		return // already scheduled; the auto-restart driver owns the counter
+	}
+	pf.retrying[id] = &retryInfo{attempts: 0, nextAttempt: time.Now().Add(backoffDelay(0))}
+	logging.LogDebug("Scheduled auto-restart for '%s' in %s", id, backoffDelay(0))
+}
+
+// clearRetryLocked removes any auto-restart schedule for a forward. Caller must
+// hold the mutex. Used when a forward is intentionally stopped or comes back up.
+func (pf *PortForwarder) clearRetryLocked(id string) {
+	delete(pf.retrying, id)
 }
 
 // isPortAvailable checks if a TCP port is available to listen on localhost.
@@ -73,8 +136,33 @@ func isPortAvailable(port int) bool {
 	return true
 }
 
+// validateParams rejects parameters that kubectl could parse as flags (or
+// that cannot exist in a cluster) before they reach the command line.
+// Defense-in-depth: namespace and service names originate from cluster
+// output during discovery and are persisted in the local config store.
+func validateParams(params PortForwardParams) error {
+	if err := config.ValidateContextName(params.Context); err != nil {
+		return err
+	}
+	if err := config.ValidateKubernetesName("namespace", params.Namespace); err != nil {
+		return err
+	}
+	if err := config.ValidateKubernetesName("service", params.Service); err != nil {
+		return err
+	}
+	if err := config.ValidatePort("local port", params.PortLocal); err != nil {
+		return err
+	}
+	return config.ValidatePort("remote port", params.PortRemote)
+}
+
 // StartPortForward starts a port-forward for a specific set of parameters.
 func StartPortForward(params PortForwardParams) (*exec.Cmd, error) {
+	if err := validateParams(params); err != nil {
+		logging.LogError("Refusing to start port-forward: %v", err)
+		return nil, err
+	}
+
 	// *** Pre-check if local target port is available ***
 	if !isPortAvailable(params.PortLocal) {
 		// Return the specific sentinel error
@@ -95,6 +183,12 @@ func StartPortForward(params PortForwardParams) (*exec.Cmd, error) {
 	}
 	cmd := exec.Command("kubectl", args...)
 
+	// Put kubectl in its own process group so that any child processes it
+	// spawns (SSO exec-credential plugins, browser launchers) can be killed as
+	// a unit. Otherwise a child holding the stderr pipe open keeps cmd.Wait()
+	// blocked forever. See portforward_proc_unix.go / portforward_proc_windows.go.
+	setProcGroupAttrs(cmd)
+
 	var stderr bytes.Buffer
 
 	// Set stderr to capture output for checking
@@ -113,61 +207,114 @@ func StartPortForward(params PortForwardParams) (*exec.Cmd, error) {
 		return nil, fmt.Errorf("kubectl start failed: %w", err)
 	}
 
-	// Check if the process has exited. Non-blocking check.
-	// cmd.ProcessState is nil if still running after Start()
-	if cmd.ProcessState != nil {
-		stderrStr := stderr.String()
-		logging.LogError("Port-forward process exited quickly (PID: %d). Stderr: %s", cmd.Process.Pid, stderrStr)
-		// Consider a specific sentinel error here too?
-		return nil, fmt.Errorf("kubectl exited quickly. Stderr: %s", stderrStr)
-	}
-
-	// Do not treat immediate stderr as fatal; kubectl may emit warnings
-	stderrStr := strings.TrimSpace(stderr.String())
-	if stderrStr != "" {
-		logging.LogDebug("kubectl port-forward initial stderr (non-fatal): %s", stderrStr)
-	}
-
-	// If we reach here, Start() succeeded and process appears running
-	logging.LogDebug("Started port-forward process PID: %d, appears stable.", cmd.Process.Pid)
+	// Fast-failure detection (VPN down, invalid context, port conflict kubectl
+	// detects itself) is done by the caller via the watcher's done channel, not
+	// here: cmd.ProcessState is only set after Wait, and a signal-0 liveness
+	// check is defeated by zombies (an exited-but-unreaped process still
+	// answers). The stderr buffer must not be read on this success path either —
+	// exec's copy goroutine keeps writing to it until the process exits, so it
+	// is only safe to read after Wait returns.
+	logging.LogDebug("Started port-forward process PID: %d", cmd.Process.Pid)
 	return cmd, nil
 }
 
-// StopPortForward stops a port-forward process
-func StopPortForward(cmd *exec.Cmd) error {
+// drainStderr returns the captured stderr of a finished command. It must only
+// be called after cmd.Wait() has returned, when exec's copy goroutine is done.
+func drainStderr(cmd *exec.Cmd) string {
+	if cmd == nil {
+		return ""
+	}
+	if buf, ok := cmd.Stderr.(*bytes.Buffer); ok {
+		return strings.TrimSpace(buf.String())
+	}
+	return ""
+}
+
+// killProcess terminates a port-forward process group without reaping it.
+// The watcher goroutine owns cmd.Wait, so this must never Wait. Killing the
+// whole group (not just kubectl) closes every write-end of the stderr pipe,
+// including SSO credential subprocesses, so the watcher's Wait returns promptly.
+func killProcess(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
-	logging.LogDebug("Stopping port-forward process PID: %d", cmd.Process.Pid)
-
-	// Try graceful interrupt first, then kill
-	_ = cmd.Process.Kill()
-	// Reap the process to avoid zombies
-	_ = cmd.Wait()
-	return nil
+	logging.LogDebug("Killing port-forward process group PID: %d", cmd.Process.Pid)
+	return killCmdGroup(cmd)
 }
 
-// Start attempts to start the port-forward for the config at the given index.
-func (pf *PortForwarder) Start(index int, cfg config.PortForwardConfig) error {
+// watch reaps the kubectl process and cleans up tracking state when it exits
+// without Stop having been called (VPN drop, expired credentials, pod
+// deletion, ...). Exactly one watcher owns cmd.Wait per started process.
+func (pf *PortForwarder) watch(id string, info *runningInfo) {
+	err := info.cmd.Wait()
+	// Clean up tracking state first, then signal done. Closing done last means
+	// a waiter (Start's quick-exit check, RestartForwards) observes
+	// fully-settled state — and a reaped process whose socket is released.
+	pf.handleProcessExit(id, info, err)
+	if info.done != nil {
+		close(info.done)
+	}
+}
+
+// handleProcessExit deregisters a forward whose process exited on its own and
+// records it as errored so the UI can show an Error status.
+func (pf *PortForwarder) handleProcessExit(id string, info *runningInfo, waitErr error) {
+	pf.Mutex.Lock()
+	defer pf.Mutex.Unlock()
+
+	if info.stopping {
+		// Intentional stop; Stop/stopInternal already cleaned up the maps.
+		return
+	}
+	if current, exists := pf.RunningForwards[id]; !exists || current != info {
+		// The ID was deregistered (e.g. by MarkBroken) or is owned by a newer
+		// process now; whoever superseded us is responsible for its state.
+		return
+	}
+	delete(pf.RunningForwards, id)
+	if holder, reserved := pf.activeLocalPorts[info.localPort]; reserved && holder == id {
+		delete(pf.activeLocalPorts, info.localPort)
+	}
+
+	// Safe to read only now: exec's copy goroutine finished when Wait returned.
+	stderrStr := drainStderr(info.cmd)
+	reason := stderrStr
+	if reason == "" {
+		reason = fmt.Sprintf("kubectl exited unexpectedly (%v)", waitErr)
+	}
+	pf.failedForwards[id] = reason
+	logging.LogError("Port-forward '%s' (port %d) exited unexpectedly: %v (stderr: %s)", id, info.localPort, waitErr, stderrStr)
+
+	// Auto-restart only forwards that were genuinely running and then broke. A
+	// process that dies during the startup probe window is an initial-start
+	// failure (usually a misconfiguration), so it is left for manual Ctrl+R.
+	if time.Since(info.startedAt) >= startupProbeDelay {
+		pf.markRetryEligibleLocked(id)
+	}
+}
+
+// Start attempts to start the port-forward for the given config.
+func (pf *PortForwarder) Start(cfg config.PortForwardConfig) error {
+	id := cfg.ID
 	localPort := cfg.PortLocal // Get local port for checks
 
 	pf.Mutex.Lock()
-	if _, exists := pf.RunningForwards[index]; exists {
-		logging.LogDebug("Port-forward for index %d already marked as running.", index)
+	if _, exists := pf.RunningForwards[id]; exists {
+		logging.LogDebug("Port-forward for '%s' already marked as running.", id)
 		pf.Mutex.Unlock()
 		return nil // Already running, not an error
 	}
 
 	// *** Check internal reservation first ***
-	if conflictingIndex, reserved := pf.activeLocalPorts[localPort]; reserved {
-		logging.LogError("Cannot start index %d: %v (port %d reserved by index %d)", index, ErrLocalPortReserved, localPort, conflictingIndex)
+	if conflictingID, reserved := pf.activeLocalPorts[localPort]; reserved {
+		logging.LogError("Cannot start '%s': %v (port %d reserved by '%s')", id, ErrLocalPortReserved, localPort, conflictingID)
 		pf.Mutex.Unlock()
 		return ErrLocalPortReserved // Return specific error
 	}
 
 	// *** Reserve the port internally ***
-	pf.activeLocalPorts[localPort] = index
-	logging.LogDebug("Reserved local port %d for index %d", localPort, index)
+	pf.activeLocalPorts[localPort] = id
+	logging.LogDebug("Reserved local port %d for '%s'", localPort, id)
 	pf.Mutex.Unlock() // Unlock *before* calling potentially blocking StartPortForward helper
 
 	// Fallback: Check if port is actually available using net.Listen (done inside StartPortForward)
@@ -185,232 +332,454 @@ func (pf *PortForwarder) Start(index int, cfg config.PortForwardConfig) error {
 
 	// --- Handle outcome ---
 	pf.Mutex.Lock() // Re-acquire lock to update state
-	defer pf.Mutex.Unlock()
 
-	if err != nil {
-		// Start failed, release the reservation
-		if currentHolder, ok := pf.activeLocalPorts[localPort]; ok && currentHolder == index {
+	if err != nil || cmd == nil {
+		// Start failed, release the reservation and record error state
+		if currentHolder, ok := pf.activeLocalPorts[localPort]; ok && currentHolder == id {
 			delete(pf.activeLocalPorts, localPort)
-			logging.LogDebug("Released local port %d reservation for index %d due to start failure: %v", localPort, index, err)
+			logging.LogDebug("Released local port %d reservation for '%s' due to start failure: %v", localPort, id, err)
 		} else {
 			// Log if reservation was already gone or held by someone else (shouldn't happen ideally)
-			logging.LogError("Could not release reservation for port %d (index %d) after start failure. Current holder: %d, Exists: %t", localPort, index, currentHolder, ok)
+			logging.LogError("Could not release reservation for port %d ('%s') after start failure. Current holder: '%s', Exists: %t", localPort, id, currentHolder, ok)
 		}
-		return err // Return the original error from StartPortForward
+		if err != nil {
+			pf.failedForwards[id] = err.Error()
+			pf.Mutex.Unlock()
+			logging.LogError("Failed to start port-forward '%s': %v", id, err)
+			return err // Return the original error from StartPortForward
+		}
+		pf.failedForwards[id] = "kubectl did not start"
+		pf.Mutex.Unlock()
+		return fmt.Errorf("StartPortForward returned nil command without error for '%s'", id)
 	}
 
-	if cmd != nil {
-		// Start succeeded, store running info
-		pf.RunningForwards[index] = &runningInfo{cmd: cmd, localPort: localPort}
-		// Reservation in activeLocalPorts remains
-		logging.LogDebug("Successfully started and registered port-forward for index %d (PID: %d, Port: %d)", index, cmd.Process.Pid, localPort)
-		return nil // Success
-	} else {
-		// Should not happen if StartPortForward only returns nil cmd with non-nil error
-		// Release reservation as a precaution
-		if currentHolder, ok := pf.activeLocalPorts[localPort]; ok && currentHolder == index {
-			delete(pf.activeLocalPorts, localPort)
-			logging.LogDebug("Released local port %d reservation for index %d due to nil cmd/err", localPort, index)
+	// Start succeeded — clear any previous error and register the forward.
+	delete(pf.failedForwards, id)
+	info := &runningInfo{cmd: cmd, localPort: localPort, startedAt: time.Now(), done: make(chan struct{})}
+	pf.RunningForwards[id] = info
+	go pf.watch(id, info)
+	logging.LogDebug("Successfully started and registered port-forward for '%s' (PID: %d, Port: %d)", id, cmd.Process.Pid, localPort)
+	pf.Mutex.Unlock()
+
+	// Quick-exit detection: give kubectl a moment to fail fast (VPN down, bad
+	// context, port conflict it detects itself). If the watcher reaps the
+	// process within the grace window, it exited immediately — surface that as
+	// a start error so the UI shows Error now instead of flickering Running
+	// until the next status tick. The watcher has already marked it failed and
+	// deregistered it (done is closed only after that cleanup completes).
+	select {
+	case <-info.done:
+		if stderrStr := drainStderr(cmd); stderrStr != "" {
+			return fmt.Errorf("kubectl exited: %s", stderrStr)
 		}
-		return fmt.Errorf("StartPortForward returned nil command without error for index %d", index)
+		return fmt.Errorf("kubectl exited immediately (check VPN / kube context / port conflicts)")
+	case <-time.After(startupProbeDelay):
+		// Survived startup; treat as running and cancel any pending auto-restart.
+		pf.Mutex.Lock()
+		pf.clearRetryLocked(id)
+		pf.Mutex.Unlock()
+		return nil
 	}
 }
 
-// Stop attempts to stop the port-forward process for the given index.
-func (pf *PortForwarder) Stop(index int) error {
+// Stop attempts to stop the port-forward process for the given config ID.
+func (pf *PortForwarder) Stop(id string) error {
 	pf.Mutex.Lock()
-	defer pf.Mutex.Unlock()
 
-	runningInfo, exists := pf.RunningForwards[index]
+	info, exists := pf.RunningForwards[id]
 	if !exists {
-		// Not running (or not tracked), do nothing
-		logging.LogDebug("Stop: Port-forward for index %d not found or already stopped.", index)
+		// Not running (or not tracked). Still clear any error state, since an
+		// explicit stop is an intentional action.
+		delete(pf.failedForwards, id)
+		pf.clearRetryLocked(id)
+		pf.Mutex.Unlock()
+		logging.LogDebug("Stop: Port-forward for '%s' not found or already stopped.", id)
 		return nil
 	}
 
+	// Mark as intentionally stopping so the watcher doesn't treat the
+	// process exit as a failure.
+	info.stopping = true
+
 	// Get local port from stored info
-	localPort := runningInfo.localPort
+	localPort := info.localPort
 
 	// Release internal reservation first
 	if currentHolder, reserved := pf.activeLocalPorts[localPort]; reserved {
-		if currentHolder == index {
+		if currentHolder == id {
 			delete(pf.activeLocalPorts, localPort)
-			logging.LogDebug("Stop: Released internal reservation for local port %d (index %d)", localPort, index)
+			logging.LogDebug("Stop: Released internal reservation for local port %d ('%s')", localPort, id)
 		} else {
 			// Log if reservation was held by someone else (indicates inconsistency)
-			logging.LogError("Stop: Port %d reservation for index %d was held by index %d! Inconsistency?", localPort, index, currentHolder)
+			logging.LogError("Stop: Port %d reservation for '%s' was held by '%s'! Inconsistency?", localPort, id, currentHolder)
 		}
 	} else {
 		// Log if no reservation existed (indicates inconsistency)
-		logging.LogError("Stop: No internal reservation found for local port %d (index %d) during stop! Inconsistency?", localPort, index)
+		logging.LogError("Stop: No internal reservation found for local port %d ('%s') during stop! Inconsistency?", localPort, id)
 	}
 
-	// Now stop the actual process
-	err := StopPortForward(runningInfo.cmd) // Call helper
-	if err != nil {
-		// Log the error but proceed to remove from map
-		logging.LogError("Stop: Error stopping port-forward process for index %d (PID: %d, Port: %d): %v", index, runningInfo.cmd.Process.Pid, localPort, err)
-	}
+	// Intentional stop clears error state and any pending auto-restart.
+	delete(pf.failedForwards, id)
+	pf.clearRetryLocked(id)
 
 	// Remove from running map
-	delete(pf.RunningForwards, index)
-	logging.LogDebug("Stop: Stopped and deregistered port-forward for index %d (Port: %d)", index, localPort)
-	return err // Return the error from StopPortForward helper
-}
+	delete(pf.RunningForwards, id)
+	pf.Mutex.Unlock()
 
-// SyncPortForwards is now a no-op since status is not stored in config
-// Port forwards are managed entirely through UI interactions (Start/Stop methods)
-// This method is kept for interface compatibility but does nothing
-func (pf *PortForwarder) SyncPortForwards(configs []config.PortForwardConfig) map[int]error {
-	logging.LogDebug("SyncPortForwards called - no action taken (runtime state only)")
-	return make(map[int]error) // Return empty map
-}
-
-// stopInternal stops a forward assuming the lock is already held.
-func (pf *PortForwarder) stopInternal(index int) error {
-	runningInfo, exists := pf.RunningForwards[index]
-	if !exists {
-		return nil // Already stopped
+	// Kill outside the lock; the watcher goroutine reaps the process.
+	err := killProcess(info.cmd)
+	if err != nil {
+		logging.LogError("Stop: Error killing port-forward process for '%s' (Port: %d): %v", id, localPort, err)
 	}
-	localPort := runningInfo.localPort
-	if currentHolder, reserved := pf.activeLocalPorts[localPort]; reserved && currentHolder == index {
-		delete(pf.activeLocalPorts, localPort)
-	}
-	err := StopPortForward(runningInfo.cmd) // Call helper
-	delete(pf.RunningForwards, index)
-	logging.LogDebug("stopInternal: Stopped index %d (Port: %d)", index, localPort)
+	logging.LogDebug("Stop: Stopped and deregistered port-forward for '%s' (Port: %d)", id, localPort)
 	return err
 }
 
-// startInternal starts a forward assuming the lock is already held for map checks/updates.
-func (pf *PortForwarder) startInternal(index int, cfg config.PortForwardConfig) error {
-	localPort := cfg.PortLocal
-	if _, exists := pf.RunningForwards[index]; exists {
-		return nil // Already running
+// stopInternal stops a forward assuming the lock is already held.
+func (pf *PortForwarder) stopInternal(id string) error {
+	info, exists := pf.RunningForwards[id]
+	if !exists {
+		delete(pf.failedForwards, id) // intentional stop clears error state
+		pf.clearRetryLocked(id)
+		return nil // Already stopped
 	}
-	if conflictingIndex, reserved := pf.activeLocalPorts[localPort]; reserved {
-		return fmt.Errorf("%w: port %d requested by index %d, but reserved by index %d", ErrLocalPortReserved, localPort, index, conflictingIndex)
+	info.stopping = true
+	localPort := info.localPort
+	if currentHolder, reserved := pf.activeLocalPorts[localPort]; reserved && currentHolder == id {
+		delete(pf.activeLocalPorts, localPort)
 	}
-
-	// Reserve port
-	pf.activeLocalPorts[localPort] = index
-	logging.LogDebug("startInternal: Reserved port %d for index %d", localPort, index)
-
-	// Unlock *briefly* only for the potentially blocking call
-	pf.Mutex.Unlock()
-	// Correctly initialize the params struct
-	params := PortForwardParams{
-		Context:    cfg.Context,
-		Namespace:  cfg.Namespace,
-		Service:    cfg.Service,
-		PortRemote: cfg.PortRemote,
-		PortLocal:  localPort,
-	}
-	cmd, err := StartPortForward(params)
-	pf.Mutex.Lock() // Re-acquire lock immediately after call
-
-	if err != nil {
-		// Failed, release reservation
-		if currentHolder, ok := pf.activeLocalPorts[localPort]; ok && currentHolder == index {
-			delete(pf.activeLocalPorts, localPort)
-		}
-		return err // Return error from helper
-	}
-	if cmd != nil {
-		// Succeeded, add to running map
-		pf.RunningForwards[index] = &runningInfo{cmd: cmd, localPort: localPort}
-		return nil // Success
-	} else {
-		// Failed (nil cmd/err case), release reservation
-		if currentHolder, ok := pf.activeLocalPorts[localPort]; ok && currentHolder == index {
-			delete(pf.activeLocalPorts, localPort)
-		}
-		return fmt.Errorf("StartPortForward returned nil cmd/err for index %d", index)
-	}
+	delete(pf.failedForwards, id) // intentional stop clears error state
+	pf.clearRetryLocked(id)
+	delete(pf.RunningForwards, id)
+	// Kill is a non-blocking signal; the watcher goroutine reaps the process.
+	err := killProcess(info.cmd)
+	logging.LogDebug("stopInternal: Stopped '%s' (Port: %d)", id, localPort)
+	return err
 }
 
-// IsRunning checks if a port forward is currently running for the given index
-func (pf *PortForwarder) IsRunning(index int) bool {
+// IsRunning checks if a port forward is currently running for the given config ID
+func (pf *PortForwarder) IsRunning(id string) bool {
 	pf.Mutex.Lock()
 	defer pf.Mutex.Unlock()
-	_, exists := pf.RunningForwards[index]
+	_, exists := pf.RunningForwards[id]
 	return exists
+}
+
+// IsError reports whether the port-forward with the given ID is in an error
+// state — it either failed to start or its process exited unexpectedly. The
+// flag is cleared once the forward is intentionally stopped or restarts cleanly.
+func (pf *PortForwarder) IsError(id string) bool {
+	pf.Mutex.Lock()
+	defer pf.Mutex.Unlock()
+	_, failed := pf.failedForwards[id]
+	return failed
+}
+
+// ErrorReason returns the human-readable reason the forward with the given ID
+// last failed (kubectl stderr, a start error, or a broken-tunnel notice), or
+// the empty string if it is not in an error state.
+func (pf *PortForwarder) ErrorReason(id string) string {
+	pf.Mutex.Lock()
+	defer pf.Mutex.Unlock()
+	return pf.failedForwards[id]
+}
+
+// StopAllRunning stops every currently running port-forward and returns how
+// many were stopped. Error state is cleared for each (intentional action).
+func (pf *PortForwarder) StopAllRunning() int {
+	pf.Mutex.Lock()
+	defer pf.Mutex.Unlock()
+	ids := make([]string, 0, len(pf.RunningForwards))
+	for id := range pf.RunningForwards {
+		ids = append(ids, id)
+	}
+	for _, id := range ids {
+		_ = pf.stopInternal(id)
+	}
+	return len(ids)
 }
 
 // CleanupAll stops all port-forwards
 func (pf *PortForwarder) CleanupAll() {
 	pf.Mutex.Lock()
 	defer pf.Mutex.Unlock()
-	indices := make([]int, 0, len(pf.RunningForwards))
-	for idx := range pf.RunningForwards {
-		indices = append(indices, idx)
+	ids := make([]string, 0, len(pf.RunningForwards))
+	for id := range pf.RunningForwards {
+		ids = append(ids, id)
 	}
-	for _, idx := range indices {
-		logging.LogDebug("CleanupAll: Stopping index %d", idx)
-		_ = pf.stopInternal(idx) // Call internal stop
+	for _, id := range ids {
+		logging.LogDebug("CleanupAll: Stopping '%s'", id)
+		_ = pf.stopInternal(id) // Call internal stop
 	}
-	pf.RunningForwards = make(map[int]*runningInfo)
-	pf.activeLocalPorts = make(map[int]int)
+	pf.RunningForwards = make(map[string]*runningInfo)
+	pf.activeLocalPorts = make(map[int]string)
+	pf.failedForwards = make(map[string]string)
+	pf.retrying = make(map[string]*retryInfo)
 	logging.LogDebug("CleanupAll finished.")
+}
+
+// isPortForwardHealthy dials localhost:localPort and determines whether kubectl's
+// tunnel is live. A healthy tunnel: kubectl holds the connection open waiting to
+// forward data → our read times out. A broken tunnel (VPN down, pod gone): kubectl
+// closes the connection immediately → we get EOF. Connection refused means kubectl
+// is no longer listening (also unhealthy).
+//
+// Limitation: silent packet-drop black-holes (VPN route gone, no RST) cannot be
+// detected this way because kubectl still appears to hold the connection.
+func isPortForwardHealthy(localPort int) bool {
+	address := fmt.Sprintf("127.0.0.1:%d", localPort)
+	conn, err := net.DialTimeout("tcp", address, 200*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	buf := make([]byte, 1)
+	_, err = conn.Read(buf)
+	if err == nil {
+		return true // received data — definitely healthy
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true // held open — tunnel is live
+	}
+	return false // EOF or other error — upstream unreachable
+}
+
+// ProbeAllTunnels checks every running forward's TCP tunnel health concurrently
+// and returns the IDs of forwards whose tunnel appears broken. Forwards started
+// within the grace period are skipped so a just-started tunnel isn't flagged
+// before kubectl has finished establishing it. Blocking; call from a goroutine
+// or tea.Cmd.
+func (pf *PortForwarder) ProbeAllTunnels() []string {
+	const probeGrace = 5 * time.Second // don't probe a forward that just started
+
+	pf.Mutex.Lock()
+	toProbe := make(map[string]int) // id → localPort
+	for id, info := range pf.RunningForwards {
+		if time.Since(info.startedAt) < probeGrace {
+			continue
+		}
+		toProbe[id] = info.localPort
+	}
+	pf.Mutex.Unlock()
+
+	if len(toProbe) == 0 {
+		return nil
+	}
+
+	type result struct {
+		id      string
+		healthy bool
+	}
+	ch := make(chan result, len(toProbe))
+	for id, port := range toProbe {
+		go func(i string, p int) {
+			ch <- result{i, isPortForwardHealthy(p)}
+		}(id, port)
+	}
+
+	var broken []string
+	for range toProbe {
+		r := <-ch
+		if !r.healthy {
+			broken = append(broken, r.id)
+		}
+	}
+	return broken
+}
+
+// MarkBroken kills and deregisters the forwards with the given IDs, marking each
+// as errored. Used to record tunnels that the TCP health probe found broken.
+// The killed process is reaped by its own watcher goroutine.
+func (pf *PortForwarder) MarkBroken(ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	pf.Mutex.Lock()
+	defer pf.Mutex.Unlock()
+	for _, id := range ids {
+		info, ok := pf.RunningForwards[id]
+		if !ok {
+			continue
+		}
+		if holder, ok2 := pf.activeLocalPorts[info.localPort]; ok2 && holder == id {
+			delete(pf.activeLocalPorts, info.localPort)
+		}
+		delete(pf.RunningForwards, id)
+		pf.failedForwards[id] = fmt.Sprintf("tunnel health check failed on local port %d (VPN down or upstream unreachable)", info.localPort)
+		// A broken tunnel is a transient failure of a running forward, so it is
+		// eligible for auto-restart.
+		pf.markRetryEligibleLocked(id)
+		logging.LogError("MarkBroken: tunnel broken for '%s' (port %d); killing process", id, info.localPort)
+		// Non-blocking kill under the lock (allowed by the mutex contract);
+		// the forward's watcher owns Wait and will reap it, then see the entry
+		// is gone and leave the error state we just set in place.
+		_ = killProcess(info.cmd)
+	}
+}
+
+// RetryStatus reports whether an auto-restart is scheduled for the given ID and
+// how many attempts have been made so far. Used by the UI to show retry progress.
+func (pf *PortForwarder) RetryStatus(id string) (attempts int, scheduled bool) {
+	pf.Mutex.Lock()
+	defer pf.Mutex.Unlock()
+	if ri, ok := pf.retrying[id]; ok {
+		return ri.attempts, true
+	}
+	return 0, false
+}
+
+// AutoRestart attempts to restart forwards whose backoff timer has elapsed,
+// for transient breaks only (process exit after running, or a broken tunnel).
+// It returns the IDs that successfully came back up. Each failed attempt backs
+// off further; after autoRestartMaxAttempts the schedule is dropped and the
+// forward stays in Error until a manual Ctrl+R. Blocking (Start probes kubectl
+// for ~startupProbeDelay per due forward); call from a goroutine or tea.Cmd.
+func (pf *PortForwarder) AutoRestart(configs []config.PortForwardConfig) []string {
+	configsByID := make(map[string]config.PortForwardConfig, len(configs))
+	for _, cfg := range configs {
+		configsByID[cfg.ID] = cfg
+	}
+
+	now := time.Now()
+	pf.Mutex.Lock()
+	var due []string
+	for id, ri := range pf.retrying {
+		if !now.Before(ri.nextAttempt) { // now >= nextAttempt
+			due = append(due, id)
+		}
+	}
+	pf.Mutex.Unlock()
+
+	var recovered []string
+	for _, id := range due {
+		cfg, ok := configsByID[id]
+		if !ok {
+			// Config was deleted; abandon the retry.
+			pf.Mutex.Lock()
+			pf.clearRetryLocked(id)
+			pf.Mutex.Unlock()
+			continue
+		}
+		if pf.IsRunning(id) {
+			// Already back up by some other path; drop the schedule.
+			pf.Mutex.Lock()
+			pf.clearRetryLocked(id)
+			pf.Mutex.Unlock()
+			continue
+		}
+
+		logging.LogDebug("AutoRestart: attempting restart of '%s'", id)
+		err := pf.Start(cfg) // clears the retry schedule itself on confirmed success
+
+		pf.Mutex.Lock()
+		if err == nil {
+			recovered = append(recovered, id)
+			logging.LogDebug("AutoRestart: '%s' recovered", id)
+		} else if ri, stillScheduled := pf.retrying[id]; stillScheduled {
+			ri.attempts++
+			if ri.attempts >= autoRestartMaxAttempts {
+				pf.clearRetryLocked(id)
+				logging.LogError("AutoRestart: giving up on '%s' after %d attempts; leaving in Error", id, ri.attempts)
+			} else {
+				ri.nextAttempt = time.Now().Add(backoffDelay(ri.attempts))
+				logging.LogDebug("AutoRestart: '%s' attempt %d failed (%v); next try in %s", id, ri.attempts, err, backoffDelay(ri.attempts))
+			}
+		}
+		pf.Mutex.Unlock()
+	}
+	return recovered
 }
 
 // RestartResult represents the outcome of a restart operation
 type RestartResult struct {
-	RestartedCount int           // Number of port forwards restarted
-	Errors         map[int]error // Errors by config index
+	RestartedCount int              // Number of port forwards restarted
+	Errors         map[string]error // Errors by config ID
 }
 
-// RestartRunningForwards restarts all currently running port forwards
-// This is useful when network connectivity is lost (e.g., VPN disconnect)
-func (pf *PortForwarder) RestartRunningForwards(configs []config.PortForwardConfig) *RestartResult {
-	pf.Mutex.Lock()
-	defer pf.Mutex.Unlock()
+// processReapTimeout bounds how long a restart waits for the killed kubectl
+// process to be reaped (and its listening socket released) before starting
+// the replacement.
+const processReapTimeout = 5 * time.Second
 
+// RestartForwards restarts every forward that is currently running OR in an
+// error state. Running forwards are stopped and started again (useful after a
+// VPN drop); errored forwards are simply (re)started so the user can recover a
+// failed connection with Ctrl+R without first toggling it off. Intentionally
+// stopped forwards are left alone.
+func (pf *PortForwarder) RestartForwards(configs []config.PortForwardConfig) *RestartResult {
 	result := &RestartResult{
 		RestartedCount: 0,
-		Errors:         make(map[int]error),
+		Errors:         make(map[string]error),
 	}
 
-	// Get a snapshot of currently running indices
-	runningIndices := []int{}
-	for index := range pf.RunningForwards {
-		runningIndices = append(runningIndices, index)
+	configsByID := make(map[string]config.PortForwardConfig, len(configs))
+	for _, cfg := range configs {
+		configsByID[cfg.ID] = cfg
 	}
 
-	logging.LogDebug("RestartRunningForwards: Found %d running port forwards to restart", len(runningIndices))
+	// Snapshot the IDs to restart: running ∪ errored. Stop and Start manage
+	// their own locking, so the mutex is not held across the blocking kubectl
+	// calls below and other callers (UI status checks, watchers) stay responsive.
+	pf.Mutex.Lock()
+	targets := make(map[string]bool, len(pf.RunningForwards)+len(pf.failedForwards))
+	for id := range pf.RunningForwards {
+		targets[id] = true
+	}
+	for id := range pf.failedForwards {
+		targets[id] = true
+	}
+	pf.Mutex.Unlock()
 
-	// Restart each running port forward
-	for _, index := range runningIndices {
-		// Get the config for this index
-		if index >= len(configs) {
-			logging.LogError("RestartRunningForwards: Index %d is out of bounds (configs length: %d)", index, len(configs))
-			result.Errors[index] = fmt.Errorf("index %d out of bounds", index)
+	logging.LogDebug("RestartForwards: Found %d port forwards to restart (running + errored)", len(targets))
+
+	for id := range targets {
+		cfg, found := configsByID[id]
+		if !found {
+			logging.LogError("RestartForwards: Config '%s' no longer exists", id)
+			result.Errors[id] = fmt.Errorf("config '%s' no longer exists", id)
 			continue
 		}
-		cfg := configs[index]
 
-		logging.LogDebug("RestartRunningForwards: Restarting port forward %d (%s)", index, cfg.Service)
+		logging.LogDebug("RestartForwards: Restarting port forward '%s' (%s)", id, cfg.Service)
 
-		// Stop the current port forward
-		stopErr := pf.stopInternal(index)
+		// Grab the running info (nil for a purely-errored forward) so we can
+		// wait for the old process to be reaped after Stop; starting again
+		// while it still holds the local socket would trip the port pre-check.
+		pf.Mutex.Lock()
+		oldInfo := pf.RunningForwards[id]
+		pf.Mutex.Unlock()
+
+		// Stop clears any error state and, if running, kills the process. For a
+		// purely-errored forward this is a cheap no-op that just clears the flag.
+		stopErr := pf.Stop(id)
 		if stopErr != nil {
-			logging.LogError("RestartRunningForwards: Failed to stop port forward %d: %v", index, stopErr)
-			result.Errors[index] = fmt.Errorf("failed to stop: %w", stopErr)
+			logging.LogError("RestartForwards: Failed to stop port forward '%s': %v", id, stopErr)
+			result.Errors[id] = fmt.Errorf("failed to stop: %w", stopErr)
 			continue
+		}
+
+		if oldInfo != nil && oldInfo.done != nil {
+			select {
+			case <-oldInfo.done:
+			case <-time.After(processReapTimeout):
+				logging.LogError("RestartForwards: Timed out waiting for '%s' to exit; attempting start anyway", id)
+			}
 		}
 
 		// Start it again with the same config
-		startErr := pf.startInternal(index, cfg)
+		startErr := pf.Start(cfg)
 		if startErr != nil {
-			logging.LogError("RestartRunningForwards: Failed to start port forward %d: %v", index, startErr)
-			result.Errors[index] = fmt.Errorf("failed to restart: %w", startErr)
+			logging.LogError("RestartForwards: Failed to start port forward '%s': %v", id, startErr)
+			result.Errors[id] = fmt.Errorf("failed to restart: %w", startErr)
 			continue
 		}
 
 		result.RestartedCount++
-		logging.LogDebug("RestartRunningForwards: Successfully restarted port forward %d (%s)", index, cfg.Service)
+		logging.LogDebug("RestartForwards: Successfully restarted port forward '%s' (%s)", id, cfg.Service)
 	}
 
-	logging.LogDebug("RestartRunningForwards: Complete - Restarted: %d, Errors: %d", result.RestartedCount, len(result.Errors))
+	logging.LogDebug("RestartForwards: Complete - Restarted: %d, Errors: %d", result.RestartedCount, len(result.Errors))
 	return result
 }
