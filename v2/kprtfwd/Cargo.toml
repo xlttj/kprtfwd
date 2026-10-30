@@ -1,0 +1,15 @@
+[package]
+name = "kprtfwd"
+description = "Kubernetes port-forward manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kprtfwd-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true

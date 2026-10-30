@@ -1,5 +1,6 @@
-# Binaries
-kprtfwd
+# Binaries (anchored, so v2/kprtfwd/ is not ignored)
+/kprtfwd
+/build/
 *.exe
 *.exe~
 *.dll

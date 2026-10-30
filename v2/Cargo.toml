@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "kprtfwd"]
+# The spike is a standalone experiment and is removed once the engine exists.
+exclude = ["spike/kube-forward"]
+
+[workspace.package]
+version = "2.0.0-dev"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/xlttj/kprtfwd"
+
+[workspace.dependencies]
+kprtfwd-core = { path = "crates/core" }
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+rusqlite = { version = "0.41.1", features = ["bundled", "backup"] }
+thiserror = "2.0.21"
+tempfile = "3.27.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+strip = true
+lto = "thin"
