@@ -3,6 +3,7 @@
 //! This crate has no async or Kubernetes dependencies, so everything in it can
 //! be tested without a cluster.
 
+pub mod clock;
 pub mod filter;
 pub mod model;
 pub mod naming;

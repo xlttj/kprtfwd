@@ -152,7 +152,7 @@ async fn run_cmd(cmd: Cmd, client: &mut Client, app: &mut App, tx: &mpsc::Unboun
             });
         }
         Cmd::Events { id } => {
-            let result = match client.request(Request::Events { id }).await {
+            let result = match client.request(Request::Events { ids: vec![id] }).await {
                 Ok(Response::Events { entries }) => Ok(entries),
                 Ok(_) => Err("unexpected answer from the daemon".into()),
                 Err(err) => Err(err.to_string()),

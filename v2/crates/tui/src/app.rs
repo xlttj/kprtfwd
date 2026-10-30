@@ -941,6 +941,7 @@ pub(crate) mod tests {
         Snapshot {
             daemon_version: "2.0.0-test".into(),
             paused: false,
+            kubeconfig_files: vec![],
             contexts: vec![],
             forwards: vec![
                 view("prd-web", "production", "frontend", 80, false),

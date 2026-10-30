@@ -2,13 +2,14 @@
 
 mod table;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
+use kprtfwd_core::clock::local_time;
 use kprtfwd_core::{ForwardId, ForwardState, Store, filter, paths};
 use kprtfwd_proto::{Client, ClientError, ForwardView, Request, Snapshot, connect_or_start};
 
@@ -56,6 +57,14 @@ pub enum Command {
     /// Reconnect a context from scratch
     Reconnect {
         context: String,
+    },
+    /// Show the events of forwards (a project or words, as for `up`), or
+    /// without arguments the daemon's log
+    Logs {
+        /// Keep printing new entries
+        #[arg(short, long)]
+        follow: bool,
+        query: Vec<String>,
     },
     /// Delete forwards whose service no longer exists in the cluster
     Prune {
@@ -149,6 +158,8 @@ async fn execute(command: Command) -> Result<ExitCode> {
             namespace,
             yes,
         } => prune(context, &namespace, yes).await,
+        Command::Logs { follow, query } if query.is_empty() => daemon_log(follow).await,
+        Command::Logs { follow, query } => events(&query, follow).await,
         Command::Daemon(DaemonCommand::Run { .. }) => {
             bail!("`daemon run` is handled by the kprtfwd binary")
         }
@@ -196,6 +207,7 @@ async fn status(all: bool, json: bool) -> Result<ExitCode> {
         if snapshot.paused {
             println!("\nPaused. `kprtfwd resume` brings the enabled forwards back.");
         }
+        println!("\nkubeconfig: {}", snapshot.kubeconfig_files.join(", "));
     }
     let not_ready = snapshot.forwards.iter().any(|view| {
         view.forward.enabled
@@ -387,6 +399,95 @@ fn confirm(question: &str) -> Result<bool> {
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
     Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
+}
+
+/// Prints the events of the selected forwards and their contexts.
+async fn events(query: &[String], follow: bool) -> Result<ExitCode> {
+    let mut client = connect().await?;
+    let snapshot = client.snapshot().await?;
+    let ids = match select(&snapshot, query)? {
+        Selection::Project(name) => project_members(&snapshot, &name),
+        Selection::Forwards(ids) => ids,
+    };
+    let width = snapshot
+        .forwards
+        .iter()
+        .filter(|view| ids.contains(&view.forward.id))
+        .flat_map(|view| [view.forward.id.as_str().len(), view.forward.context.len()])
+        .max()
+        .unwrap_or(0);
+    let mut printed: HashSet<(SystemTime, String, String)> = HashSet::new();
+    loop {
+        let entries = match client.request(Request::Events { ids: ids.clone() }).await? {
+            kprtfwd_proto::Response::Events { entries } => entries,
+            _ => bail!("unexpected answer from the daemon"),
+        };
+        for entry in entries {
+            let key = (entry.at, entry.source.clone(), entry.message.clone());
+            if printed.insert(key) {
+                println!(
+                    "{}  {:<width$}  {}",
+                    local_time(entry.at),
+                    entry.source,
+                    entry.message
+                );
+            }
+        }
+        if !follow {
+            return Ok(ExitCode::SUCCESS);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Prints the end of the daemon's newest log file, and with `follow` what
+/// is appended, switching files at the daily rotation.
+async fn daemon_log(follow: bool) -> Result<ExitCode> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: usize = 50;
+    let dir = paths::log_dir().context("neither KPRTFWD_HOME nor HOME is set")?;
+    let newest = || -> Option<PathBuf> {
+        std::fs::read_dir(&dir)
+            .ok()?
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("daemon.") && name.ends_with(".log"))
+            })
+            .max()
+    };
+    let mut file = newest().with_context(|| format!("no daemon log in {}", dir.display()))?;
+    let text = std::fs::read_to_string(&file)?;
+    let lines: Vec<&str> = text.lines().collect();
+    for line in &lines[lines.len().saturating_sub(TAIL)..] {
+        println!("{line}");
+    }
+    if !follow {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut position = text.len() as u64;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Some(latest) = newest()
+            && latest != file
+        {
+            file = latest;
+            position = 0;
+        }
+        let length = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+        if length < position {
+            position = 0;
+        }
+        if length > position {
+            let mut handle = std::fs::File::open(&file)?;
+            handle.seek(SeekFrom::Start(position))?;
+            let mut appended = String::new();
+            handle.read_to_string(&mut appended)?;
+            print!("{appended}");
+            position = length;
+        }
+    }
 }
 
 async fn pause(paused: bool) -> Result<ExitCode> {
@@ -616,6 +717,7 @@ mod tests {
         Snapshot {
             daemon_version: "test".into(),
             paused: false,
+            kubeconfig_files: vec![],
             contexts: vec![],
             forwards: vec![
                 view("stg-api", "staging", "api"),

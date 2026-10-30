@@ -9,6 +9,7 @@ pub mod discovery;
 pub mod errors;
 mod events;
 mod forward;
+pub mod kubeconfig;
 pub mod portforward;
 
 use std::collections::{HashMap, HashSet};
@@ -129,17 +130,25 @@ impl Engine {
         self.forwards.get(id)?.last_error()
     }
 
-    /// The events of a forward and of its context, oldest first.
-    pub fn events(&self, id: &ForwardId, context: &str) -> Vec<Event> {
-        let mut events: Vec<Event> = self
-            .forward_events
+    /// A forward's events, oldest first. They outlive stopping the forward.
+    pub fn forward_events(&self, id: &ForwardId) -> Vec<Event> {
+        self.forward_events
             .get(id)
-            .into_iter()
-            .chain(self.context_events.get(context))
-            .flat_map(EventLog::entries)
-            .collect();
-        events.sort_by_key(|event| event.at);
-        events
+            .map(EventLog::entries)
+            .unwrap_or_default()
+    }
+
+    /// A context's events, oldest first.
+    pub fn context_events(&self, name: &str) -> Vec<Event> {
+        self.context_events
+            .get(name)
+            .map(EventLog::entries)
+            .unwrap_or_default()
+    }
+
+    /// The contexts in use.
+    pub fn context_names(&self) -> Vec<String> {
+        self.contexts.keys().cloned().collect()
     }
 
     pub fn shutdown(&mut self) {

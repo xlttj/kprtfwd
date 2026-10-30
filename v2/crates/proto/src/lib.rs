@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 pub use client::{Client, ClientError, connect_or_start, spawn_daemon};
 
 /// Bumped on every incompatible change to the messages.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// A request with its ID. The request is nested, not flattened, because
 /// requests have fields of their own named `id`.
@@ -82,9 +82,9 @@ pub enum Request {
         namespace_filter: String,
         dry_run: bool,
     },
-    /// Recent events of a forward and its context.
+    /// Recent events of these forwards and of their contexts.
     Events {
-        id: ForwardId,
+        ids: Vec<ForwardId>,
     },
     Shutdown,
 }
@@ -140,6 +140,8 @@ pub struct DiscoveredPort {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventEntry {
     pub at: SystemTime,
+    /// The forward's ID or the context's name.
+    pub source: String,
     pub message: String,
 }
 
@@ -153,6 +155,8 @@ pub struct Snapshot {
     /// All forwards, sorted by context, namespace, service and port.
     pub forwards: Vec<ForwardView>,
     pub projects: Vec<ProjectView>,
+    /// The kubeconfig files the daemon reads.
+    pub kubeconfig_files: Vec<String>,
 }
 
 impl Snapshot {
@@ -288,7 +292,7 @@ mod tests {
                 namespace_filter: "*".into(),
                 dry_run: true,
             },
-            Request::Events { id: id() },
+            Request::Events { ids: vec![id()] },
             Request::Shutdown,
         ];
         for (n, request) in requests.into_iter().enumerate() {

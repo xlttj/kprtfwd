@@ -17,7 +17,7 @@ use kprtfwd_core::state::derive;
 use kprtfwd_core::svctype::classify;
 use kprtfwd_core::validate::validate_forward;
 use kprtfwd_core::{ContextState, Forward, ForwardId, Project, Store, StoreError, paths};
-use kprtfwd_engine::{Engine, discovery};
+use kprtfwd_engine::{Engine, discovery, kubeconfig};
 use kprtfwd_proto::{
     Client, ClientError, ClientMessage, ContextView, DiscoveredPort, EventEntry, ForwardView,
     LastError, PROTOCOL_VERSION, ProjectView, Request, Response, ServerMessage, Snapshot,
@@ -112,6 +112,7 @@ async fn serve(data_dir: &Path) -> Result<()> {
         pid = std::process::id(),
         "daemon started"
     );
+    tokio::spawn(watch_kubeconfig(daemon.clone()));
 
     let shutdown = Arc::new(Notify::new());
     let clients = Arc::new(AtomicUsize::new(0));
@@ -396,21 +397,35 @@ impl Daemon {
                 info!(project = %name, "project deleted");
                 return Ok(Response::Done);
             }
-            Request::Events { id } => {
-                let forward = self
-                    .store
-                    .forward(&id)
-                    .map_err(text)?
-                    .ok_or_else(|| format!("unknown forward {id}"))?;
-                let entries = self
-                    .engine
-                    .events(&id, &forward.context)
-                    .into_iter()
-                    .map(|event| EventEntry {
-                        at: event.at,
-                        message: event.message,
-                    })
-                    .collect();
+            Request::Events { ids } => {
+                let mut entries = Vec::new();
+                let mut contexts = HashSet::new();
+                for id in &ids {
+                    let forward = self
+                        .store
+                        .forward(id)
+                        .map_err(text)?
+                        .ok_or_else(|| format!("unknown forward {id}"))?;
+                    let source = id.to_string();
+                    entries.extend(self.engine.forward_events(id).into_iter().map(|e| {
+                        EventEntry {
+                            at: e.at,
+                            source: source.clone(),
+                            message: e.message,
+                        }
+                    }));
+                    contexts.insert(forward.context);
+                }
+                for context in contexts {
+                    entries.extend(self.engine.context_events(&context).into_iter().map(|e| {
+                        EventEntry {
+                            at: e.at,
+                            source: context.clone(),
+                            message: e.message,
+                        }
+                    }));
+                }
+                entries.sort_by_key(|entry| entry.at);
                 return Ok(Response::Events { entries });
             }
             Request::ListContexts | Request::Discover { .. } | Request::Prune { .. } => {
@@ -478,7 +493,57 @@ impl Daemon {
             contexts,
             forwards,
             projects,
+            kubeconfig_files: kubeconfig::files()
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
         })
+    }
+}
+
+/// Reconnects contexts whose kubeconfig settings changed: a renewed token, a
+/// moved cluster, a context that did not exist before. Checks the files'
+/// modification times every 2 s; a change elsewhere in the file, like
+/// `kubectl config use-context`, touches no running context.
+async fn watch_kubeconfig(daemon: Arc<Mutex<Daemon>>) {
+    let files = kubeconfig::files();
+    let modified = || -> Vec<Option<std::time::SystemTime>> {
+        files
+            .iter()
+            .map(|file| fs::metadata(file).and_then(|m| m.modified()).ok())
+            .collect()
+    };
+    let mut last_modified = modified();
+    let mut prints = kubeconfig::fingerprints().unwrap_or_default();
+    debug!(?files, contexts = prints.len(), "watching kubeconfig");
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let now = modified();
+        if now == last_modified {
+            continue;
+        }
+        last_modified = now;
+        debug!("kubeconfig modified");
+        let new_prints = match kubeconfig::fingerprints() {
+            Ok(new_prints) => new_prints,
+            Err(err) => {
+                // Possibly caught mid-write; the next change retries.
+                warn!(%err, "kubeconfig changed but cannot be read");
+                continue;
+            }
+        };
+        let mut daemon = daemon.lock().await;
+        for name in daemon.engine.context_names() {
+            if new_prints.get(&name) == prints.get(&name) {
+                continue;
+            }
+            info!(context = %name, "kubeconfig changed, reconnecting");
+            match daemon.wanted() {
+                Ok(wanted) => daemon.engine.reconnect(&name, &wanted).await,
+                Err(err) => warn!(%err, "cannot read forwards"),
+            }
+        }
+        prints = new_prints;
     }
 }
 

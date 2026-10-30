@@ -190,8 +190,12 @@ Main dependencies:
   2. Load forwards and their desired state.
   3. Start a context actor for every context with an enabled forward.
 - **Kubeconfig.** The daemon inherits `KUBECONFIG` from the client that started
-  it. It watches those files and reloads changed contexts. `kprtfwd status` shows
-  which files are in use.
+  it; `kprtfwd status` shows which files are in use. Every 2 s it checks their
+  modification times. After a change it hashes each context's context, cluster
+  and user entries and reconnects only the running contexts whose hash changed:
+  a renewed token, a moved cluster, a context that was missing. Switching
+  `current-context` or editing another context leaves running forwards alone.
+  Only the hashes are kept, not the settings, which include credentials.
 - **Stop.** `kprtfwd daemon stop`, SIGTERM, or the idle exit: close listeners,
   close forwards, close the database.
 - **Upgrade.** Clients compare versions in the handshake. A daemon of another
@@ -401,8 +405,10 @@ the multi-thread runtime.
   outage should be reported once, by the context state.
 - The engine keeps the last 100 events of each forward and each context; they
   survive switching a forward off and on, but not a daemon restart. The TUI's
-  event view (`l`) shows a forward's events merged with its context's. Events
-  include:
+  event view (`l`) shows a forward's events merged with its context's;
+  `kprtfwd logs <project or words>` does the same for any set of forwards, and
+  `kprtfwd logs` without arguments shows the daemon's log file. Both follow
+  with `-f`; times are local. Events include:
   - state changes,
   - refused connections and why,
   - pod switches,
@@ -615,7 +621,8 @@ Internal structure:
 | `kprtfwd switch <project>` | enable the project, disable everything else |
 | `kprtfwd pause` / `resume` | global pause |
 | `kprtfwd prune [--context C] [--namespace 'app-*'] [-y]` | as in v1: lists forwards whose service is gone and deletes them after asking; nothing is deleted if the cluster cannot be listed |
-| `kprtfwd discover ...`, `kprtfwd logs ...` | not built; the TUI covers both |
+| `kprtfwd logs [-f] [project or words]` | events of the matching forwards and their contexts; without arguments the daemon log |
+| `kprtfwd discover ...` | not built; the TUI's `d` covers it |
 | `kprtfwd reconnect <context>` | rebuild a context's client, watches and forwards |
 | `kprtfwd daemon status/stop/restart` | daemon control (`daemon run [--foreground]` is internal, or for debugging) |
 | `kprtfwd db list [--db PATH]` | read the database without the daemon; the file is not changed |
@@ -650,12 +657,17 @@ These are shown in the INFO column and by `kprtfwd status`.
 - **engine:**
   - unit tests for the protocol framing (encode, decode, port header, error
     channel);
-  - integration tests against a kind cluster in CI:
-    - start a forward;
-    - delete the pod and check recovery;
-    - inject outages through the spike's TCP proxy (freeze and kill);
-    - local port busy;
-    - error channel when the pod port is closed.
+  - cluster tests in `crates/engine/tests/cluster.rs`, run in CI against kind
+    (job `cluster`) and locally against any throwaway cluster. They only run
+    when `KPRTFWD_TEST_CONTEXT` is set; each creates and deletes its own
+    namespace:
+    - the forward stays on one pod; deleting that pod moves it to the other
+      one by itself (at most 3 failed requests allowed, 0 seen);
+    - scaled to 0, connections close at once and the state is
+      `WaitingForPods`; scaled up, it works again without a restart;
+    - with `KPRTFWD_TEST_PAUSE`/`RESUME` (`docker pause` of the kind control
+      plane): the outage is detected (about 15 s), connections close at once
+      meanwhile, and the forward is ready again about 2 s after the resume.
 - **proto:** serde round trips and the protocol version check.
 - **tui:** key-by-key tests of `App::update`, drawing tests with `TestBackend`,
   and `expect` scripts for the whole flow (see section 10).
@@ -683,14 +695,14 @@ These are shown in the INFO column and by `kprtfwd status`.
 
 The v1 Go code stays on `main` and keeps shipping fixes until phase 3.
 
-Status 2026-10-30: phase 0 is done. Phase 1 runs locally against orbstack and
-staging. The CI checks exist, but the kind integration tests are still to be
-written; the scenarios were run by hand against orbstack: pod deleted while in
-use (60 of 60 requests answered), scale to 0 and back, busy port, missing
-service, and a TCP proxy to the API server that was frozen and killed (detected
-after about 15 s and at once, recovered within a second; a request during the
-undetected phase ends after the 10 s open timeout).
-Not built yet: kubeconfig file watching and `kprtfwd logs`.
+Status 2026-10-30: phases 0 to 2 are done, including kubeconfig watching,
+`kprtfwd logs` and the cluster tests, which pass locally against kind (twice,
+with the same timings). Phase 1 was also run by hand against orbstack and
+staging: pod deleted while in use (60 of 60 requests answered), scale to 0 and
+back, busy port, missing service, and a TCP proxy to the API server that was
+frozen and killed (detected after about 15 s and at once, recovered within a
+second; a request during the undetected phase ends after the 10 s open
+timeout).
 
 Phase 2 runs locally: the TUI, CRUD for forwards and projects, discovery, prune
 and the event view. Every v1 feature has a counterpart except grouping, which

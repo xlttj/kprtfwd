@@ -3,6 +3,7 @@
 
 use std::time::SystemTime;
 
+use kprtfwd_core::clock::local_time;
 use kprtfwd_core::{ContextState, ForwardState};
 use kprtfwd_proto::Snapshot;
 use ratatui::Frame;
@@ -80,7 +81,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Mode::Events { id, entries } => {
             let mut lines: Vec<Line> = entries
                 .iter()
-                .map(|e| Line::raw(format!("{}  {}", clock(e.at), e.message)))
+                .map(|e| {
+                    // Context events say which context; the forward's own don't need to.
+                    if e.source == id.as_str() {
+                        Line::raw(format!("{}  {}", local_time(e.at), e.message))
+                    } else {
+                        Line::raw(format!("{}  {}: {}", local_time(e.at), e.source, e.message))
+                    }
+                })
                 .collect();
             if lines.is_empty() {
                 lines.push(Line::styled("no events yet", dim()));
@@ -478,20 +486,6 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         width,
         height,
     }
-}
-
-/// `HH:MM:SS` in UTC; good enough to order and relate events.
-fn clock(at: SystemTime) -> String {
-    let secs = at
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!(
-        "{:02}:{:02}:{:02}",
-        secs / 3600 % 24,
-        secs / 60 % 60,
-        secs % 60
-    )
 }
 
 #[cfg(test)]
