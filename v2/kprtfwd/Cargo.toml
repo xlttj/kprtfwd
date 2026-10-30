@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 kprtfwd-cli.workspace = true
 kprtfwd-daemon.workspace = true
+kprtfwd-tui.workspace = true
 clap.workspace = true
 tokio.workspace = true
 

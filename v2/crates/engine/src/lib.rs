@@ -5,7 +5,9 @@
 
 mod cache;
 mod context;
+pub mod discovery;
 pub mod errors;
+mod events;
 mod forward;
 pub mod portforward;
 
@@ -17,6 +19,8 @@ use kprtfwd_core::{Forward, ForwardId};
 use tracing::info;
 
 use crate::context::Context;
+pub use crate::events::Event;
+use crate::events::EventLog;
 use crate::forward::ForwardHandle;
 pub use crate::forward::LastError;
 
@@ -24,6 +28,9 @@ pub use crate::forward::LastError;
 pub struct Engine {
     contexts: HashMap<String, Arc<Context>>,
     forwards: HashMap<ForwardId, ForwardHandle>,
+    /// Kept here, not in the actors, so they survive stopping and starting.
+    context_events: HashMap<String, EventLog>,
+    forward_events: HashMap<ForwardId, EventLog>,
 }
 
 impl Engine {
@@ -58,7 +65,12 @@ impl Engine {
         });
         for name in needed {
             if !self.contexts.contains_key(name) {
-                let context = Context::start(name).await;
+                let events = self
+                    .context_events
+                    .entry(name.to_owned())
+                    .or_default()
+                    .clone();
+                let context = Context::start(name, events).await;
                 self.contexts.insert(name.to_owned(), context);
             }
         }
@@ -79,7 +91,14 @@ impl Engine {
             info!(id = %forward.id, "forward started");
             self.forwards.insert(
                 forward.id.clone(),
-                ForwardHandle::start(forward.clone(), context),
+                ForwardHandle::start(
+                    forward.clone(),
+                    context,
+                    self.forward_events
+                        .entry(forward.id.clone())
+                        .or_default()
+                        .clone(),
+                ),
             );
         }
     }
@@ -108,6 +127,19 @@ impl Engine {
 
     pub fn last_error(&self, id: &ForwardId) -> Option<LastError> {
         self.forwards.get(id)?.last_error()
+    }
+
+    /// The events of a forward and of its context, oldest first.
+    pub fn events(&self, id: &ForwardId, context: &str) -> Vec<Event> {
+        let mut events: Vec<Event> = self
+            .forward_events
+            .get(id)
+            .into_iter()
+            .chain(self.context_events.get(context))
+            .flat_map(EventLog::entries)
+            .collect();
+        events.sort_by_key(|event| event.at);
+        events
     }
 
     pub fn shutdown(&mut self) {

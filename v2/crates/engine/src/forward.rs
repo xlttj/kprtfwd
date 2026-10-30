@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 use crate::cache::Endpoint;
 use crate::context::Context;
 use crate::errors::{Failure, classify};
+use crate::events::EventLog;
 use crate::portforward::{self, KubeIo, PortForward, PortForwardError};
 
 const BIND_RETRY: Duration = Duration::from_secs(5);
@@ -39,15 +40,18 @@ pub struct ForwardHandle {
 }
 
 impl ForwardHandle {
-    pub fn start(spec: Forward, context: Arc<Context>) -> Self {
-        let shared = Arc::new(Shared::default());
+    pub fn start(spec: Forward, context: Arc<Context>, events: EventLog) -> Self {
+        events.push("started");
+        let shared = Arc::new(Shared::new(events));
         let task = tokio::spawn(run(spec.clone(), context, shared.clone()));
         Self { spec, shared, task }
     }
 
     /// Closes the listeners and all connections.
     pub fn stop(&self) {
-        self.shared.stopped.store(true, Ordering::Relaxed);
+        if !self.shared.stopped.swap(true, Ordering::Relaxed) {
+            self.shared.events.push("stopped");
+        }
         self.shared.warm.lock().unwrap().take();
         self.task.abort();
     }
@@ -95,10 +99,11 @@ struct Shared {
     /// A warm stream is being opened; parallel connections do not open more.
     refilling: AtomicBool,
     stopped: AtomicBool,
+    events: EventLog,
 }
 
-impl Default for Shared {
-    fn default() -> Self {
+impl Shared {
+    fn new(events: EventLog) -> Self {
         Self {
             bind: Mutex::new(Bind::Pending),
             pod: Mutex::new(None),
@@ -108,11 +113,10 @@ impl Default for Shared {
             warm: Mutex::new(None),
             refilling: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            events,
         }
     }
-}
 
-impl Shared {
     /// Stays on the current pod while it is ready, otherwise switches.
     fn choose(&self, endpoints: &[Endpoint], spec: &Forward) -> Endpoint {
         let mut pod = self.pod.lock().unwrap();
@@ -123,12 +127,17 @@ impl Shared {
         }
         let next = endpoints[0].clone();
         info!(id = %spec.id, pod = %next.pod, previous = ?pod.as_deref(), "pod changed");
+        self.events.push(match pod.as_deref() {
+            Some(previous) => format!("pod {previous} gone, now {}", next.pod),
+            None => format!("pod {}", next.pod),
+        });
         *pod = Some(next.pod.clone());
         next
     }
 
     fn record_error(&self, spec: &Forward, message: String) {
         warn!(id = %spec.id, %message, "connection failed");
+        self.events.push(format!("connection failed: {message}"));
         *self.last_error.lock().unwrap() = Some(LastError {
             at: SystemTime::now(),
             message,
@@ -267,6 +276,7 @@ async fn bind(spec: &Forward, shared: &Shared) -> Listeners {
                     .ok();
                 *shared.bind.lock().unwrap() = Bind::Bound;
                 info!(id = %spec.id, port, "listening");
+                shared.events.push(format!("listening on port {port}"));
                 return Listeners { v4, v6 };
             }
             Err(err) => {
@@ -279,6 +289,12 @@ async fn bind(spec: &Forward, shared: &Shared) -> Listeners {
                 let mut bind = shared.bind.lock().unwrap();
                 if *bind != busy {
                     warn!(id = %spec.id, port, ?busy, "cannot listen");
+                    if let Bind::Busy { holder } = &busy {
+                        shared.events.push(match holder {
+                            Some(holder) => format!("port {port} busy: {holder}"),
+                            None => format!("port {port} busy"),
+                        });
+                    }
                     *bind = busy;
                 }
             }
@@ -317,6 +333,10 @@ async fn connection(
     };
     if !context.state().is_healthy() {
         debug!(id = %spec.id, "connection closed: context not healthy");
+        shared.events.push(format!(
+            "connection closed: API server {}",
+            context.state().summary()
+        ));
         return;
     }
     let Some(cache) = context.namespace(&spec.namespace) else {
@@ -326,6 +346,14 @@ async fn connection(
         Ok(endpoints) => endpoints,
         Err(target) => {
             debug!(id = %spec.id, ?target, "connection closed: no ready pod");
+            let reason = match target {
+                Target::Syncing => "starting".to_owned(),
+                Target::ServiceNotFound => "service not found".to_owned(),
+                Target::PortNotOnService => "port not on service".to_owned(),
+                Target::Forbidden(message) => format!("forbidden: {message}"),
+                Target::Endpoints { ready, total } => format!("{ready}/{total} pods ready"),
+            };
+            shared.events.push(format!("connection closed: {reason}"));
             return;
         }
     };
@@ -377,6 +405,9 @@ fn open_failed(spec: &Forward, shared: &Shared, err: &PortForwardError) {
         && let Failure::Forbidden(message) = classify(kube_err)
     {
         warn!(id = %spec.id, %message, "port-forward forbidden");
+        shared
+            .events
+            .push(format!("port-forward forbidden: {message}"));
         *shared.forbidden.lock().unwrap() = Some(message);
         return;
     }

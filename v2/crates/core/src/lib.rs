@@ -5,6 +5,7 @@
 
 pub mod filter;
 pub mod model;
+pub mod naming;
 pub mod paths;
 pub mod state;
 pub mod store;

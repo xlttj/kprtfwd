@@ -31,6 +31,12 @@ pub enum ClientError {
         client: u32,
         daemon_version: String,
     },
+    /// A daemon answers, but not in this protocol: most likely an older
+    /// version that is still running.
+    #[error(
+        "a daemon is running that this kprtfwd cannot talk to (probably another version); restart it with `kprtfwd daemon restart`"
+    )]
+    Incompatible,
     #[error("{0}")]
     Daemon(String),
     #[error("the daemon closed the connection")]
@@ -74,7 +80,13 @@ impl Client {
             protocol: PROTOCOL_VERSION,
             client_version: env!("CARGO_PKG_VERSION").to_owned(),
         };
-        match client.request(hello).await? {
+        let welcome = match client.request(hello).await {
+            Err(ClientError::Closed | ClientError::Unexpected) => {
+                return Err(ClientError::Incompatible);
+            }
+            other => other?,
+        };
+        match welcome {
             Response::Welcome {
                 protocol,
                 daemon_version,

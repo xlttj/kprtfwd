@@ -9,7 +9,8 @@ mod client;
 use std::io;
 use std::time::SystemTime;
 
-use kprtfwd_core::{ContextState, Forward, ForwardId, ForwardState};
+use kprtfwd_core::svctype::ServiceType;
+use kprtfwd_core::{ContextState, Forward, ForwardId, ForwardState, Project};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
@@ -17,12 +18,13 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 pub use client::{Client, ClientError, connect_or_start, spawn_daemon};
 
 /// Bumped on every incompatible change to the messages.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
+/// A request with its ID. The request is nested, not flattened, because
+/// requests have fields of their own named `id`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClientMessage {
     pub id: u64,
-    #[serde(flatten)]
     pub request: Request,
 }
 
@@ -52,6 +54,38 @@ pub enum Request {
     ReconnectContext {
         name: String,
     },
+    /// Adds forwards or replaces those with the same ID.
+    UpsertForwards {
+        forwards: Vec<Forward>,
+    },
+    DeleteForward {
+        id: ForwardId,
+    },
+    /// Creates a project or replaces its members.
+    UpsertProject {
+        project: Project,
+    },
+    DeleteProject {
+        name: String,
+    },
+    /// The contexts in the kubeconfig.
+    ListContexts,
+    /// Services in a context whose namespace matches `namespace_filter`
+    /// (`*` wildcards; empty for all).
+    Discover {
+        context: String,
+        namespace_filter: String,
+    },
+    /// Deletes forwards whose service no longer exists, or only lists them.
+    Prune {
+        context: String,
+        namespace_filter: String,
+        dry_run: bool,
+    },
+    /// Recent events of a forward and its context.
+    Events {
+        id: ForwardId,
+    },
     Shutdown,
 }
 
@@ -72,6 +106,41 @@ pub enum Response {
     },
     Snapshot(Snapshot),
     Done,
+    Contexts {
+        names: Vec<String>,
+        current: Option<String>,
+    },
+    Discovered {
+        ports: Vec<DiscoveredPort>,
+    },
+    Pruned {
+        forwards: Vec<Forward>,
+    },
+    Events {
+        entries: Vec<EventEntry>,
+    },
+}
+
+/// One service port found by discovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredPort {
+    pub namespace: String,
+    pub service: String,
+    pub port: u16,
+    pub port_name: Option<String>,
+    pub service_type: ServiceType,
+    /// The forward that already exists for this port.
+    pub existing: Option<ForwardId>,
+    /// The ID a new forward gets, or the existing forward's.
+    pub id: ForwardId,
+    /// The proposed local port, or the existing forward's.
+    pub local_port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventEntry {
+    pub at: SystemTime,
+    pub message: String,
 }
 
 /// Everything a client shows.
@@ -154,7 +223,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn requests_are_flat_json() {
+    fn requests_survive_the_wire() {
         let message = ClientMessage {
             id: 7,
             request: Request::SetEnabled {
@@ -165,20 +234,75 @@ mod tests {
         let json = serde_json::to_string(&message).unwrap();
         assert_eq!(
             json,
-            r#"{"id":7,"type":"set_enabled","ids":["a"],"enabled":true}"#
-        );
-        assert_eq!(
-            serde_json::from_str::<ClientMessage>(&json).unwrap(),
-            message
+            r#"{"id":7,"request":{"type":"set_enabled","ids":["a"],"enabled":true}}"#
         );
 
-        let shutdown = r#"{"id":1,"type":"shutdown"}"#;
-        assert_eq!(
-            serde_json::from_str::<ClientMessage>(shutdown)
-                .unwrap()
-                .request,
-            Request::Shutdown
-        );
+        // Every kind of request, including those with an `id` field of their own.
+        let id = || ForwardId::new("staging.shop.api-80");
+        let forward = Forward {
+            id: id(),
+            context: "staging".into(),
+            namespace: "shop".into(),
+            service: "api".into(),
+            remote_port: 80,
+            local_port: 18080,
+            enabled: false,
+        };
+        let requests = [
+            Request::Hello {
+                protocol: PROTOCOL_VERSION,
+                client_version: "test".into(),
+            },
+            Request::Snapshot,
+            Request::SetProjectEnabled {
+                name: "shop".into(),
+                enabled: true,
+            },
+            Request::SwitchProject {
+                name: "shop".into(),
+            },
+            Request::SetPaused { paused: true },
+            Request::ReconnectContext {
+                name: "staging".into(),
+            },
+            Request::UpsertForwards {
+                forwards: vec![forward],
+            },
+            Request::DeleteForward { id: id() },
+            Request::UpsertProject {
+                project: Project {
+                    name: "shop".into(),
+                    forwards: vec![id()],
+                },
+            },
+            Request::DeleteProject {
+                name: "shop".into(),
+            },
+            Request::ListContexts,
+            Request::Discover {
+                context: "staging".into(),
+                namespace_filter: "shop-*".into(),
+            },
+            Request::Prune {
+                context: "staging".into(),
+                namespace_filter: "*".into(),
+                dry_run: true,
+            },
+            Request::Events { id: id() },
+            Request::Shutdown,
+        ];
+        for (n, request) in requests.into_iter().enumerate() {
+            let message = ClientMessage {
+                id: n as u64,
+                request,
+            };
+            let json = serde_json::to_string(&message).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ClientMessage>(&json).unwrap(),
+                message,
+                "{json}"
+            );
+        }
     }
 
     #[tokio::test]

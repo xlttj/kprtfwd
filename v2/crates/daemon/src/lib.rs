@@ -2,6 +2,7 @@
 //! socket. A client starts it on demand; it exits after a while with nothing
 //! to do.
 
+use std::collections::HashSet;
 use std::fs::{self, DirBuilder};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -10,12 +11,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
+use kprtfwd_core::filter::wildcard;
+use kprtfwd_core::naming::{forward_id, propose_local_port};
 use kprtfwd_core::state::derive;
-use kprtfwd_core::{ContextState, Forward, Project, Store, StoreError, paths};
-use kprtfwd_engine::Engine;
+use kprtfwd_core::svctype::classify;
+use kprtfwd_core::validate::validate_forward;
+use kprtfwd_core::{ContextState, Forward, ForwardId, Project, Store, StoreError, paths};
+use kprtfwd_engine::{Engine, discovery};
 use kprtfwd_proto::{
-    Client, ClientError, ClientMessage, ContextView, ForwardView, LastError, PROTOCOL_VERSION,
-    ProjectView, Request, Response, ServerMessage, Snapshot, read_message, write_message,
+    Client, ClientError, ClientMessage, ContextView, DiscoveredPort, EventEntry, ForwardView,
+    LastError, PROTOCOL_VERSION, ProjectView, Request, Response, ServerMessage, Snapshot,
+    read_message, write_message,
 };
 use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
@@ -90,6 +96,11 @@ async fn serve(data_dir: &Path) -> Result<()> {
     let Some(listener) = bind_socket(&socket).await? else {
         return Ok(());
     };
+    // Lets `kprtfwd daemon stop` end a daemon of another version, which it
+    // cannot talk to.
+    let pid_file = data_dir.join("daemon.pid");
+    fs::write(&pid_file, format!("{}\n", std::process::id()))
+        .with_context(|| format!("write {}", pid_file.display()))?;
     let store = Store::open(&data_dir.join("kprtfwd.db")).context("open the database")?;
     let daemon = Arc::new(Mutex::new(Daemon {
         store,
@@ -152,6 +163,7 @@ async fn serve(data_dir: &Path) -> Result<()> {
 
     daemon.lock().await.engine.shutdown();
     let _ = fs::remove_file(&socket);
+    let _ = fs::remove_file(&pid_file);
     info!("daemon stopped");
     Ok(())
 }
@@ -258,6 +270,20 @@ async fn serve_client(
                 shutdown.notify_one();
                 Ok(Response::Done)
             }
+            // These talk to a cluster and may take seconds; they must not
+            // hold the lock that snapshot requests need.
+            Request::ListContexts => {
+                discovery::contexts().map(|(names, current)| Response::Contexts { names, current })
+            }
+            Request::Discover {
+                context,
+                namespace_filter,
+            } => discover(&daemon, &context, &namespace_filter).await,
+            Request::Prune {
+                context,
+                namespace_filter,
+                dry_run,
+            } => prune(&daemon, &context, &namespace_filter, dry_run).await,
             request => daemon.lock().await.handle(request).await,
         };
         let reply = match result {
@@ -342,6 +368,54 @@ impl Daemon {
                 info!(context = %name, "reconnected");
                 return Ok(Response::Done);
             }
+            Request::UpsertForwards { forwards } => {
+                // Check all first, so a bad entry adds none.
+                for forward in &forwards {
+                    validate_forward(forward).map_err(|err| format!("{}: {err}", forward.id))?;
+                }
+                for forward in &forwards {
+                    self.store.upsert_forward(forward).map_err(text)?;
+                }
+                info!(count = forwards.len(), "forwards saved");
+            }
+            Request::DeleteForward { id } => {
+                if !self.store.delete_forward(&id).map_err(text)? {
+                    return Err(format!("unknown forward {id}"));
+                }
+                info!(%id, "forward deleted");
+            }
+            Request::UpsertProject { project } => {
+                self.store.upsert_project(&project).map_err(text)?;
+                info!(project = %project.name, members = project.forwards.len(), "project saved");
+                return Ok(Response::Done);
+            }
+            Request::DeleteProject { name } => {
+                if !self.store.delete_project(&name).map_err(text)? {
+                    return Err(format!("no project named {name:?}"));
+                }
+                info!(project = %name, "project deleted");
+                return Ok(Response::Done);
+            }
+            Request::Events { id } => {
+                let forward = self
+                    .store
+                    .forward(&id)
+                    .map_err(text)?
+                    .ok_or_else(|| format!("unknown forward {id}"))?;
+                let entries = self
+                    .engine
+                    .events(&id, &forward.context)
+                    .into_iter()
+                    .map(|event| EventEntry {
+                        at: event.at,
+                        message: event.message,
+                    })
+                    .collect();
+                return Ok(Response::Events { entries });
+            }
+            Request::ListContexts | Request::Discover { .. } | Request::Prune { .. } => {
+                return Err("handled outside the lock".into());
+            }
         }
         self.apply().await.map_err(text)?;
         Ok(Response::Done)
@@ -406,6 +480,104 @@ impl Daemon {
             projects,
         })
     }
+}
+
+/// Lists the service ports in a context, with the ID and local port each would
+/// get, or already has.
+async fn discover(
+    daemon: &Mutex<Daemon>,
+    context: &str,
+    namespace_filter: &str,
+) -> Result<Response, String> {
+    let services = discovery::services(context, namespace_filter).await?;
+    let forwards = daemon
+        .lock()
+        .await
+        .store
+        .forwards()
+        .map_err(|err| err.to_string())?;
+
+    let mut taken_ids: HashSet<ForwardId> = forwards.iter().map(|f| f.id.clone()).collect();
+    let mut taken_ports: HashSet<u16> = forwards.iter().map(|f| f.local_port).collect();
+    let is_free = |port: u16| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok();
+
+    let mut ports = Vec::new();
+    for service in services {
+        for port in service.ports {
+            let existing = forwards.iter().find(|f| {
+                f.context == context
+                    && f.namespace == service.namespace
+                    && f.service == service.name
+                    && f.remote_port == port.port
+            });
+            let (id, local_port) = match existing {
+                Some(forward) => (forward.id.clone(), forward.local_port),
+                None => {
+                    let id = forward_id(
+                        context,
+                        &service.namespace,
+                        &service.name,
+                        port.port,
+                        &taken_ids,
+                    );
+                    let local = propose_local_port(port.port, &taken_ports, is_free).unwrap_or(0);
+                    taken_ids.insert(id.clone());
+                    taken_ports.insert(local);
+                    (id, local)
+                }
+            };
+            ports.push(DiscoveredPort {
+                namespace: service.namespace.clone(),
+                service: service.name.clone(),
+                port: port.port,
+                port_name: port.name,
+                service_type: classify(&service.name, port.port),
+                existing: existing.map(|f| f.id.clone()),
+                id,
+                local_port,
+            });
+        }
+    }
+    Ok(Response::Discovered { ports })
+}
+
+/// Finds forwards in `context` whose service no longer exists, and deletes
+/// them unless `dry_run`. If the cluster cannot be listed, nothing is deleted.
+async fn prune(
+    daemon: &Mutex<Daemon>,
+    context: &str,
+    namespace_filter: &str,
+    dry_run: bool,
+) -> Result<Response, String> {
+    let services = discovery::services(context, namespace_filter).await?;
+    let existing: HashSet<(String, String)> = services
+        .into_iter()
+        .map(|s| (s.namespace, s.name))
+        .collect();
+    let filter = namespace_filter.trim();
+    let all = filter.is_empty() || filter == "*";
+
+    let mut daemon = daemon.lock().await;
+    let gone: Vec<Forward> = daemon
+        .store
+        .forwards()
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .filter(|f| f.context == context)
+        .filter(|f| all || wildcard(filter, &f.namespace))
+        .filter(|f| !existing.contains(&(f.namespace.clone(), f.service.clone())))
+        .collect();
+    if !dry_run && !gone.is_empty() {
+        for forward in &gone {
+            daemon
+                .store
+                .delete_forward(&forward.id)
+                .map_err(|err| err.to_string())?;
+        }
+        daemon.apply().await.map_err(|err| err.to_string())?;
+        info!(context, count = gone.len(), "pruned forwards");
+    }
+    Ok(Response::Pruned { forwards: gone })
 }
 
 /// The socket path the daemon uses, for clients.

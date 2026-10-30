@@ -194,9 +194,10 @@ Main dependencies:
   which files are in use.
 - **Stop.** `kprtfwd daemon stop`, SIGTERM, or the idle exit: close listeners,
   close forwards, close the database.
-- **Upgrade.** Clients compare versions in the handshake. On a mismatch the TUI
-  offers to restart the daemon. The desired state is persisted, so forwards come
-  back on their own.
+- **Upgrade.** Clients compare versions in the handshake. A daemon of another
+  version is reported with the hint `kprtfwd daemon restart`; the desired state
+  is persisted, so forwards come back on their own. The daemon writes its PID to
+  `daemon.pid`, so `daemon stop` can end a daemon it cannot talk to.
 
 ### 6.2 Context actor
 
@@ -398,8 +399,10 @@ the multi-thread runtime.
 - `KPRTFWD_LOG` sets the filter (`tracing` syntax). By default kube-rs's own
   request logging is off: it logs every failed request as an error, while an
   outage should be reported once, by the context state.
-- Each forward and each context keeps a ring buffer of its last 200 events. The
-  TUI's event view (`l`) and `kprtfwd logs` show them. Events include:
+- The engine keeps the last 100 events of each forward and each context; they
+  survive switching a forward off and on, but not a daemon restart. The TUI's
+  event view (`l`) shows a forward's events merged with its context's. Events
+  include:
   - state changes,
   - refused connections and why,
   - pod switches,
@@ -413,15 +416,20 @@ the multi-thread runtime.
 - **Handshake.** The client sends `Hello { protocol, client_version }`, the daemon
   answers `Welcome { protocol, daemon_version }`. Different protocol numbers mean
   the client asks the user to restart the daemon.
-- **Requests.** Every request carries an `id`, and the response echoes it.
-- **Events.** On a subscribed connection the daemon first sends a `Snapshot`, then
-  events with an increasing `seq`. A client that sees a gap in `seq` asks for a new
-  snapshot.
-- **Stats.** Updates are coalesced to at most 2 per second.
+- **Requests.** `{"id": 7, "request": {"type": "set_enabled", ...}}`; the response
+  echoes the `id`. The request is nested, not flattened next to `id`, because some
+  requests have an `id` field of their own; a test sends every request kind
+  through serde to keep it that way.
+- **Updates.** Clients ask for a `Snapshot` when they need one; the TUI does so
+  every 300 ms. Over a local socket that costs a few milliseconds, and it saves a
+  push protocol with sequence numbers. A subscription can come later if polling
+  ever shows up in a profile.
+- **Slow requests.** `Discover`, `Prune` and `ListContexts` talk to a cluster or
+  read the kubeconfig without holding the daemon's lock, so snapshots keep
+  flowing while they run.
 
 ```rust
 enum Request {
-    // Phase 1
     Hello { protocol: u32, client_version: String },
     Snapshot,
     SetEnabled { ids: Vec<ForwardId>, enabled: bool },
@@ -429,25 +437,25 @@ enum Request {
     SwitchProject { name: String },
     SetPaused { paused: bool },
     ReconnectContext { name: String },
-    Shutdown,
-    // Phase 2
-    Subscribe,
-    UpsertForward(ForwardSpec),
+    UpsertForwards { forwards: Vec<Forward> },
     DeleteForward { id: ForwardId },
-    UpsertProject { name: String, forwards: Vec<ForwardId> },
+    UpsertProject { project: Project },
     DeleteProject { name: String },
     ListContexts,
     Discover { context: String, namespace_filter: String },
     Prune { context: String, namespace_filter: String, dry_run: bool },
-    Events { scope: Scope, limit: u32 },
+    Events { id: ForwardId },
+    Shutdown,
 }
 
-enum Event {
-    Snapshot { seq: u64, contexts: Vec<ContextView>, forwards: Vec<ForwardView>, projects: Vec<ProjectView> },
-    ContextChanged { seq: u64, context: ContextView },
-    ForwardChanged { seq: u64, forward: ForwardView },
-    ProjectsChanged { seq: u64, projects: Vec<ProjectView> },
-    Log { seq: u64, scope: Scope, entry: EventEntry },
+enum Response {
+    Welcome { protocol: u32, daemon_version: String, pid: u32 },
+    Snapshot(Snapshot),   // contexts, forwards with state, projects, paused
+    Done,
+    Contexts { names: Vec<String>, current: Option<String> },
+    Discovered { ports: Vec<DiscoveredPort> },   // with proposed ID and local port
+    Pruned { forwards: Vec<Forward> },
+    Events { entries: Vec<EventEntry> },
 }
 ```
 
@@ -540,7 +548,7 @@ Keys:
 | `space` | selected forward on or off |
 | `/` | filter; `enter` keeps it, `esc` clears it |
 | `+` / `-` | all listed forwards on / off |
-| `p` | projects list: `enter` enable, `s` switch to (all others off), `-` disable |
+| `p` | projects (see below) |
 | `o` | open `http://localhost:<port>` |
 | `y` | copy `localhost:<port>` |
 | `e` / `a` / `x` | edit, add, delete a forward |
@@ -549,28 +557,53 @@ Keys:
 | `r` | reconnect the selected forward's context |
 | `l` | events of the selected forward |
 | `?` | key help |
+| `ctrl+l` | redraw the screen |
 | `q` | quit; forwards keep running |
+
+**Projects are made from the list.** Filter until the list shows what belongs
+together, then `p`:
+
+| Key in `p` | Action |
+|---|---|
+| `enter` / `-` | switch the project on / off |
+| `s` | switch to the project: its forwards on, all others off (v1's behaviour) |
+| `f` | show its members: sets the filter to `@name` |
+| `n` | new project from the listed forwards |
+| `u` | set the project's members to the listed forwards |
+| `x` | delete the project (asks; its forwards stay) |
+
+`@name` works in every filter, also in `kprtfwd up @shop`.
+
+There is no grouping and no collapsing. v1 grouped by context or service type;
+with the context as a column and a filter over everything, groups only add keys.
 
 The forms are plain line-based dialogs, with `tab` to move between fields, `enter`
 to save and `esc` to cancel. They are:
 
 - **Edit/add:** context, namespace, service, remote port, local port.
 - **Discovery:**
-  1. choose a context;
-  2. enter a namespace filter;
-  3. a service list with the same filter behaviour; `space` marks, `e` edits the
-     proposed local port, `enter` adds the marked services.
+  1. choose a context (the current one is preselected);
+  2. enter a namespace filter (`*` wildcards, empty for all);
+  3. a service list with a filter; `space` marks, `+`/`-` mark all listed, `e`
+     edits the proposed local port, `enter` adds the marked services (switched
+     off). Ports that already have a forward show as `added`.
+
+  Discovery runs in the background; the list stays usable meanwhile.
 
 Internal structure:
 
-- **Elm-style.** `AppState` is a read-only copy of the daemon snapshot, kept current
-  by events, plus local UI state. `update(&mut AppState, Msg) -> Vec<Cmd>` and
-  `view(&AppState, &mut Frame)`.
+- **Elm-style.** `App` holds the latest daemon snapshot plus local UI state.
+  `App::update(Msg) -> Vec<Cmd>` handles keys and results without a terminal;
+  `view::draw(&App, &mut Frame)` draws.
 - **Modes.** A `Mode` enum replaces v1's flags: `List`, `Filter`, `Projects`,
   `Form`, `Discovery`, `Events`, `Confirm`, `Help`.
-- **Daemon calls** are async commands, and their results come back as messages. The
-  TUI never blocks on the network, and draws only when something changed.
-- **Tests:** snapshot tests with ratatui's `TestBackend` and `insta`.
+- **Daemon calls** are commands; their results come back as messages. Requests to
+  the daemon take milliseconds and run in the loop; discovery runs in a task of
+  its own.
+- **Tests:** `App::update` is tested key by key; the drawing with ratatui's
+  `TestBackend`. The flows were also driven end to end with `expect` against
+  orbstack (ratatui only redraws changed cells, so such scripts match single
+  words and press `ctrl+l` before each check).
 
 ## 11. CLI
 
@@ -581,9 +614,8 @@ Internal structure:
 | `kprtfwd up <project or words>...` / `down ...` | enable or disable a project, or every forward the words match (as in the TUI filter); `down --all` |
 | `kprtfwd switch <project>` | enable the project, disable everything else |
 | `kprtfwd pause` / `resume` | global pause |
-| `kprtfwd discover --context C [--namespace 'app-*'] [--yes]` | add services without the TUI |
-| `kprtfwd prune --context C [--namespace ...] [-y]` | as in v1 |
-| `kprtfwd logs [-f] [<id> or --context C]` | daemon events and log |
+| `kprtfwd prune [--context C] [--namespace 'app-*'] [-y]` | as in v1: lists forwards whose service is gone and deletes them after asking; nothing is deleted if the cluster cannot be listed |
+| `kprtfwd discover ...`, `kprtfwd logs ...` | not built; the TUI covers both |
 | `kprtfwd reconnect <context>` | rebuild a context's client, watches and forwards |
 | `kprtfwd daemon status/stop/restart` | daemon control (`daemon run [--foreground]` is internal, or for debugging) |
 | `kprtfwd db list [--db PATH]` | read the database without the daemon; the file is not changed |
@@ -625,7 +657,8 @@ These are shown in the INFO column and by `kprtfwd status`.
     - local port busy;
     - error channel when the pod port is closed.
 - **proto:** serde round trips and the protocol version check.
-- **tui:** snapshot tests.
+- **tui:** key-by-key tests of `App::update`, drawing tests with `TestBackend`,
+  and `expect` scripts for the whole flow (see section 10).
 - **Manual checklist, against every configured context:**
   - forward, auth (including an expired `oidc-login` token) and the health probe;
   - a real VPN drop and recovery;
@@ -657,8 +690,15 @@ use (60 of 60 requests answered), scale to 0 and back, busy port, missing
 service, and a TCP proxy to the API server that was frozen and killed (detected
 after about 15 s and at once, recovered within a second; a request during the
 undetected phase ends after the 10 s open timeout).
-Not built yet: kubeconfig file watching, the event ring buffers and
-`kprtfwd logs`.
+Not built yet: kubeconfig file watching and `kprtfwd logs`.
+
+Phase 2 runs locally: the TUI, CRUD for forwards and projects, discovery, prune
+and the event view. Every v1 feature has a counterpart except grouping, which
+was dropped on purpose (section 10). Driven end to end with `expect` against
+orbstack: empty list, discovery, add, switch on, filter, events, project from
+the list, project off, edit the local port, pause and resume; the forward was
+then reachable on its new port. `prune` was checked with the service present,
+deleted and declined, and deleted and confirmed.
 
 ## 16. Decisions, risks, open questions
 

@@ -14,6 +14,7 @@ use tracing::{info, warn};
 
 use crate::cache::NamespaceCache;
 use crate::errors::{Failure, classify};
+use crate::events::EventLog;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const PROBE_INTERVAL_HEALTHY: Duration = Duration::from_secs(5);
@@ -29,23 +30,29 @@ pub struct Context {
     state: watch::Sender<ContextState>,
     namespaces: Mutex<HashMap<String, Arc<NamespaceCache>>>,
     health: Mutex<Option<JoinHandle<()>>>,
+    events: EventLog,
+}
+
+/// A client for a kubeconfig context.
+pub async fn client_for(context: &str) -> Result<Client, String> {
+    let options = KubeConfigOptions {
+        context: Some(context.to_owned()),
+        ..Default::default()
+    };
+    let config = Config::from_kubeconfig(&options)
+        .await
+        .map_err(|err| err.to_string())?;
+    Client::try_from(config).map_err(|err| err.to_string())
 }
 
 impl Context {
     /// Builds the client from the kubeconfig and starts the health probe.
-    pub async fn start(name: &str) -> Arc<Self> {
-        let options = KubeConfigOptions {
-            context: Some(name.to_owned()),
-            ..Default::default()
-        };
-        let client = match Config::from_kubeconfig(&options).await {
-            Ok(config) => Client::try_from(config).map_err(|err| err.to_string()),
-            Err(err) => Err(err.to_string()),
-        };
-        let (state, client) = match client {
+    pub async fn start(name: &str, events: EventLog) -> Arc<Self> {
+        let (state, client) = match client_for(name).await {
             Ok(client) => (ContextState::Connecting, Some(client)),
             Err(message) => {
                 warn!(context = name, %message, "cannot load context");
+                events.push(format!("kubeconfig: {message}"));
                 (ContextState::ConfigError { message }, None)
             }
         };
@@ -55,6 +62,7 @@ impl Context {
             state: watch::channel(state).0,
             namespaces: Mutex::new(HashMap::new()),
             health: Mutex::new(None),
+            events,
         });
         if context.client.is_some() {
             let task = tokio::spawn(probe_health(Arc::downgrade(&context)));
@@ -165,6 +173,13 @@ async fn probe_health(context: Weak<Context>) {
                     warn!(context = context.name(), state = %other.summary(), "API server not usable")
                 }
             }
+            context.events.push(match &next {
+                ContextState::Healthy { server_version } => {
+                    format!("API server reachable ({server_version})")
+                }
+                ContextState::AuthFailed { message, .. } => format!("login needed: {message}"),
+                other => format!("API server {}", other.summary()),
+            });
             context.state.send_replace(next.clone());
         }
 

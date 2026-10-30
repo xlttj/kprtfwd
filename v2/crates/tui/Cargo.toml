@@ -1,0 +1,17 @@
+[package]
+name = "kprtfwd-tui"
+description = "The kprtfwd terminal UI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kprtfwd-core.workspace = true
+kprtfwd-proto.workspace = true
+anyhow.workspace = true
+ratatui.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

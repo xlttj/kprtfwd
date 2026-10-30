@@ -57,6 +57,18 @@ pub enum Command {
     Reconnect {
         context: String,
     },
+    /// Delete forwards whose service no longer exists in the cluster
+    Prune {
+        /// Kubeconfig context [default: the current context]
+        #[arg(long)]
+        context: Option<String>,
+        /// Namespace filter with `*` wildcards, e.g. 'my-app-*'
+        #[arg(long, default_value = "*")]
+        namespace: String,
+        /// Delete without asking
+        #[arg(short = 'y')]
+        yes: bool,
+    },
     /// Show or control the daemon
     #[command(subcommand)]
     Daemon(DaemonCommand),
@@ -132,6 +144,11 @@ async fn execute(command: Command) -> Result<ExitCode> {
                 .await?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::Prune {
+            context,
+            namespace,
+            yes,
+        } => prune(context, &namespace, yes).await,
         Command::Daemon(DaemonCommand::Run { .. }) => {
             bail!("`daemon run` is handled by the kprtfwd binary")
         }
@@ -151,16 +168,7 @@ async fn execute(command: Command) -> Result<ExitCode> {
 }
 
 fn socket() -> Result<PathBuf> {
-    // macOS allows 103 bytes for a Unix socket path, Linux 107.
-    const MAX_SOCKET_PATH: usize = 103;
-    let path = paths::socket_path().context("neither KPRTFWD_HOME nor HOME is set")?;
-    if path.as_os_str().len() > MAX_SOCKET_PATH {
-        bail!(
-            "the socket path {} is too long for a Unix socket; set KPRTFWD_HOME to a shorter directory",
-            path.display()
-        );
-    }
-    Ok(path)
+    paths::usable_socket_path().map_err(anyhow::Error::msg)
 }
 
 /// Connects to the daemon, starting it if needed.
@@ -219,7 +227,14 @@ fn select(snapshot: &Snapshot, query: &[String]) -> Result<Selection> {
     let ids: Vec<ForwardId> = snapshot
         .forwards
         .iter()
-        .filter(|view| filter::matches(&query, &view.forward))
+        .filter(|view| {
+            filter::matches_with(&query, &view.forward, |project| {
+                snapshot
+                    .projects
+                    .iter()
+                    .any(|p| p.name == project && p.forwards.contains(&view.forward.id))
+            })
+        })
         .map(|view| view.forward.id.clone())
         .collect();
     if ids.is_empty() {
@@ -317,6 +332,63 @@ async fn report(client: &mut Client, ids: &[ForwardId]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+async fn prune(context: Option<String>, namespace: &str, yes: bool) -> Result<ExitCode> {
+    let mut client = connect().await?;
+    let context = match context {
+        Some(context) => context,
+        None => match client.request(Request::ListContexts).await? {
+            kprtfwd_proto::Response::Contexts {
+                current: Some(current),
+                ..
+            } => current,
+            _ => bail!("no current context in the kubeconfig; pass --context"),
+        },
+    };
+    let request = |dry_run| Request::Prune {
+        context: context.clone(),
+        namespace_filter: namespace.to_owned(),
+        dry_run,
+    };
+    let gone = match client.request(request(true)).await? {
+        kprtfwd_proto::Response::Pruned { forwards } => forwards,
+        _ => bail!("unexpected answer from the daemon"),
+    };
+    if gone.is_empty() {
+        println!("Nothing to prune in {context}.");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let rows: Vec<Vec<String>> = gone
+        .iter()
+        .map(|f| {
+            vec![
+                format!("{}/{}:{}", f.namespace, f.service, f.remote_port),
+                f.local_port.to_string(),
+                f.id.to_string(),
+            ]
+        })
+        .collect();
+    print_table(&["SERVICE", "LOCAL", "ID"], &rows);
+    if !yes && !confirm(&format!("\nDelete these {} forwards? [y/N] ", gone.len()))? {
+        return Ok(ExitCode::SUCCESS);
+    }
+    match client.request(request(false)).await? {
+        kprtfwd_proto::Response::Pruned { forwards } => {
+            println!("Deleted {} forwards.", forwards.len());
+        }
+        _ => bail!("unexpected answer from the daemon"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn confirm(question: &str) -> Result<bool> {
+    use std::io::Write;
+    print!("{question}");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
+}
+
 async fn pause(paused: bool) -> Result<ExitCode> {
     connect().await?.act(Request::SetPaused { paused }).await?;
     println!("{}", if paused { "Paused." } else { "Resumed." });
@@ -345,15 +417,36 @@ async fn daemon_status() -> Result<ExitCode> {
 
 async fn daemon_stop() -> Result<ExitCode> {
     let socket = socket()?;
-    let mut client = match Client::connect(&socket).await {
-        Ok(client) => client,
+    match Client::connect(&socket).await {
+        Ok(mut client) => client.act(Request::Shutdown).await?,
         Err(ClientError::NotRunning(_)) => {
             println!("daemon not running");
             return Ok(ExitCode::SUCCESS);
         }
+        // Another version that does not understand us: stop it by its PID.
+        Err(ClientError::Incompatible | ClientError::ProtocolMismatch { .. }) => {
+            let pid_file = paths::data_dir()
+                .context("neither KPRTFWD_HOME nor HOME is set")?
+                .join("daemon.pid");
+            let pid = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+                .with_context(|| {
+                    format!(
+                        "a daemon of another version is running and {} is missing; stop it by hand",
+                        pid_file.display()
+                    )
+                })?;
+            let status = std::process::Command::new("kill")
+                .arg(pid.to_string())
+                .status()
+                .context("run kill")?;
+            if !status.success() {
+                bail!("kill {pid} failed");
+            }
+        }
         Err(err) => return Err(err.into()),
-    };
-    client.act(Request::Shutdown).await?;
+    }
     // The daemon removes its socket as the last step.
     for _ in 0..100 {
         if !socket.exists() {

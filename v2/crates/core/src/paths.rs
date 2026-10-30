@@ -22,6 +22,20 @@ pub fn socket_path() -> Option<PathBuf> {
     data_dir().map(|dir| dir.join("daemon.sock"))
 }
 
+/// The socket path, or why it cannot be used: no home directory, or too long
+/// for a Unix socket (macOS allows 103 bytes, Linux 107).
+pub fn usable_socket_path() -> Result<PathBuf, String> {
+    const MAX: usize = 103;
+    let path = socket_path().ok_or("neither KPRTFWD_HOME nor HOME is set")?;
+    if path.as_os_str().len() > MAX {
+        return Err(format!(
+            "the socket path {} is too long for a Unix socket; set KPRTFWD_HOME to a shorter directory",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
 /// The daemon's log files: `<data dir>/logs`.
 pub fn log_dir() -> Option<PathBuf> {
     data_dir().map(|dir| dir.join("logs"))
