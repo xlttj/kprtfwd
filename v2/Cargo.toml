@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "kprtfwd"]
+members = ["crates/core", "crates/engine", "crates/proto", "crates/daemon", "crates/cli", "kprtfwd"]
 # The spike is a standalone experiment and is removed once the engine exists.
 exclude = ["spike/kube-forward"]
 
@@ -12,10 +12,27 @@ repository = "https://github.com/xlttj/kprtfwd"
 
 [workspace.dependencies]
 kprtfwd-core = { path = "crates/core" }
+kprtfwd-engine = { path = "crates/engine" }
+kprtfwd-proto = { path = "crates/proto" }
+kprtfwd-daemon = { path = "crates/daemon" }
+kprtfwd-cli = { path = "crates/cli" }
 anyhow = "1.0.104"
+bytes = "1"
 clap = { version = "4.6.7", features = ["derive"] }
+futures = "0.3"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+k8s-openapi = { version = "0.28", features = ["latest"] }
+kube = { version = "4.2", features = ["ws", "runtime"] }
 rusqlite = { version = "0.41.1", features = ["bundled", "backup"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2.0.21"
+tokio = { version = "1.54", features = ["full"] }
+tokio-tungstenite = "0.29"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3.27.0"
 
 [workspace.lints.rust]

@@ -327,6 +327,35 @@ fn set_enabled_changes_all_or_nothing() {
 }
 
 #[test]
+fn set_enabled_exactly_switches_the_whole_set() {
+    let mut store = Store::in_memory().unwrap();
+    for (i, port) in [("a", 18091), ("b", 18092), ("c", 18093)] {
+        store
+            .upsert_forward(&forward(i, "staging", "shop", "api", (80, port)))
+            .unwrap();
+    }
+    store.set_enabled(&[id("a"), id("b")], true).unwrap();
+    let enabled = |store: &Store| -> Vec<String> {
+        store
+            .forwards()
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.enabled)
+            .map(|f| f.id.to_string())
+            .collect()
+    };
+
+    store.set_enabled_exactly(&[id("b"), id("c")]).unwrap();
+    assert_eq!(enabled(&store), ["b", "c"]);
+
+    assert!(matches!(
+        store.set_enabled_exactly(&[id("a"), id("missing")]),
+        Err(StoreError::UnknownForward(_))
+    ));
+    assert_eq!(enabled(&store), ["b", "c"], "unchanged after an unknown ID");
+}
+
+#[test]
 fn projects_replace_members_and_follow_deletes() {
     let mut store = Store::in_memory().unwrap();
     for (i, port) in [("a", 18091), ("b", 18092)] {

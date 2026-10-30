@@ -1,10 +1,13 @@
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// Identifier of a forward.
 ///
 /// IDs are opaque: v1 created them in several shapes, and existing ones are
 /// kept as they are.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ForwardId(String);
 
 impl ForwardId {
@@ -36,7 +39,7 @@ impl From<String> for ForwardId {
 }
 
 /// A configured port-forward from a local port to a service port.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Forward {
     pub id: ForwardId,
     /// Kubeconfig context name.
@@ -52,7 +55,7 @@ pub struct Forward {
 }
 
 /// A named set of forwards that can be switched on and off together.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {
     pub name: String,
     pub forwards: Vec<ForwardId>,

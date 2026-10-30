@@ -7,9 +7,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-kprtfwd-core.workspace = true
-anyhow.workspace = true
+kprtfwd-cli.workspace = true
+kprtfwd-daemon.workspace = true
 clap.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

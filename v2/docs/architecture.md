@@ -175,7 +175,13 @@ Main dependencies:
 ### 6.1 Lifecycle
 
 - **Socket.** `~/.kprtfwd/daemon.sock`; the directory has mode 0700 and the
-  socket 0600.
+  socket 0600. `KPRTFWD_HOME` replaces `~/.kprtfwd`, e.g. for tests. Unix socket
+  paths are limited to about 100 bytes; the CLI refuses longer ones and names
+  `KPRTFWD_HOME` as the way out.
+- **Start on demand.** A client that finds no daemon runs `kprtfwd daemon run`
+  in its own process group, with no terminal attached. If that process exits
+  right away, the client reports it and names the log directory instead of
+  waiting.
 - **Single instance.** On start the daemon binds the socket. If the socket exists
   and a handshake succeeds, another daemon is running and this one exits. If the
   connection fails, the socket is stale; the daemon removes and rebinds it.
@@ -213,6 +219,9 @@ credentials.
   So `/version` covers both network and auth problems.
 - The spike used exactly this probe, against staging (k3s 1.33) and orbstack.
 - Timeout 3 s. The probe runs every 5 s while healthy and every 2 s while not.
+- A healthy context turns unreachable only after two timeouts in a row; a single
+  slow answer over VPN is not an outage. DNS and refused connections count at
+  once.
 - Failures are classified as DNS, refused, timeout, TLS, or auth.
 - Auth errors that watches or port-forwards report (401) also set the context to
   `AuthFailed`.
@@ -260,11 +269,15 @@ ready pod and keep using that one.
 Spreading load across pods is irrelevant for a developer forward. There is no
 setting for this.
 
-**Warm forward.** Exactly one port-forward connection is kept open ahead of time.
+**Warm forward.** After each connection, one port-forward stream is opened ahead
+of time for the next one, and kept for at most 60 s.
 
-- Only while the context is healthy and its pod is ready.
-- It is discarded when the pod changes, when the context has an outage, or when
-  its liveness check fails (section 6.4).
+- Only for HTTP services (by port and name, as in v1's service types). Browsers
+  open many short connections and gain the most. For other protocols an idle
+  connection is just noise in the server's logs, and server-first protocols such
+  as MySQL would send their greeting into a stream nobody reads yet.
+- It is discarded when the pod changes, when the context has an outage, when it
+  receives anything before it is used, or after 60 s.
 
 There is no setting for this either.
 
@@ -279,7 +292,9 @@ open the upgraded connection.
 
 **Upgrade.** `kube::core::Request::portforward(pod, &[port])` builds the request.
 `kube::Client::connect` sends it and handles TLS, auth (including exec plugins) and
-the WebSocket handshake (subprotocol `v4.channel.k8s.io`).
+the WebSocket handshake (subprotocol `v4.channel.k8s.io`). Opening a stream times
+out after 10 s: over a silently dead network the handshake would otherwise hang
+until the health probe notices the outage (about 15 s, two probe timeouts).
 
 **Framing.**
 
@@ -294,10 +309,10 @@ the WebSocket handshake (subprotocol `v4.channel.k8s.io`).
 becomes a forward event and shows up in the TUI.
 
 **Liveness.** Every connection runs as a task owned by the forward actor, so the
-actor always knows whether it is still alive. The warm forward sends a WebSocket
-ping every 15 s and is dropped if no pong comes back within 5 s. The API server's
-answer to pings on port-forward connections still needs checking in phase 1. If
-it does not answer, a maximum age of 60 s is the fallback, as in the spike.
+actor always knows whether it is still alive; disabling the forward ends them all.
+A warm stream waits in a small keeper task that reads from it: a close, an error
+or unexpected data ends it. A stream that dies silently is caught by the 60 s
+maximum age and by the context's health probe. WebSocket pings are not used.
 
 **Close.** The protocol has no half-close. When either side ends, the WebSocket is
 closed, as in kubectl's WebSocket mode and in kube-rs.
@@ -310,9 +325,10 @@ closed, as in kubectl's WebSocket mode and in kube-rs.
 enum ContextState {
     Idle,                                       // no enabled forwards
     Connecting,
-    Healthy { server_version: String, rtt: Duration },
+    Healthy { server_version: String },
     Unreachable { since: SystemTime, cause: NetCause },
     AuthFailed { since: SystemTime, message: String },
+    ConfigError { message: String },            // context missing in kubeconfig
 }
 
 enum NetCause { Dns, Refused, Timeout, Tls(String), Other(String) }
@@ -320,11 +336,12 @@ enum NetCause { Dns, Refused, Timeout, Tls(String), Other(String) }
 enum ForwardState {
     Disabled,
     Paused,                                     // global pause, see 6.6
-    PortBusy { holder: Option<ProcessInfo> },
+    Starting,                                   // listener or cache not ready yet
+    PortBusy { holder: Option<String> },        // "mysqld (pid 812)", via lsof
     WaitingForContext,                          // context is not Healthy
     WaitingForPods { ready: u16, total: u16 },  // no ready endpoint
-    Misconfigured(Misconfig),                   // service or port missing, RBAC
-    Ready { pod: String, active_conns: u32 },
+    Misconfigured { problem: Misconfig },       // service or port missing, RBAC
+    Ready { pod: Option<String>, active_conns: u32 },
 }
 
 enum Misconfig { ServiceNotFound, PortNotOnService, Forbidden(String) }
@@ -376,9 +393,11 @@ the multi-thread runtime.
 
 ### 6.8 Logging and events
 
-- `tracing` writes to `~/.kprtfwd/logs/daemon.log` (daily rotation, 7 files kept).
-- Noise from kube and hyper is filtered (`kube=warn`). An outage is reported once,
-  by the context state.
+- `tracing` writes to `~/.kprtfwd/logs/daemon.<date>.log` (daily rotation, 7
+  files kept). `kprtfwd daemon run --foreground` logs to the terminal instead.
+- `KPRTFWD_LOG` sets the filter (`tracing` syntax). By default kube-rs's own
+  request logging is off: it logs every failed request as an error, while an
+  outage should be reported once, by the context state.
 - Each forward and each context keeps a ring buffer of its last 200 events. The
   TUI's event view (`l`) and `kprtfwd logs` show them. Events include:
   - state changes,
@@ -402,23 +421,25 @@ the multi-thread runtime.
 
 ```rust
 enum Request {
+    // Phase 1
+    Hello { protocol: u32, client_version: String },
     Snapshot,
-    Subscribe,
     SetEnabled { ids: Vec<ForwardId>, enabled: bool },
-    EnableProject { name: String },
-    DisableProject { name: String },
+    SetProjectEnabled { name: String, enabled: bool },
     SwitchProject { name: String },
     SetPaused { paused: bool },
+    ReconnectContext { name: String },
+    Shutdown,
+    // Phase 2
+    Subscribe,
     UpsertForward(ForwardSpec),
     DeleteForward { id: ForwardId },
     UpsertProject { name: String, forwards: Vec<ForwardId> },
     DeleteProject { name: String },
-    ReconnectContext { name: String },
     ListContexts,
     Discover { context: String, namespace_filter: String },
     Prune { context: String, namespace_filter: String, dry_run: bool },
     Events { scope: Scope, limit: u32 },
-    Shutdown,
 }
 
 enum Event {
@@ -557,13 +578,15 @@ Internal structure:
 |---|---|
 | `kprtfwd` | TUI; starts the daemon if needed |
 | `kprtfwd status [--json]` | contexts and forwards with their state |
-| `kprtfwd up <id or project>...` / `down ...` | enable or disable |
+| `kprtfwd up <project or words>...` / `down ...` | enable or disable a project, or every forward the words match (as in the TUI filter); `down --all` |
 | `kprtfwd switch <project>` | enable the project, disable everything else |
 | `kprtfwd pause` / `resume` | global pause |
 | `kprtfwd discover --context C [--namespace 'app-*'] [--yes]` | add services without the TUI |
 | `kprtfwd prune --context C [--namespace ...] [-y]` | as in v1 |
 | `kprtfwd logs [-f] [<id> or --context C]` | daemon events and log |
-| `kprtfwd daemon status/stop/restart` | daemon control (`daemon run` is internal) |
+| `kprtfwd reconnect <context>` | rebuild a context's client, watches and forwards |
+| `kprtfwd daemon status/stop/restart` | daemon control (`daemon run [--foreground]` is internal, or for debugging) |
+| `kprtfwd db list [--db PATH]` | read the database without the daemon; the file is not changed |
 
 Exit codes:
 
@@ -627,6 +650,16 @@ These are shown in the INFO column and by `kprtfwd status`.
 
 The v1 Go code stays on `main` and keeps shipping fixes until phase 3.
 
+Status 2026-10-30: phase 0 is done. Phase 1 runs locally against orbstack and
+staging. The CI checks exist, but the kind integration tests are still to be
+written; the scenarios were run by hand against orbstack: pod deleted while in
+use (60 of 60 requests answered), scale to 0 and back, busy port, missing
+service, and a TCP proxy to the API server that was frozen and killed (detected
+after about 15 s and at once, recovered within a second; a request during the
+undetected phase ends after the 10 s open timeout).
+Not built yet: kubeconfig file watching, the event ring buffers and
+`kprtfwd logs`.
+
 ## 16. Decisions, risks, open questions
 
 Decisions (2026-10-30):
@@ -647,7 +680,7 @@ Risks:
 |---|---|---|
 | One WebSocket per connection | +80–100 ms per new connection over VPN | warm forward (measured 87 ms vs kubectl 193 ms) |
 | Own protocol implementation misses edge cases | broken or stuck connections | kube-rs and the spike as reference; framing unit tests; kind tests; manual checks against every configured context |
-| The API server does not answer WebSocket pings on port-forward connections | warm forward liveness unknown | fall back to a 60 s maximum age (spike behaviour) |
+| A warm stream dies silently | one request after an idle phase fails | keeper task reads the stream; 60 s maximum age; dropped on any outage; HTTP services only |
 | A watch stays stale after a silent drop | connections go to a pod that is gone | restart watches on recovery; the watcher's idle timeout (~290 s) as a backstop |
 | An exec plugin blocks a runtime worker | stalls while a login runs | multi-thread runtime |
 | Many long-lived connections (watches, warm forwards) | load on the API server | watches only for namespaces with enabled forwards; warm forwards only while healthy |

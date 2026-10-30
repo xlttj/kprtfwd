@@ -1,0 +1,20 @@
+[package]
+name = "kprtfwd-daemon"
+description = "The kprtfwd daemon: owns the forwards, serves clients over a Unix socket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kprtfwd-core.workspace = true
+kprtfwd-engine.workspace = true
+kprtfwd-proto.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

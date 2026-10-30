@@ -207,6 +207,23 @@ impl Store {
         Ok(())
     }
 
+    /// Enables exactly the given forwards and disables all others. If one ID
+    /// is unknown, nothing is changed.
+    pub fn set_enabled_exactly(&mut self, ids: &[ForwardId]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("UPDATE port_forwards SET enabled = 0", [])?;
+        {
+            let mut update = tx.prepare("UPDATE port_forwards SET enabled = 1 WHERE id = ?1")?;
+            for id in ids {
+                if update.execute([id.as_str()])? == 0 {
+                    return Err(StoreError::UnknownForward(id.clone()));
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// All projects with their forward IDs, sorted by name.
     pub fn projects(&self) -> Result<Vec<Project>> {
         let mut stmt = self.conn.prepare(

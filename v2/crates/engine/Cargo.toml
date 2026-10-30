@@ -1,0 +1,27 @@
+[package]
+name = "kprtfwd-engine"
+description = "Kubernetes access and port-forwarding for the kprtfwd daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kprtfwd-core.workspace = true
+bytes.workspace = true
+futures.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
