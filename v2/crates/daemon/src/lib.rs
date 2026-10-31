@@ -1,6 +1,7 @@
 //! The kprtfwd daemon: owns the forwards and serves clients over a Unix
-//! socket. A client starts it on demand; it exits after a while with nothing
-//! to do.
+//! socket. A client starts it on demand. It exits after a while with nothing
+//! to do, and when the last TUI quits, unless `config.toml` says to keep the
+//! forwards running.
 
 use std::collections::HashSet;
 use std::fs::{self, DirBuilder};
@@ -16,12 +17,12 @@ use kprtfwd_core::naming::{forward_id, propose_local_port};
 use kprtfwd_core::state::derive;
 use kprtfwd_core::svctype::classify;
 use kprtfwd_core::validate::validate_forward;
-use kprtfwd_core::{ContextState, Forward, ForwardId, Project, Store, StoreError, paths};
+use kprtfwd_core::{Config, ContextState, Forward, ForwardId, Project, Store, StoreError, paths};
 use kprtfwd_engine::{Engine, discovery, kubeconfig};
 use kprtfwd_proto::{
     Client, ClientError, ClientMessage, ContextView, DiscoveredPort, EventEntry, ForwardView,
     LastError, PROTOCOL_VERSION, ProjectView, Request, Response, ServerMessage, Snapshot,
-    read_message, write_message,
+    read_message, stop_daemon, write_message,
 };
 use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
@@ -96,11 +97,21 @@ async fn serve(data_dir: &Path) -> Result<()> {
     let Some(listener) = bind_socket(&socket).await? else {
         return Ok(());
     };
+    if let Err(err) = adopt_legacy_dir(data_dir).await {
+        let _ = fs::remove_file(&socket);
+        return Err(err);
+    }
     // Lets `kprtfwd daemon stop` end a daemon of another version, which it
     // cannot talk to.
     let pid_file = data_dir.join("daemon.pid");
     fs::write(&pid_file, format!("{}\n", std::process::id()))
         .with_context(|| format!("write {}", pid_file.display()))?;
+    let config_path = data_dir.join("config.toml");
+    match Config::write_template(&config_path) {
+        Ok(true) => info!(path = %config_path.display(), "wrote the default settings"),
+        Ok(false) => {}
+        Err(err) => warn!(%err, path = %config_path.display(), "cannot write the default settings"),
+    }
     let store = Store::open(&data_dir.join("kprtfwd.db")).context("open the database")?;
     let daemon = Arc::new(Mutex::new(Daemon {
         store,
@@ -116,6 +127,7 @@ async fn serve(data_dir: &Path) -> Result<()> {
 
     let shutdown = Arc::new(Notify::new());
     let clients = Arc::new(AtomicUsize::new(0));
+    let tuis = Arc::new(Tuis::default());
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
     // The terminal that started the daemon may close; that must not stop it.
@@ -131,6 +143,7 @@ async fn serve(data_dir: &Path) -> Result<()> {
                         stream,
                         daemon.clone(),
                         shutdown.clone(),
+                        tuis.clone(),
                         ClientCount::enter(&clients),
                     ));
                 }
@@ -147,6 +160,20 @@ async fn serve(data_dir: &Path) -> Result<()> {
             _ = hangup.recv() => debug!("ignoring SIGHUP"),
             () = shutdown.notified() => {
                 info!("shutdown requested");
+                break;
+            }
+            () = tuis.last_left.notified() => {
+                if tuis.count.load(Ordering::SeqCst) > 0 {
+                    continue; // another TUI attached in the meantime
+                }
+                if keep_forwards_running(&config_path) {
+                    debug!("last TUI quit, forwards keep running");
+                    continue;
+                }
+                info!("last TUI quit, switching all forwards off");
+                if let Err(err) = daemon.lock().await.switch_all_off() {
+                    warn!(%err, "cannot switch the forwards off");
+                }
                 break;
             }
             _ = idle_check.tick() => {
@@ -203,6 +230,42 @@ async fn bind_socket(path: &Path) -> Result<Option<UnixListener>> {
     Ok(Some(listener))
 }
 
+/// The TUIs connected right now; tells the main loop when the last one leaves.
+#[derive(Default)]
+struct Tuis {
+    count: AtomicUsize,
+    last_left: Notify,
+}
+
+/// Held by the connection of a TUI.
+struct Attached(Arc<Tuis>);
+
+impl Attached {
+    fn new(tuis: &Arc<Tuis>) -> Self {
+        tuis.count.fetch_add(1, Ordering::SeqCst);
+        Self(tuis.clone())
+    }
+}
+
+impl Drop for Attached {
+    fn drop(&mut self) {
+        if self.0.count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.last_left.notify_one();
+        }
+    }
+}
+
+/// Reads the setting when it is needed, so edits apply without a restart.
+fn keep_forwards_running(config_path: &Path) -> bool {
+    match Config::load(config_path) {
+        Ok(config) => config.keep_forwards_running,
+        Err(err) => {
+            warn!(%err, "using the default settings");
+            Config::default().keep_forwards_running
+        }
+    }
+}
+
 /// Counts connected clients for the idle exit.
 struct ClientCount(Arc<AtomicUsize>);
 
@@ -223,6 +286,7 @@ async fn serve_client(
     stream: UnixStream,
     daemon: Arc<Mutex<Daemon>>,
     shutdown: Arc<Notify>,
+    tuis: Arc<Tuis>,
     _count: ClientCount,
 ) {
     let (reader, mut writer) = stream.into_split();
@@ -256,6 +320,8 @@ async fn serve_client(
         Ok(None) | Err(_) => return,
     }
 
+    // Dropped when the connection ends, however it ends.
+    let mut attached = None;
     loop {
         let message = match read_message::<_, ClientMessage>(&mut reader).await {
             Ok(Some(message)) => message,
@@ -269,6 +335,10 @@ async fn serve_client(
         let result = match message.request {
             Request::Shutdown => {
                 shutdown.notify_one();
+                Ok(Response::Done)
+            }
+            Request::Attach => {
+                attached.get_or_insert_with(|| Attached::new(&tuis));
                 Ok(Response::Done)
             }
             // These talk to a cluster and may take seconds; they must not
@@ -320,6 +390,13 @@ impl Daemon {
             .into_iter()
             .filter(|f| f.enabled)
             .collect())
+    }
+
+    /// Switches every forward off and lifts a pause, so the next start begins
+    /// with nothing running.
+    fn switch_all_off(&mut self) -> Result<(), StoreError> {
+        self.store.set_enabled_exactly(&[])?;
+        self.store.set_paused(false)
     }
 
     fn has_enabled(&self) -> Result<bool, StoreError> {
@@ -428,7 +505,10 @@ impl Daemon {
                 entries.sort_by_key(|entry| entry.at);
                 return Ok(Response::Events { entries });
             }
-            Request::ListContexts | Request::Discover { .. } | Request::Prune { .. } => {
+            Request::Attach
+            | Request::ListContexts
+            | Request::Discover { .. }
+            | Request::Prune { .. } => {
                 return Err("handled outside the lock".into());
             }
         }
@@ -499,6 +579,31 @@ impl Daemon {
                 .collect(),
         })
     }
+}
+
+/// Takes over `~/.kprtfwd`, where kprtfwd v1 and the first v2 builds kept
+/// their data, while this directory has no database yet: stops a daemon still
+/// running there and copies its database. The old directory is left as it is,
+/// so kprtfwd v1 keeps working on it.
+async fn adopt_legacy_dir(data_dir: &Path) -> Result<()> {
+    let Some(legacy) = paths::legacy_dir() else {
+        return Ok(());
+    };
+    let db = data_dir.join("kprtfwd.db");
+    let legacy_db = legacy.join("kprtfwd.db");
+    if db.exists() || !legacy_db.exists() {
+        return Ok(());
+    }
+    let stopped = stop_daemon(&legacy.join("daemon.sock"), &legacy.join("daemon.pid"))
+        .await
+        .with_context(|| format!("stop the daemon running in {}", legacy.display()))?;
+    if stopped {
+        info!(dir = %legacy.display(), "stopped the daemon of the old directory");
+    }
+    Store::copy_file(&legacy_db, &db)
+        .with_context(|| format!("copy {} to {}", legacy_db.display(), db.display()))?;
+    info!(from = %legacy_db.display(), to = %db.display(), "copied the database");
+    Ok(())
 }
 
 /// Reconnects contexts whose kubeconfig settings changed: a renewed token, a

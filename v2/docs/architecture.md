@@ -14,7 +14,8 @@ port-forward protocol on top of kube-rs. It tracks reachability once per cluster
 context, and it picks a ready pod for every new connection from a watched
 EndpointSlice cache. As a result:
 
-- forwards keep running when the TUI or the terminal is closed,
+- forwards live in the daemon, not in the TUI; by default quitting the TUI
+  switches them off as in v1, and one setting keeps them running instead,
 - a pod restart only affects connections open at that moment,
 - a VPN drop puts the context's forwards into a waiting state, and they recover
   on their own within seconds once the API server is reachable again.
@@ -46,14 +47,15 @@ Structural limits of v1:
 
 Goals:
 
-- Forwards outlive any UI.
+- Forwards live in a daemon; whether they outlive the TUI is one setting.
 - Pod restarts and short network drops only affect connections open at that moment.
 - One place knows whether a cluster is reachable; forwards follow it.
 - New-connection latency on par with kubectl or better.
 - A TUI for professionals: one list, single keys, the reason for every problem
   visible in the list itself.
 - A scriptable CLI (`status --json`, `up`, `down`).
-- Existing data is kept: the v1 SQLite database is migrated in place, IDs stay.
+- Existing data is kept: v2 copies the v1 SQLite database to its own directory
+  and migrates the copy; IDs stay.
 - macOS and Linux.
 
 Non-goals:
@@ -109,7 +111,7 @@ flowchart LR
   end
   subgraph daemon[kprtfwd daemon]
     IPC[IPC server]
-    STORE[(SQLite<br/>~/.kprtfwd/kprtfwd.db)]
+    STORE[(SQLite<br/>~/.config/kprtfwd/kprtfwd.db)]
     subgraph ctx[per context]
       HEALTH[health probe]
       WATCH[EndpointSlice and<br/>Service watches]
@@ -131,7 +133,12 @@ flowchart LR
 Process model:
 
 - **One daemon per user, started on demand.** The first client that needs it
-  starts it (`kprtfwd daemon run --detach`). There is no launchd or systemd unit.
+  starts it (`kprtfwd daemon run`). There is no launchd or systemd unit.
+- **Quitting the TUI.** The TUI registers with the daemon (`Attach`). When the
+  last TUI's connection closes, by `q`, a closed terminal or a crash, the daemon
+  switches every forward off, lifts a pause and exits. That includes forwards
+  switched on with `kprtfwd up`. `keep_forwards_running = true` in
+  `config.toml` keeps them running in the background instead.
 - **Idle exit.** The daemon exits on its own once no forward has been enabled and
   no client has been connected for 10 minutes. Paused forwards count as enabled.
 - **Clients:** the TUI (`kprtfwd`) and the CLI (`kprtfwd <subcommand>`).
@@ -166,18 +173,27 @@ Main dependencies:
 - IPC: `serde`, `serde_json`
 - logging: `tracing`, `tracing-subscriber`, `tracing-appender`
 - CLI and TUI: `clap`, `ratatui`, `crossterm`
-- kubeconfig changes: `notify`
-- browser: `open`
-- tests: `insta`
+- settings: `toml`
 
 ## 6. Daemon
 
 ### 6.1 Lifecycle
 
-- **Socket.** `~/.kprtfwd/daemon.sock`; the directory has mode 0700 and the
-  socket 0600. `KPRTFWD_HOME` replaces `~/.kprtfwd`, e.g. for tests. Unix socket
-  paths are limited to about 100 bytes; the CLI refuses longer ones and names
-  `KPRTFWD_HOME` as the way out.
+- **Directory.** `~/.config/kprtfwd`, or `$XDG_CONFIG_HOME/kprtfwd`, holds
+  `config.toml`, the database, `daemon.sock`, `daemon.pid` and `logs/`. The
+  directory has mode 0700 and the socket 0600. `KPRTFWD_HOME` replaces the
+  directory, e.g. for tests. Unix socket paths are limited to about 100 bytes;
+  the CLI refuses longer ones and names `KPRTFWD_HOME` as the way out.
+- **Settings.** `config.toml`; the daemon writes a commented template on its
+  first start. The only setting is `keep_forwards_running` (default `false`).
+  Unknown keys and wrong types are errors: the TUI refuses to start and names
+  the file and the problem. The daemon reads the file when the last TUI quits,
+  so a change applies without a restart.
+- **Moving from `~/.kprtfwd`.** If the directory has no database yet but
+  `~/.kprtfwd/kprtfwd.db` exists, the daemon stops a daemon still running there
+  (by its PID if it is another version) and copies the database with SQLite's
+  backup API. `~/.kprtfwd` stays as it is, so v1 keeps working on its own copy.
+  With `KPRTFWD_HOME` set, this step is skipped.
 - **Start on demand.** A client that finds no daemon runs `kprtfwd daemon run`
   in its own process group, with no terminal attached. If that process exits
   right away, the client reports it and names the log directory instead of
@@ -196,8 +212,9 @@ Main dependencies:
   a renewed token, a moved cluster, a context that was missing. Switching
   `current-context` or editing another context leaves running forwards alone.
   Only the hashes are kept, not the settings, which include credentials.
-- **Stop.** `kprtfwd daemon stop`, SIGTERM, or the idle exit: close listeners,
-  close forwards, close the database.
+- **Stop.** `kprtfwd daemon stop`, SIGTERM, the idle exit, or the last TUI
+  quitting: close listeners, close forwards, close the database. Only the last
+  one switches the forwards off first.
 - **Upgrade.** Clients compare versions in the handshake. A daemon of another
   version is reported with the hint `kprtfwd daemon restart`; the desired state
   is persisted, so forwards come back on their own. The daemon writes its PID to
@@ -380,7 +397,9 @@ and bind attempts. The derivation is table-tested in `core`.
     behaviour.
 - **Pause.** A global `paused` setting is persisted, and is what v1's Ctrl+P does.
   Listeners close, the `enabled` flags stay as they are, and resume restores them.
-- **Restarts.** Starting the daemon brings back every enabled forward.
+- **Restarts.** Starting the daemon brings back every enabled forward. When the
+  last TUI quits without `keep_forwards_running`, every forward is switched off
+  and the pause lifted, so the next start begins with nothing running, as in v1.
 
 ### 6.7 Auth plugins
 
@@ -398,7 +417,7 @@ the multi-thread runtime.
 
 ### 6.8 Logging and events
 
-- `tracing` writes to `~/.kprtfwd/logs/daemon.<date>.log` (daily rotation, 7
+- `tracing` writes to `~/.config/kprtfwd/logs/daemon.<date>.log` (daily rotation, 7
   files kept). `kprtfwd daemon run --foreground` logs to the terminal instead.
 - `KPRTFWD_LOG` sets the filter (`tracing` syntax). By default kube-rs's own
   request logging is off: it logs every failed request as an error, while an
@@ -418,7 +437,7 @@ the multi-thread runtime.
 
 - **Transport.** A Unix domain socket.
 - **Framing.** Newline-delimited JSON with serde-tagged enums. It is easy to debug:
-  `socat - UNIX-CONNECT:$HOME/.kprtfwd/daemon.sock`.
+  `socat - UNIX-CONNECT:$HOME/.config/kprtfwd/daemon.sock`.
 - **Handshake.** The client sends `Hello { protocol, client_version }`, the daemon
   answers `Welcome { protocol, daemon_version }`. Different protocol numbers mean
   the client asks the user to restart the daemon.
@@ -437,6 +456,7 @@ the multi-thread runtime.
 ```rust
 enum Request {
     Hello { protocol: u32, client_version: String },
+    Attach,               // sent by the TUI (section 5)
     Snapshot,
     SetEnabled { ids: Vec<ForwardId>, enabled: bool },
     SetProjectEnabled { name: String, enabled: bool },
@@ -450,7 +470,7 @@ enum Request {
     ListContexts,
     Discover { context: String, namespace_filter: String },
     Prune { context: String, namespace_filter: String, dry_run: bool },
-    Events { id: ForwardId },
+    Events { ids: Vec<ForwardId> },
     Shutdown,
 }
 
@@ -470,18 +490,20 @@ on or off with one request (`+` / `-`).
 
 ## 8. Persistence and migration
 
-- **Database.** v2 keeps `~/.kprtfwd/kprtfwd.db`. It uses `rusqlite` with
-  `PRAGMA foreign_keys = ON` and WAL mode.
+- **Database.** `~/.config/kprtfwd/kprtfwd.db`, copied from v1's
+  `~/.kprtfwd/kprtfwd.db` on the first start (section 6.1). It uses `rusqlite`
+  with `PRAGMA foreign_keys = ON` and WAL mode.
 - **Schema version.** The version lives in `PRAGMA user_version`. A database that
   has the v1 tables and `user_version = 0` counts as version 1. Migrations are
   additive:
   - **v2:** `port_forwards` gains `enabled INTEGER NOT NULL DEFAULT 0`. A new
     table `settings (key TEXT PRIMARY KEY, value TEXT)` holds `paused`.
 - **Backup.** The first migration copies the database to `kprtfwd.db.v1-backup`.
-- **Rollback.** v1 always reads and writes explicit column lists. The additive
-  changes therefore keep the v1 binary working on a migrated database, which is
-  the rollback path. v1 and v2 should not run at the same time, because they would
-  compete for local ports.
+- **Rollback.** v1 keeps its own file in `~/.kprtfwd`, which v2 no longer
+  changes; that is the rollback path, without the changes made in v2. v1 also
+  works on a migrated database, because it always reads and writes explicit
+  column lists and the changes are additive. v1 and v2 should not run at the
+  same time, because they would compete for local ports.
 - **IDs.** IDs are opaque and kept as they are. The current database holds two
   historic shapes: 21 IDs with three parts and 42 with four. New IDs are
   `<context>.<namespace>.<service>-<port>`, sanitized as in v1, with a numeric
@@ -564,7 +586,7 @@ Keys:
 | `l` | events of the selected forward |
 | `?` | key help |
 | `ctrl+l` | redraw the screen |
-| `q` | quit; forwards keep running |
+| `q` | quit and switch all forwards off; with `keep_forwards_running` they keep running |
 
 **Projects are made from the list.** Filter until the list shows what belongs
 together, then `p`:
@@ -669,6 +691,10 @@ These are shown in the INFO column and by `kprtfwd status`.
       plane): the outage is detected (about 15 s), connections close at once
       meanwhile, and the forward is ready again about 2 s after the resume.
 - **proto:** serde round trips and the protocol version check.
+- **daemon:** `kprtfwd/tests/daemon.rs` runs the real binary with `HOME` set to
+  a temporary directory: quitting the last TUI switches the forwards off and
+  lifts the pause, another client or `keep_forwards_running` keeps them, and a
+  daemon still running in `~/.kprtfwd` is stopped and its database copied.
 - **tui:** key-by-key tests of `App::update`, drawing tests with `TestBackend`,
   and `expect` scripts for the whole flow (see section 10).
 - **Manual checklist, against every configured context:**
@@ -712,6 +738,11 @@ the list, project off, edit the local port, pause and resume; the forward was
 then reachable on its new port. `prune` was checked with the service present,
 deleted and declined, and deleted and confirmed.
 
+After the first day of daily use, the data moved to `~/.config/kprtfwd` and
+quitting the TUI switches the forwards off unless `keep_forwards_running` is
+set. The move was checked with the previous build's daemon still running: it was
+stopped by its PID and its database copied.
+
 ## 16. Decisions, risks, open questions
 
 Decisions (2026-10-30):
@@ -721,6 +752,8 @@ Decisions (2026-10-30):
 | Platforms | macOS and Linux; no Windows |
 | Repository | `v2/` subdirectory on `main` until release |
 | Daemon start | on demand by the first client, idle exit after 10 minutes; no launchd/systemd unit |
+| Quitting the TUI | switches all forwards off and stops the daemon, as in v1; `keep_forwards_running = true` keeps them running |
+| Directory | `~/.config/kprtfwd` (or `$XDG_CONFIG_HOME/kprtfwd`), taken over from `~/.kprtfwd` once |
 | Health probe | `GET /version` with credentials (section 6.2) |
 | Pod choice | stay on the last ready pod, as kubectl does; not configurable (section 6.3) |
 | Port-forward protocol | own implementation on top of kube-rs's upgraded connection (section 6.4) |

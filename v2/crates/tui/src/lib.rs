@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use kprtfwd_core::paths;
+use kprtfwd_core::{Config, paths};
 use kprtfwd_proto::{Client, Request, Response, connect_or_start};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -22,15 +22,41 @@ use crate::app::{App, Cmd, Msg};
 const REFRESH: Duration = Duration::from_millis(300);
 
 pub async fn run() -> Result<()> {
+    // A broken config.toml is reported now, not only when quitting.
+    let config_path = paths::config_path().context("neither KPRTFWD_HOME nor HOME is set")?;
+    let config = Config::load(&config_path)?;
+    let mut client = attach().await?;
+    let snapshot = client.snapshot().await?;
+    let mut app = App::new(snapshot);
+    app.keep_forwards_running = config.keep_forwards_running;
+    app.config_path = home_relative(&config_path);
+
+    let mut terminal = ratatui::init();
+    let result = event_loop(&mut terminal, client, app).await;
+    ratatui::restore();
+    result
+}
+
+/// Connects to the daemon as a TUI, starting the daemon if needed. When the
+/// last TUI's connection closes, the daemon switches the forwards off unless
+/// the settings say to keep them running.
+async fn attach() -> Result<Client> {
     let socket = paths::usable_socket_path().map_err(anyhow::Error::msg)?;
     let exe = std::env::current_exe().context("find the kprtfwd binary")?;
     let mut client = connect_or_start(&socket, &exe).await?;
-    let snapshot = client.snapshot().await?;
+    client.act(Request::Attach).await?;
+    Ok(client)
+}
 
-    let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, client, App::new(snapshot)).await;
-    ratatui::restore();
-    result
+/// `path` with the home directory written as `~`.
+fn home_relative(path: &std::path::Path) -> String {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .and_then(|home| path.strip_prefix(home).ok())
+        .map_or_else(
+            || path.display().to_string(),
+            |rest| format!("~/{}", rest.display()),
+        )
 }
 
 async fn event_loop(
@@ -83,10 +109,7 @@ async fn event_loop(
                     }
                     Err(err) => {
                         app.update(Msg::Done(Err(format!("lost the daemon: {err}; reconnecting"))));
-                        if let Ok(socket) = paths::usable_socket_path()
-                            && let Ok(exe) = std::env::current_exe()
-                            && let Ok(new) = connect_or_start(&socket, &exe).await
-                        {
+                        if let Ok(new) = attach().await {
                             client = new;
                         }
                     }

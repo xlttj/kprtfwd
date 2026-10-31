@@ -13,5 +13,11 @@ kprtfwd-tui.workspace = true
 clap.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+kprtfwd-core.workspace = true
+kprtfwd-proto.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
 [lints]
 workspace = true

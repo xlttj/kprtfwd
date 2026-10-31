@@ -11,7 +11,9 @@ use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use kprtfwd_core::clock::local_time;
 use kprtfwd_core::{ForwardId, ForwardState, Store, filter, paths};
-use kprtfwd_proto::{Client, ClientError, ForwardView, Request, Snapshot, connect_or_start};
+use kprtfwd_proto::{
+    Client, ClientError, ForwardView, Request, Snapshot, connect_or_start, stop_daemon,
+};
 
 use crate::table::print_table;
 
@@ -103,7 +105,7 @@ pub enum DaemonCommand {
 pub enum DbCommand {
     /// List forwards and projects; reads a copy, the file is not changed
     List {
-        /// Database file [default: ~/.kprtfwd/kprtfwd.db]
+        /// Database file [default: ~/.config/kprtfwd/kprtfwd.db]
         #[arg(long)]
         db: Option<PathBuf>,
     },
@@ -517,46 +519,15 @@ async fn daemon_status() -> Result<ExitCode> {
 }
 
 async fn daemon_stop() -> Result<ExitCode> {
-    let socket = socket()?;
-    match Client::connect(&socket).await {
-        Ok(mut client) => client.act(Request::Shutdown).await?,
-        Err(ClientError::NotRunning(_)) => {
-            println!("daemon not running");
-            return Ok(ExitCode::SUCCESS);
-        }
-        // Another version that does not understand us: stop it by its PID.
-        Err(ClientError::Incompatible | ClientError::ProtocolMismatch { .. }) => {
-            let pid_file = paths::data_dir()
-                .context("neither KPRTFWD_HOME nor HOME is set")?
-                .join("daemon.pid");
-            let pid = std::fs::read_to_string(&pid_file)
-                .ok()
-                .and_then(|text| text.trim().parse::<u32>().ok())
-                .with_context(|| {
-                    format!(
-                        "a daemon of another version is running and {} is missing; stop it by hand",
-                        pid_file.display()
-                    )
-                })?;
-            let status = std::process::Command::new("kill")
-                .arg(pid.to_string())
-                .status()
-                .context("run kill")?;
-            if !status.success() {
-                bail!("kill {pid} failed");
-            }
-        }
-        Err(err) => return Err(err.into()),
+    let pid_file = paths::data_dir()
+        .context("neither KPRTFWD_HOME nor HOME is set")?
+        .join("daemon.pid");
+    if stop_daemon(&socket()?, &pid_file).await? {
+        println!("daemon stopped");
+    } else {
+        println!("daemon not running");
     }
-    // The daemon removes its socket as the last step.
-    for _ in 0..100 {
-        if !socket.exists() {
-            println!("daemon stopped");
-            return Ok(ExitCode::SUCCESS);
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    bail!("the daemon did not stop within 5 s")
+    Ok(ExitCode::SUCCESS)
 }
 
 fn print_contexts(snapshot: &Snapshot) {

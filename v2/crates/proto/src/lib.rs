@@ -15,10 +15,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
-pub use client::{Client, ClientError, connect_or_start, spawn_daemon};
+pub use client::{Client, ClientError, connect_or_start, spawn_daemon, stop_daemon};
 
 /// Bumped on every incompatible change to the messages.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// A request with its ID. The request is nested, not flattened, because
 /// requests have fields of their own named `id`.
@@ -35,6 +35,10 @@ pub enum Request {
         protocol: u32,
         client_version: String,
     },
+    /// Sent by the TUI. When the last such connection closes, the daemon
+    /// switches all forwards off and exits, unless `config.toml` says to keep
+    /// them running.
+    Attach,
     Snapshot,
     SetEnabled {
         ids: Vec<ForwardId>,
@@ -257,6 +261,7 @@ mod tests {
                 protocol: PROTOCOL_VERSION,
                 client_version: "test".into(),
             },
+            Request::Attach,
             Request::Snapshot,
             Request::SetProjectEnabled {
                 name: "shop".into(),

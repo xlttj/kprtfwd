@@ -1,15 +1,49 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 
-/// Directory for kprtfwd's data: `$KPRTFWD_HOME` if set, else `~/.kprtfwd`
-/// (the same as in v1).
+/// kprtfwd's directory for its settings, database, socket and logs:
+/// `$KPRTFWD_HOME` if set, else `$XDG_CONFIG_HOME/kprtfwd`, else
+/// `~/.config/kprtfwd`.
 ///
 /// Returns `None` if neither `KPRTFWD_HOME` nor `HOME` is set.
 pub fn data_dir() -> Option<PathBuf> {
-    let non_empty = |name| std::env::var_os(name).filter(|value| !value.is_empty());
-    if let Some(dir) = non_empty("KPRTFWD_HOME") {
+    choose_dir(env("KPRTFWD_HOME"), env("XDG_CONFIG_HOME"), env("HOME"))
+}
+
+/// Where kprtfwd v1 and the first v2 builds kept their data: `~/.kprtfwd`.
+/// `None` when `KPRTFWD_HOME` is set, so tests never touch it.
+pub fn legacy_dir() -> Option<PathBuf> {
+    if env("KPRTFWD_HOME").is_some() {
+        return None;
+    }
+    env("HOME").map(|home| PathBuf::from(home).join(".kprtfwd"))
+}
+
+fn env(name: &str) -> Option<OsString> {
+    std::env::var_os(name).filter(|value| !value.is_empty())
+}
+
+fn choose_dir(
+    kprtfwd_home: Option<OsString>,
+    xdg_config_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Option<PathBuf> {
+    if let Some(dir) = kprtfwd_home {
         return Some(PathBuf::from(dir));
     }
-    non_empty("HOME").map(|home| PathBuf::from(home).join(".kprtfwd"))
+    // The XDG spec says to ignore relative paths.
+    if let Some(dir) = xdg_config_home
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+    {
+        return Some(dir.join("kprtfwd"));
+    }
+    home.map(|home| PathBuf::from(home).join(".config").join("kprtfwd"))
+}
+
+/// The settings: `<data dir>/config.toml`.
+pub fn config_path() -> Option<PathBuf> {
+    data_dir().map(|dir| dir.join("config.toml"))
 }
 
 /// The database: `<data dir>/kprtfwd.db`.
@@ -39,4 +73,39 @@ pub fn usable_socket_path() -> Result<PathBuf, String> {
 /// The daemon's log files: `<data dir>/logs`.
 pub fn log_dir() -> Option<PathBuf> {
     data_dir().map(|dir| dir.join("logs"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir(kprtfwd_home: Option<&str>, xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+        choose_dir(
+            kprtfwd_home.map(OsString::from),
+            xdg.map(OsString::from),
+            home.map(OsString::from),
+        )
+    }
+
+    #[test]
+    fn chooses_the_data_dir() {
+        let path = |p: &str| Some(PathBuf::from(p));
+        assert_eq!(
+            dir(None, None, Some("/home/me")),
+            path("/home/me/.config/kprtfwd")
+        );
+        assert_eq!(
+            dir(None, Some("/xdg"), Some("/home/me")),
+            path("/xdg/kprtfwd")
+        );
+        assert_eq!(
+            dir(None, Some("relative"), Some("/home/me")),
+            path("/home/me/.config/kprtfwd")
+        );
+        assert_eq!(
+            dir(Some("/test"), Some("/xdg"), Some("/home/me")),
+            path("/test")
+        );
+        assert_eq!(dir(None, None, None), None);
+    }
 }

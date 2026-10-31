@@ -4,6 +4,7 @@
 //! be tested without a cluster.
 
 pub mod clock;
+pub mod config;
 pub mod filter;
 pub mod model;
 pub mod naming;
@@ -13,6 +14,7 @@ pub mod store;
 pub mod svctype;
 pub mod validate;
 
+pub use config::Config;
 pub use model::{Forward, ForwardId, Project};
 pub use state::{ContextState, ForwardState};
 pub use store::{Store, StoreError};

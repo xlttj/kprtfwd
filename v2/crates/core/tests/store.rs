@@ -217,6 +217,27 @@ fn snapshot_leaves_file_untouched() {
 }
 
 #[test]
+fn copies_a_database_without_changing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let from = v1_database(dir.path());
+    let before = fs::read(&from).unwrap();
+    let to = dir.path().join(".config/kprtfwd/kprtfwd.db");
+
+    Store::copy_file(&from, &to).unwrap();
+
+    assert_eq!(fs::read(&from).unwrap(), before);
+    assert_eq!(mode(&to), 0o600);
+    assert_eq!(mode(to.parent().unwrap()), 0o700);
+    // The copy is migrated where it is opened; the original stays at v1.
+    let store = Store::open(&to).unwrap();
+    assert_eq!(store.forwards().unwrap(), fixture_forwards());
+    assert_eq!(raw_user_version(&from), 0);
+
+    // An existing database is never overwritten.
+    assert!(Store::copy_file(&from, &to).is_err());
+}
+
+#[test]
 fn creates_new_database_with_private_permissions() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join(".kprtfwd");

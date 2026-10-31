@@ -106,7 +106,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 70,
             );
         }
-        Mode::Help => popup(frame, " keys ", help_lines(), 70),
+        Mode::Help => popup(frame, " keys ", help_lines(app), 70),
     }
 }
 
@@ -442,8 +442,13 @@ fn draw_services(frame: &mut Frame, s: &Services) {
     );
 }
 
-fn help_lines() -> Vec<Line<'static>> {
-    [
+fn help_lines(app: &App) -> Vec<Line<'static>> {
+    let quit = if app.keep_forwards_running {
+        "q                        quit; forwards keep running"
+    } else {
+        "q                        quit and switch all forwards off"
+    };
+    let mut lines: Vec<Line<'static>> = [
         "↑↓ j k  PgUp PgDn  g G   move",
         "space                    selected forward on/off",
         "/                        filter: all words must match; @name = project",
@@ -457,11 +462,18 @@ fn help_lines() -> Vec<Line<'static>> {
         "r                        reconnect the selected forward's context",
         "l                        events of the selected forward",
         "ctrl+l                   redraw the screen",
-        "q                        quit; forwards keep running",
+        quit,
     ]
     .into_iter()
     .map(Line::raw)
-    .collect()
+    .collect();
+    if !app.config_path.is_empty() {
+        lines.push(Line::styled(
+            format!("settings: {}", app.config_path),
+            dim(),
+        ));
+    }
+    lines
 }
 
 /// A bordered box in the middle of the screen, sized to its lines.
@@ -551,6 +563,26 @@ mod tests {
         let waiting = screen.iter().find(|line| line.contains("waiting")).unwrap();
         assert!(waiting.contains("API unreachable (DNS)"), "{waiting}");
         assert!(screen[7].contains("space on/off"), "{}", screen[7]);
+    }
+
+    #[test]
+    fn help_says_what_quitting_does() {
+        let mut app = App::new(snapshot());
+        app.mode = Mode::Help;
+        app.config_path = "~/.config/kprtfwd/config.toml".into();
+        let screen = render(&app, 100, 24).join("\n");
+        assert!(
+            screen.contains("quit and switch all forwards off"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("settings: ~/.config/kprtfwd/config.toml"),
+            "{screen}"
+        );
+
+        app.keep_forwards_running = true;
+        let screen = render(&app, 100, 24).join("\n");
+        assert!(screen.contains("quit; forwards keep running"), "{screen}");
     }
 
     #[test]

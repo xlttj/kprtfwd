@@ -1,7 +1,7 @@
 //! SQLite storage for forwards, projects and settings.
 //!
-//! The database is the file v1 uses (`~/.kprtfwd/kprtfwd.db`). Schema changes
-//! are additive, so the v1 binary keeps working on a migrated file.
+//! The schema extends v1's (`~/.kprtfwd/kprtfwd.db`). Changes are additive,
+//! so the v1 binary keeps working on a migrated file.
 
 use std::fs::{DirBuilder, OpenOptions};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -120,6 +120,26 @@ impl Store {
         configure(&conn)?;
         migrate(&mut conn, None)?;
         Ok(Self { conn })
+    }
+
+    /// Copies the database at `from` to `to`, which must not exist yet. The
+    /// source is opened read-only and not changed; the copy is consistent even
+    /// while another process uses the source.
+    pub fn copy_file(from: &Path, to: &Path) -> Result<()> {
+        let source = Connection::open_with_flags(
+            from,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        if let Some(dir) = to.parent().filter(|d| !d.as_os_str().is_empty()) {
+            DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        }
+        if to.exists() {
+            return Err(StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("{} exists", to.display()),
+            )));
+        }
+        write_backup(&source, to)
     }
 
     /// An empty in-memory database with the current schema.

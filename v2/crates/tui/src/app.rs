@@ -50,6 +50,9 @@ pub struct App {
     pub mode: Mode,
     pub message: Option<Message>,
     pub quit: bool,
+    /// From the settings, for the help.
+    pub keep_forwards_running: bool,
+    pub config_path: String,
     /// Rows the list showed last time, for paging; set while drawing.
     pub page: Cell<usize>,
 }
@@ -156,6 +159,8 @@ impl App {
             mode: Mode::List,
             message: None,
             quit: false,
+            keep_forwards_running: false,
+            config_path: String::new(),
             page: Cell::new(10),
         };
         app.keep_selection();

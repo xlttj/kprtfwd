@@ -39,6 +39,8 @@ pub enum ClientError {
     Incompatible,
     #[error("{0}")]
     Daemon(String),
+    #[error("{0}")]
+    CannotStop(String),
     #[error("the daemon closed the connection")]
     Closed,
     #[error("unexpected answer from the daemon")]
@@ -177,4 +179,41 @@ pub async fn connect_or_start(socket: &Path, exe: &Path) -> Result<Client, Clien
         }
     }
     Err(ClientError::StartTimeout(WAIT))
+}
+
+/// Stops the daemon that serves `socket` and waits until it is gone. One of
+/// another version, which does not understand the request, is stopped by the
+/// PID in `pid_file`. Returns `false` if no daemon was running.
+pub async fn stop_daemon(socket: &Path, pid_file: &Path) -> Result<bool, ClientError> {
+    match Client::connect(socket).await {
+        Ok(mut client) => client.act(Request::Shutdown).await?,
+        Err(ClientError::NotRunning(_)) => return Ok(false),
+        Err(ClientError::Incompatible | ClientError::ProtocolMismatch { .. }) => {
+            let pid = std::fs::read_to_string(pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+                .ok_or_else(|| {
+                    ClientError::CannotStop(format!(
+                        "a daemon of another version is running and {} is missing; stop it by hand",
+                        pid_file.display()
+                    ))
+                })?;
+            let status = Command::new("kill").arg(pid.to_string()).status()?;
+            if !status.success() {
+                return Err(ClientError::CannotStop(format!("kill {pid} failed")));
+            }
+        }
+        Err(err) => return Err(err),
+    }
+    // The daemon removes its socket as the last step.
+    for _ in 0..100 {
+        if !socket.exists() {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(ClientError::CannotStop(format!(
+        "the daemon on {} did not stop within 5 s",
+        socket.display()
+    )))
 }
