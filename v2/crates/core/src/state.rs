@@ -117,7 +117,7 @@ impl ForwardState {
     }
 
     /// The INFO column: why the forward is not ready; empty if it is.
-    pub fn info(&self, context_name: &str, context: &ContextState) -> String {
+    pub fn info(&self, context: &ContextState) -> String {
         match self {
             Self::Disabled | Self::Paused | Self::Ready { .. } => String::new(),
             Self::Starting => "starting".into(),
@@ -129,9 +129,7 @@ impl ForwardState {
                 ContextState::Unreachable { cause, .. } => {
                     format!("API unreachable ({})", cause.short())
                 }
-                ContextState::AuthFailed { .. } => {
-                    format!("login needed: kubectl --context {context_name} get ns")
-                }
+                ContextState::AuthFailed { .. } => "login needed: reconnect (r) to log in".into(),
                 ContextState::ConfigError { message } => format!("kubeconfig: {message}"),
                 ContextState::Idle | ContextState::Connecting => "connecting".into(),
                 ContextState::Healthy { .. } => String::new(),
@@ -342,7 +340,7 @@ mod tests {
             cause: NetCause::Dns,
         };
         assert_eq!(
-            ForwardState::WaitingForContext.info("staging", &unreachable),
+            ForwardState::WaitingForContext.info(&unreachable),
             "API unreachable (DNS)"
         );
         let auth = ContextState::AuthFailed {
@@ -350,18 +348,18 @@ mod tests {
             message: "exec plugin failed".into(),
         };
         assert_eq!(
-            ForwardState::WaitingForContext.info("staging", &auth),
-            "login needed: kubectl --context staging get ns"
+            ForwardState::WaitingForContext.info(&auth),
+            "login needed: reconnect (r) to log in"
         );
         assert_eq!(
-            ForwardState::WaitingForPods { ready: 0, total: 2 }.info("staging", &healthy()),
+            ForwardState::WaitingForPods { ready: 0, total: 2 }.info(&healthy()),
             "0/2 pods ready"
         );
         assert_eq!(
             ForwardState::PortBusy {
                 holder: Some("mysqld (pid 812)".into())
             }
-            .info("staging", &healthy()),
+            .info(&healthy()),
             "port busy: mysqld (pid 812)"
         );
         assert_eq!(unreachable.summary(), "unreachable (DNS)");

@@ -91,9 +91,12 @@ Lessons that shape this design:
   Every new connection therefore pays a TCP + TLS + upgrade handshake (~80–100 ms
   over VPN). Keeping one forward opened ahead of time removes that cost.
 - **Pod lookup from a watch cache.** It must not cost API calls per connection.
-- **Exec plugins print to the terminal.** kube-rs runs exec auth plugins
-  synchronously and inherits their stderr, which would corrupt a TUI. That is one
-  more reason to keep Kubernetes access in the daemon.
+- **Exec plugins run inside requests.** kube-rs runs exec auth plugins when it
+  builds a client and again in every request while the token is expiring, with
+  their stderr inherited. A request that times out leaves its plugin running
+  while the next request starts another one. With a browser login (kubelogin),
+  every attempt opens a tab, even while the API server is unreachable. So the
+  daemon runs the plugin itself (section 6.7).
 - **Watches can go stale.** kube-rs sets no read timeout by default. A watch whose
   TCP connection is silently dropped is only noticed by the watcher's idle timeout
   (~290 s). The daemon must restart watches when a context recovers.
@@ -227,26 +230,24 @@ forward**. Other contexts stay idle: no client, no probes, no exec plugin calls.
 So opening the TUI never triggers a login to a cluster you are not using.
 
 **Building the client.** The actor builds a `kube::Client` from the kubeconfig
-context.
+context. An exec plugin is taken out of the client's settings first; the actor
+runs it itself (section 6.7).
 
 **Health probe.** The probe is `GET /version`, sent with the context's
 credentials.
 
 - The endpoint is readable for every authenticated user and returns a few bytes.
   It works in clusters with tight RBAC, where other probes might fail with 403.
-- Credentials are still checked:
-  - an exec plugin that fails (expired login) fails the request before it is sent;
-  - a token the server rejects returns 401.
-  
-  So `/version` covers both network and auth problems.
+- Credentials are still checked: a token the server rejects returns 401. So
+  `/version` covers both network and auth problems.
+- Without a token it is an anonymous request. Any answer, even 401, shows that
+  the API server is reachable, which decides whether the actor may log in.
 - The spike used exactly this probe, against staging (k3s 1.33) and orbstack.
 - Timeout 3 s. The probe runs every 5 s while healthy and every 2 s while not.
 - A healthy context turns unreachable only after two timeouts in a row; a single
   slow answer over VPN is not an outage. DNS and refused connections count at
   once.
 - Failures are classified as DNS, refused, timeout, TLS, or auth.
-- Auth errors that watches or port-forwards report (401) also set the context to
-  `AuthFailed`.
 
 **Watches.** The actor watches EndpointSlices and Services per namespace, only for
 namespaces with enabled forwards. The watches are reference-counted and start and
@@ -313,7 +314,7 @@ v2 implements the WebSocket port-forward protocol itself. kube-rs is only used t
 open the upgraded connection.
 
 **Upgrade.** `kube::core::Request::portforward(pod, &[port])` builds the request.
-`kube::Client::connect` sends it and handles TLS, auth (including exec plugins) and
+`kube::Client::connect` sends it and handles TLS, auth (section 6.7) and
 the WebSocket handshake (subprotocol `v4.channel.k8s.io`). Opening a stream times
 out after 10 s: over a silently dead network the handshake would otherwise hang
 until the health probe notices the outage (about 15 s, two probe timeouts).
@@ -403,17 +404,32 @@ and bind attempts. The derivation is table-tested in `core`.
 
 ### 6.7 Auth plugins
 
-kube-rs runs exec plugins such as `kubectl oidc-login get-token` synchronously,
-with stderr inherited. In the daemon, stdin is `/dev/null` and stderr goes to the
-log. That has three consequences:
+Exec plugins such as `kubectl oidc-login get-token` may log in through the
+browser. kube-rs would run them inside requests (section 4), so the daemon runs
+them itself:
 
-- The TUI is never disturbed by plugin output.
-- Browser-based logins still work, because the plugin opens the browser itself.
-- Plugins that need a TTY fail. The context then shows `AuthFailed` with the hint:
-  run `kubectl --context <name> get ns` once to log in.
-
-The plugin call blocks one runtime worker while it runs. The daemon therefore uses
-the multi-thread runtime.
+- Only the context actor's health probe runs the plugin: one run at a time, and
+  only while the API server answers. While it is unreachable, for example
+  without VPN, nothing runs and no browser opens.
+- The probe logs in when there is no token, when it expires within 60 s, or
+  when the API server rejects it. A layer in the client adds the token to every
+  request; watches and port-forwards never run the plugin.
+- The watches of a context with an exec plugin start after its first login.
+- After a failed login the probe stops, and the context stays `AuthFailed`.
+  Another attempt could open yet another browser tab while nobody is there.
+  Reconnecting the context (`r`, `kprtfwd reconnect`) tries again; so does a
+  change to its kubeconfig settings.
+- The plugin runs without a terminal: stdin is `/dev/null`, stderr is read for
+  the error, and `KUBERNETES_EXEC_INFO` says `interactive: false`. kubelogin
+  ignores that flag and opens the browser anyway, which is why the rules above
+  are needed. A login that takes longer than 5 minutes is stopped.
+- Errors name the plugin by its command and first argument, never the other
+  arguments: kubeconfigs pass client secrets there. Values of flags and
+  variables named like a secret are masked in the plugin's error text.
+- Plugins that return a client certificate instead of a token are not
+  supported yet.
+- Discovery and prune log in the same way, once per call, and only if the API
+  server answers.
 
 ### 6.8 Logging and events
 
@@ -664,7 +680,7 @@ These are shown in the INFO column and by `kprtfwd status`.
 |---|---|
 | DNS lookup of the API host fails | `API unreachable (DNS)`; header: `staging unreachable (DNS, VPN?)` |
 | refused or timed out | `API unreachable (timeout)` |
-| exec plugin failed or 401 | `login needed: kubectl --context staging get ns` |
+| login failed or rejected (401) | `login needed: reconnect (r) to log in` |
 | 403 on watch or port-forward | `forbidden: port-forward in namespace X` |
 | `EADDRINUSE` | `port busy: mysqld (pid 812)` |
 | service gone | `service not found (prune?)` |
@@ -679,6 +695,9 @@ These are shown in the INFO column and by `kprtfwd status`.
 - **engine:**
   - unit tests for the protocol framing (encode, decode, port header, error
     channel);
+  - login tests with a fake exec plugin and API server: no login while the API
+    server is unreachable, one login once it answers, none after a failed or
+    rejected login, and no secrets in the error;
   - cluster tests in `crates/engine/tests/cluster.rs`, run in CI against kind
     (job `cluster`) and locally against any throwaway cluster. They only run
     when `KPRTFWD_TEST_CONTEXT` is set; each creates and deletes its own
@@ -767,7 +786,7 @@ Risks:
 | Own protocol implementation misses edge cases | broken or stuck connections | kube-rs and the spike as reference; framing unit tests; kind tests; manual checks against every configured context |
 | A warm stream dies silently | one request after an idle phase fails | keeper task reads the stream; 60 s maximum age; dropped on any outage; HTTP services only |
 | A watch stays stale after a silent drop | connections go to a pod that is gone | restart watches on recovery; the watcher's idle timeout (~290 s) as a backstop |
-| An exec plugin blocks a runtime worker | stalls while a login runs | multi-thread runtime |
+| An exec plugin opens a browser tab per attempt | tabs pile up while the API server is unreachable or nobody logs in | the daemon runs the plugin itself: only while the API server answers, one at a time, not again after a failure (section 6.7) |
 | Many long-lived connections (watches, warm forwards) | load on the API server | watches only for namespaces with enabled forwards; warm forwards only while healthy |
 | Daemon and client versions differ after an upgrade | protocol errors | version check in the handshake, restart offer, persisted desired state |
 | v1 and v2 run at the same time | port conflicts | v2 reports the process holding a port |

@@ -578,7 +578,7 @@ fn print_forwards(snapshot: &Snapshot, views: &[&ForwardView]) {
 
 /// Why a forward is not ready, or its last error if that is recent.
 fn info(view: &ForwardView, context: &kprtfwd_core::ContextState) -> String {
-    let text = view.state.info(&view.forward.context, context);
+    let text = view.state.info(context);
     if !text.is_empty() {
         return text;
     }

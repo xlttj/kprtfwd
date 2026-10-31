@@ -10,7 +10,7 @@ use kube::api::ListParams;
 use kube::config::Kubeconfig;
 use kube::{Api, Client, ResourceExt};
 
-use crate::context::client_for;
+use crate::context::{answered, client_for, probe};
 use crate::errors::{Failure, classify};
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -40,7 +40,20 @@ pub fn contexts() -> Result<(Vec<String>, Option<String>), String> {
 /// The services in `context` whose namespace matches `namespace_filter` (`*`
 /// wildcards, empty for all), sorted by namespace and name.
 pub async fn services(context: &str, namespace_filter: &str) -> Result<Vec<ServiceInfo>, String> {
-    let client = client_for(context).await?;
+    let (client, login) = client_for(context).await?;
+    if let Some(login) = login {
+        // Log in only if the API server answers: a login may open the browser.
+        let answer = probe(&client).await;
+        if let Err(failure) = &answer
+            && !answered(&answer)
+        {
+            return Err(describe(failure, context));
+        }
+        login
+            .run()
+            .await
+            .map_err(|message| format!("login failed: {message}"))?;
+    }
     let filter = namespace_filter.trim();
     let all = filter.is_empty() || filter == "*";
 

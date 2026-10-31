@@ -3,6 +3,7 @@
 //! [`Engine::reconcile`] runs exactly the forwards it is given: one context
 //! actor per kubeconfig context in use, one forward actor per forward.
 
+mod auth;
 mod cache;
 mod context;
 pub mod discovery;

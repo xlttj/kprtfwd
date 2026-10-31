@@ -1261,14 +1261,17 @@ dependencies = [
  "futures",
  "hyper",
  "hyper-util",
+ "jiff",
  "k8s-openapi",
  "kprtfwd-core",
  "kube",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-tungstenite",
+ "tower",
  "tracing",
 ]
 

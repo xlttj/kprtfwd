@@ -12,6 +12,7 @@ bytes.workspace = true
 futures.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+jiff.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
 serde.workspace = true
@@ -19,7 +20,11 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
+tower.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

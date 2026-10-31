@@ -58,19 +58,18 @@ pub struct Endpoint {
 }
 
 impl NamespaceCache {
-    pub fn start(client: &Client, namespace: &str) -> Arc<Self> {
-        let cache = Arc::new(Self {
+    /// An empty cache; [`Self::restart`] starts its watches.
+    pub fn new(namespace: &str) -> Arc<Self> {
+        Arc::new(Self {
             namespace: namespace.to_owned(),
             services: Shared::default(),
             slices: Shared::default(),
             tasks: Mutex::new(Vec::new()),
-        });
-        cache.restart(client);
-        cache
+        })
     }
 
-    /// Starts the watches again. The cached objects stay until the new
-    /// listing replaces them.
+    /// Starts the watches, or starts them again. The cached objects stay
+    /// until the new listing replaces them.
     pub fn restart(&self, client: &Client) {
         let mut tasks = self.tasks.lock().unwrap();
         for task in tasks.drain(..) {

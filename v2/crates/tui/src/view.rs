@@ -256,7 +256,7 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Why a forward is not ready, or its last error if that is recent.
 fn info(view: &kprtfwd_proto::ForwardView, context: &ContextState) -> String {
-    let text = view.state.info(&view.forward.context, context);
+    let text = view.state.info(context);
     if !text.is_empty() {
         return text;
     }
