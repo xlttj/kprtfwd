@@ -23,7 +23,7 @@ EndpointSlice cache. As a result:
 The TUI is one plain list of all forwards across all contexts, built for fast
 keyboard use.
 
-The design is backed by a spike (`v2/spike/kube-forward`), see section 4.
+The design is backed by a spike, see section 4.
 
 ## 2. Why: what v1 runs into
 
@@ -69,8 +69,8 @@ Non-goals:
 
 ## 4. Evidence from the spike
 
-`v2/spike/kube-forward` (kube 4.2, k8s-openapi 0.28, tokio; about 390 lines)
-forwards one service natively, using kube-rs's `Portforwarder`. Results:
+The spike `v2/spike/kube-forward` (kube 4.2, k8s-openapi 0.28, tokio; about 390
+lines; removed in phase 3, it is in the git history) forwarded one service natively, using kube-rs's `Portforwarder`. Results:
 
 | Test | kubectl | Spike |
 |---|---|---|
@@ -151,19 +151,17 @@ Process model:
 Workspace layout:
 
 ```
-v2/
-  Cargo.toml          workspace
-  crates/
-    core/             domain types, state derivation, store, IDs, service types
-    proto/            IPC messages and framing, versioned
-    engine/           kube clients, context health, watches, listeners,
-                      port-forward protocol
-    daemon/           process lifecycle, IPC server, wiring engine <-> store
-    tui/              ratatui app
-    cli/              clap commands (thin; talk to the daemon)
-  kprtfwd/            binary: dispatches to tui, cli or daemon
-  docs/               this document
-  spike/              the spike; removed once the engine replaces it
+Cargo.toml            workspace
+crates/
+  core/               domain types, state derivation, store, IDs, service types
+  proto/              IPC messages and framing, versioned
+  engine/             kube clients, context health, logins, watches,
+                      listeners, port-forward protocol
+  daemon/             process lifecycle, IPC server, wiring engine <-> store
+  tui/                ratatui app
+  cli/                clap commands (thin; talk to the daemon)
+kprtfwd/              binary: dispatches to tui, cli or daemon
+docs/                 this document
 ```
 
 `core` has no async or Kubernetes dependencies, so the state logic is testable
@@ -738,7 +736,7 @@ These are shown in the INFO column and by `kprtfwd status`.
 | 2. TUI | list, filter, `+`/`-`, projects, pause, edit/add/delete, open/copy, events view, discovery, prune | every v1 feature is covered (parity checklist) |
 | 3. Release | move the workspace to the repo root, delete the Go code and `v2/spike`, Homebrew 2.0.0, README | 2.0.0 tagged, after two weeks of daily use without v1 |
 
-The v1 Go code stays on `main` and keeps shipping fixes until phase 3.
+The v1 Go code stayed on `main` and kept shipping fixes until phase 3.
 
 Status 2026-10-30: phases 0 to 2 are done, including kubeconfig watching,
 `kprtfwd logs` and the cluster tests, which pass locally against kind (twice,
@@ -762,6 +760,11 @@ quitting the TUI switches the forwards off unless `keep_forwards_running` is
 set. The move was checked with the previous build's daemon still running: it was
 stopped by its PID and its database copied.
 
+On 2026-10-31 the daemon took over running exec plugins (section 6.7), and
+phase 3 began: the Go code and the spike were removed, the workspace moved to
+the repository root, and the release workflow builds the Rust binaries. 2.0.0
+is not tagged yet, and the Homebrew tap still installs v1.
+
 ## 16. Decisions, risks, open questions
 
 Decisions (2026-10-30):
@@ -769,7 +772,7 @@ Decisions (2026-10-30):
 | Topic | Decision |
 |---|---|
 | Platforms | macOS and Linux; no Windows |
-| Repository | `v2/` subdirectory on `main` until release |
+| Repository | the Cargo workspace at the repository root; v1 (Go) is only in the git history |
 | Daemon start | on demand by the first client, idle exit after 10 minutes; no launchd/systemd unit |
 | Quitting the TUI | switches all forwards off and stops the daemon, as in v1; `keep_forwards_running = true` keeps them running |
 | Directory | `~/.config/kprtfwd` (or `$XDG_CONFIG_HOME/kprtfwd`), taken over from `~/.kprtfwd` once |
@@ -783,7 +786,7 @@ Risks:
 | Risk | Impact | Mitigation |
 |---|---|---|
 | One WebSocket per connection | +80–100 ms per new connection over VPN | warm forward (measured 87 ms vs kubectl 193 ms) |
-| Own protocol implementation misses edge cases | broken or stuck connections | kube-rs and the spike as reference; framing unit tests; kind tests; manual checks against every configured context |
+| Own protocol implementation misses edge cases | broken or stuck connections | kube-rs and the spike (git history) as reference; framing unit tests; kind tests; manual checks against every configured context |
 | A warm stream dies silently | one request after an idle phase fails | keeper task reads the stream; 60 s maximum age; dropped on any outage; HTTP services only |
 | A watch stays stale after a silent drop | connections go to a pod that is gone | restart watches on recovery; the watcher's idle timeout (~290 s) as a backstop |
 | An exec plugin opens a browser tab per attempt | tabs pile up while the API server is unreachable or nobody logs in | the daemon runs the plugin itself: only while the API server answers, one at a time, not again after a failure (section 6.7) |

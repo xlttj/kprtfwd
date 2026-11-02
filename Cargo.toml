@@ -1,8 +1,6 @@
 [workspace]
 resolver = "3"
 members = ["crates/core", "crates/engine", "crates/proto", "crates/daemon", "crates/cli", "crates/tui", "kprtfwd"]
-# The spike is a standalone experiment and is removed once the engine exists.
-exclude = ["spike/kube-forward"]
 
 [workspace.package]
 version = "2.0.0-dev"

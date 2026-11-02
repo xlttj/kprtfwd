@@ -9,48 +9,67 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
 
-      - name: Set up Go
-        uses: actions/setup-go@v6
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          go-version-file: go.mod
+          components: rustfmt, clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            echo "The following files are not gofmt-formatted:"
-            echo "$unformatted"
-            exit 1
-          fi
+        run: cargo fmt --all --check
 
-      - name: Vet
-        run: go vet ./...
-
-      - name: Build
-        run: go build ./...
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test
-        run: go test -race ./...
+        run: cargo test --workspace --locked
 
-  govulncheck:
+  audit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
-      - name: Set up Go
-        uses: actions/setup-go@v6
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
         with:
-          go-version-file: go.mod
-
-      # v1.8.0 and later need Go 1.26; go.mod pins Go 1.25.
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          tool: cargo-audit
 
       - name: Scan for known vulnerabilities
-        run: govulncheck ./...
+        run: cargo audit
+
+  cluster:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: kprtfwd
+
+      - name: Cluster tests
+        run: cargo test -p kprtfwd-engine --test cluster --locked -- --test-threads=1 --nocapture
+        env:
+          KPRTFWD_TEST_CONTEXT: kind-kprtfwd
+          KPRTFWD_TEST_PAUSE: docker pause kprtfwd-control-plane
+          KPRTFWD_TEST_RESUME: docker unpause kprtfwd-control-plane
