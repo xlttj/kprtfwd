@@ -4,85 +4,96 @@ on:
   push:
     tags:
       - 'v*'
+  # Builds without releasing, so changes to this workflow are tested.
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-release:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            asset: kprtfwd-darwin-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            asset: kprtfwd-darwin-amd64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            asset: kprtfwd-linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            asset: kprtfwd-linux-arm64
+    runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v5
-    
-    - name: Set up Go
-      uses: actions/setup-go@v6
-      with:
-        go-version-file: go.mod
-    
-    - name: Get the version
-      id: get_version
-      run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-    
-    - name: Build for macOS (Intel)
-      run: |
-        GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o kprtfwd-darwin-amd64 main.go
-        
-    - name: Build for macOS (Apple Silicon)
-      run: |
-        GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o kprtfwd-darwin-arm64 main.go
-        
-    - name: Build for Linux (amd64)
-      run: |
-        GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o kprtfwd-linux-amd64 main.go
-        
-    - name: Build for Linux (arm64)
-      run: |
-        GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o kprtfwd-linux-arm64 main.go
-        
-    - name: Build for Windows
-      run: |
-        GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o kprtfwd-windows-amd64.exe main.go
-    
-    - name: Calculate checksums
-      run: |
-        sha256sum kprtfwd-* > checksums.txt
-        cat checksums.txt
-    
-    - name: Create Release
-      uses: softprops/action-gh-release@v2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        name: Release ${{ steps.get_version.outputs.VERSION }}
-        draft: false
-        prerelease: false
-        files: |
-          kprtfwd-darwin-amd64
-          kprtfwd-darwin-arm64
-          kprtfwd-linux-amd64
-          kprtfwd-linux-arm64
-          kprtfwd-windows-amd64.exe
-          checksums.txt
-        body: |
-          ## Changes
-          
-          * Please see the git log for detailed changes
-          
-          ## Installation
-          
-          ### Homebrew (macOS)
-          ```bash
-          brew tap xlttj/kprtfwd
-          brew install kprtfwd
-          ```
-          
-          ### Manual Installation
-          1. Download the appropriate binary for your system
-          2. Make it executable: `chmod +x kprtfwd-*`
-          3. Move to your PATH: `mv kprtfwd-* /usr/local/bin/kprtfwd`
-          
-          ### Go Install
-          ```bash
-          go install github.com/xlttj/kprtfwd@${{ steps.get_version.outputs.VERSION }}
-          ```
+      - uses: actions/checkout@v5
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked -p kprtfwd --target ${{ matrix.target }}
+
+      - name: Name the binary
+        run: cp target/${{ matrix.target }}/release/kprtfwd ${{ matrix.asset }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Calculate checksums
+        run: |
+          sha256sum kprtfwd-* > checksums.txt
+          cat checksums.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.ref_name }}
+          files: |
+            kprtfwd-*
+            checksums.txt
+          body: |
+            ## Changes
+
+            See the git log for details.
+
+            ## Installation
+
+            Download the binary for your system, make it executable and put it on your `PATH`:
+
+            ```bash
+            chmod +x kprtfwd-darwin-arm64
+            mv kprtfwd-darwin-arm64 /usr/local/bin/kprtfwd
+            ```
+
+            `checksums.txt` lists the SHA-256 checksum of every binary.
+
+            ### From source
+
+            ```bash
+            cargo install --locked --git https://github.com/xlttj/kprtfwd --tag ${{ github.ref_name }} kprtfwd
+            ```
