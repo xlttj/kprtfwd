@@ -10,7 +10,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
-use common::{Home, NOT_FOUND, database, enabled, fake_api, forward, wait_until, write_database};
+use common::{
+    Children, Home, NOT_FOUND, database, enabled, fake_api, forward, wait_until, write_database,
+};
 use kprtfwd_core::Store;
 use kprtfwd_core::config::TEMPLATE;
 use kprtfwd_proto::{Client, Request, Response, Snapshot};
@@ -108,6 +110,45 @@ fn a_failed_take_over_is_tried_again() {
     let snapshot: Snapshot =
         serde_json::from_slice(&output.stdout).unwrap_or_else(|err| panic!("{err}: {output:?}"));
     assert_eq!(snapshot.forwards.len(), 1);
+}
+
+/// A crashed daemon leaves its socket behind; the next start replaces it.
+#[tokio::test]
+async fn a_stale_socket_is_replaced() {
+    let home = Home::new();
+    home.stale_socket();
+
+    let output = home.run(&["status", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    Client::connect(&home.socket())
+        .await
+        .expect("daemon serves");
+}
+
+/// Clients started together after a crash each start a daemon; one serves
+/// and the others give way, so no daemon runs unreachable on the database.
+#[tokio::test]
+async fn daemons_started_at_once_leave_one_running() {
+    let home = Home::new();
+    home.stale_socket();
+
+    let mut daemons = Children((0..8).map(|_| home.spawn_daemon()).collect());
+    let pid = home.connect_once_up().await.daemon_pid;
+    let serving = daemons.0.iter().position(|d| d.id() == pid);
+    let serving = serving.expect("the daemon that serves is one of ours");
+    for index in 0..daemons.0.len() {
+        if index != serving {
+            let status = daemons.exit_status(index).await;
+            assert!(status.success(), "a daemon that gave way: {status}");
+        }
+    }
+    assert!(daemons.0[serving].try_wait().unwrap().is_none(), "exited");
+    let written = std::fs::read_to_string(home.pid_file()).unwrap();
+    assert_eq!(written.trim(), pid.to_string());
+
+    let output = home.run(&["daemon", "stop"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(daemons.exit_status(serving).await.success());
 }
 
 const VERSION: &str = r#"{"major":"1","minor":"33","gitVersion":"v1.33.0","gitCommit":"","gitTreeState":"","buildDate":"","goVersion":"","compiler":"","platform":""}"#;

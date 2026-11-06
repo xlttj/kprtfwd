@@ -4,8 +4,8 @@
 //! forwards running.
 
 use std::collections::HashSet;
-use std::fs::{self, DirBuilder};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::fs::{self, DirBuilder, File, TryLockError};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -35,6 +35,9 @@ use tracing_subscriber::EnvFilter;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Exit after this long without enabled forwards and without clients.
 const IDLE_EXIT: Duration = Duration::from_secs(10 * 60);
+/// How long a daemon waits for the lock of the data directory while the
+/// daemon that holds it does not answer, as long as clients wait for a start.
+const LOCK_WAIT: Duration = Duration::from_secs(10);
 /// kube-rs logs every failed request as an error; outages are reported once,
 /// by the context state, instead.
 const DEFAULT_LOG_FILTER: &str =
@@ -60,11 +63,70 @@ pub fn run(options: Options) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let result = runtime.block_on(serve(&data_dir));
+    let locked = runtime.block_on(lock_data_dir(&data_dir));
+    let result = match locked {
+        Ok(Some(lock)) => {
+            let result = runtime.block_on(serve(&data_dir));
+            // Tasks still running hold the database and the listeners of
+            // forwards; they end before the next daemon gets the lock.
+            drop(runtime);
+            drop(lock);
+            result
+        }
+        Ok(None) => Ok(()),
+        Err(err) => Err(err),
+    };
     if let Err(err) = &result {
         tracing::error!("{err:#}");
     }
     result
+}
+
+/// Takes `daemon.lock` in the data directory, which a daemon holds from
+/// before it touches the socket until it has exited, so two daemons never
+/// share the database. While another daemon holds it, waits: one that is
+/// starting answers on the socket soon, and this one gives way (`None`); one
+/// that is exiting releases the lock soon. The file stays; removing it would
+/// let a daemon lock a file the next one no longer finds.
+async fn lock_data_dir(data_dir: &Path) -> Result<Option<File>> {
+    let path = data_dir.join("daemon.lock");
+    let socket = data_dir.join("daemon.sock");
+    let file = File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(err)) => {
+                return Err(err).with_context(|| format!("lock {}", path.display()));
+            }
+        }
+        match Client::connect(&socket).await {
+            Ok(other) => {
+                info!(pid = other.daemon_pid, "another daemon is running");
+                return Ok(None);
+            }
+            Err(err @ ClientError::ProtocolMismatch { .. }) => {
+                bail!("a daemon answers on {}, but: {err}", socket.display())
+            }
+            // Not bound yet, or no longer.
+            Err(_) => {}
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "another daemon holds {} but does not answer on {}",
+                path.display(),
+                socket.display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 fn init_logging(
@@ -231,7 +293,9 @@ async fn serve(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Binds the socket. Returns `None` if another daemon already serves it.
+/// Binds the socket. Returns `None` if another daemon already serves it: one
+/// of a build without the lock. Called with the lock held, so a socket nobody
+/// answers on is stale and no other daemon replaces it at the same time.
 async fn bind_socket(path: &Path) -> Result<Option<UnixListener>> {
     if path.exists() {
         match Client::connect(path).await {

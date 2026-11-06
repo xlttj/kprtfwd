@@ -181,10 +181,11 @@ Main dependencies:
 ### 6.1 Lifecycle
 
 - **Directory.** `~/.config/kprtfwd`, or `$XDG_CONFIG_HOME/kprtfwd`, holds
-  `config.toml`, the database, `daemon.sock`, `daemon.pid` and `logs/`. The
-  directory has mode 0700 and the socket 0600. `KPRTFWD_HOME` replaces the
-  directory, e.g. for tests. Unix socket paths are limited to about 100 bytes;
-  the CLI refuses longer ones and names `KPRTFWD_HOME` as the way out.
+  `config.toml`, the database, `daemon.sock`, `daemon.pid`, `daemon.lock` and
+  `logs/`. The directory has mode 0700 and the socket 0600. `KPRTFWD_HOME`
+  replaces the directory, e.g. for tests. Unix socket paths are limited to
+  about 100 bytes; the CLI refuses longer ones and names `KPRTFWD_HOME` as the
+  way out.
 - **Settings.** `config.toml`; the daemon writes a commented template on its
   first start. The only setting is `keep_forwards_running` (default `false`).
   Unknown keys and wrong types are errors: the TUI refuses to start and names
@@ -202,9 +203,17 @@ Main dependencies:
   in its own process group, with no terminal attached. If that process exits
   right away, the client reports it and names the log directory instead of
   waiting.
-- **Single instance.** On start the daemon binds the socket. If the socket exists
-  and a handshake succeeds, another daemon is running and this one exits. If the
-  connection fails, the socket is stale; the daemon removes and rebinds it.
+- **Single instance.** On start the daemon first takes an exclusive lock
+  (`flock`) on `daemon.lock` in the directory and holds it until it has
+  exited; the system releases it however the process ends. While another
+  daemon holds the lock, the new one waits: once the other answers on the
+  socket, the new one exits, and once the other has exited, the new one gets
+  the lock. It gives up after 10 s, as its client does. Only with the lock
+  does it look at the socket: if a handshake succeeds there, a daemon of a
+  build without the lock is running and this one exits; if the connection
+  fails, the socket is stale, and the daemon removes and rebinds it. So
+  clients that start daemons at the same time, also next to a stale socket,
+  leave one daemon on the database. The lock file stays in the directory.
 - **Start.**
   1. Raise the soft limit of open files to 10240, or to the hard limit if
      that is lower; a higher limit is kept. The daemon inherits the limit of
@@ -858,7 +867,9 @@ These are shown in the INFO column and by `kprtfwd status`.
   a temporary directory: quitting the last TUI switches the forwards off and
   lifts the pause, another client or `keep_forwards_running` keeps them, a
   daemon still running in `~/.kprtfwd` is stopped and its database copied,
-  and with a fake API server and exec plugin, `use-context`, `kubens` and a
+  a stale socket is replaced, eight daemons started at once on a stale
+  socket leave exactly one, whose PID is in `daemon.pid`, while the others
+  exit with 0, and with a fake API server and exec plugin, `use-context`, `kubens` and a
   rewrite of a user with env entries cause no reconnect and no login while a
   moved cluster causes exactly one; `status` shows a context and its forward
   `logging in` while the plugin waits; discovery does not propose a port that

@@ -13,8 +13,9 @@
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use kprtfwd_core::{Forward, ForwardId, Store};
@@ -132,6 +133,39 @@ impl Home {
         assert!(output.status.success(), "{output:?}");
     }
 
+    pub fn pid_file(&self) -> PathBuf {
+        self.data_dir().join("daemon.pid")
+    }
+
+    /// Leaves a socket file nobody listens on, as a daemon that crashed does.
+    pub fn stale_socket(&self) {
+        std::fs::create_dir_all(self.data_dir()).unwrap();
+        drop(UnixListener::bind(self.socket()).unwrap());
+        assert!(self.socket().exists());
+    }
+
+    /// Runs `daemon run` as a child of the test, which [`Children`] ends.
+    pub fn spawn_daemon(&self) -> Child {
+        self.command(&["daemon", "run"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("run kprtfwd daemon")
+    }
+
+    /// Connects as soon as a daemon serves, within 10 s.
+    pub async fn connect_once_up(&self) -> Client {
+        let started = Instant::now();
+        loop {
+            if let Ok(client) = Client::connect(&self.socket()).await {
+                return client;
+            }
+            assert!(started.elapsed() < Duration::from_secs(10), "no daemon");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Connects like the TUI does.
     pub async fn attach(&self) -> Client {
         let mut client = Client::connect(&self.socket()).await.expect("connect");
@@ -205,6 +239,39 @@ pub async fn wait_until(what: &str, done: impl Fn() -> bool) {
     while !done() {
         assert!(started.elapsed() < Duration::from_secs(10), "not {what}");
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Processes the test started itself; killed when it ends, also when it
+/// fails. Never any other process.
+#[derive(Default)]
+pub struct Children(pub Vec<Child>);
+
+impl Children {
+    /// Waits up to 10 s for the child at `index` to exit.
+    pub async fn exit_status(&mut self, index: usize) -> ExitStatus {
+        let started = Instant::now();
+        loop {
+            if let Some(status) = self.0[index].try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "process {} still runs",
+                self.0[index].id()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+impl Drop for Children {
+    fn drop(&mut self) {
+        for child in &mut self.0 {
+            // Does nothing for a child already waited for.
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
