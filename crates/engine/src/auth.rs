@@ -42,7 +42,22 @@ const MIN_SECRET: usize = 4;
 const MIN_TOKEN: usize = 32;
 
 /// Held by the plugin that runs; see [`turn`].
+#[cfg(not(test))]
 static TURN: Mutex<()> = Mutex::const_new(());
+
+// Each test runs on a thread of its own, with all its tasks, and must not
+// wait for the logins of the others.
+#[cfg(test)]
+thread_local! {
+    static TURN: &'static Mutex<()> = Box::leak(Box::new(Mutex::new(())));
+}
+
+fn running() -> &'static Mutex<()> {
+    #[cfg(not(test))]
+    return &TURN;
+    #[cfg(test)]
+    return TURN.with(|turn| *turn);
+}
 
 /// The right to run a plugin.
 pub struct Turn {
@@ -56,13 +71,13 @@ pub struct Turn {
 /// tab at a time, and the next plugin may find the first one's tokens in
 /// its cache.
 pub async fn turn() -> Turn {
-    match TURN.try_lock() {
-        Ok(running) => Turn {
-            _running: running,
+    match running().try_lock() {
+        Ok(guard) => Turn {
+            _running: guard,
             waited: false,
         },
         Err(_) => Turn {
-            _running: TURN.lock().await,
+            _running: running().lock().await,
             waited: true,
         },
     }
@@ -866,8 +881,9 @@ mod tests {
                 ("LINGER", lingering.to_str().unwrap()),
             ],
         ));
+        let turn = turn().await;
         let started = std::time::Instant::now();
-        let result = login.run(&turn().await).await;
+        let result = login.run(&turn).await;
         let took = started.elapsed();
         let pid = std::fs::read_to_string(&lingering).unwrap();
         std::process::Command::new("kill")
