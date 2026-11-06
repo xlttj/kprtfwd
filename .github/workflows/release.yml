@@ -26,10 +26,12 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-latest
             asset: kprtfwd-darwin-amd64
-          - target: x86_64-unknown-linux-gnu
+          # Static musl binaries run on every Linux, whatever its glibc.
+          # Each is built on a runner of its architecture, which runs it.
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             asset: kprtfwd-linux-amd64
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
             asset: kprtfwd-linux-arm64
     runs-on: ${{ matrix.os }}
@@ -41,11 +43,35 @@ jobs:
           rustup toolchain install stable --profile minimal --target ${{ matrix.target }} --no-self-update
           rustup default stable
 
+      # The C parts (bundled SQLite, ring) must be compiled against musl
+      # as well. cc picks no musl compiler by itself for aarch64.
+      - name: Set up musl
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
+          echo "TARGET_CC=musl-gcc" >> "$GITHUB_ENV"
+
       - name: Build
         run: cargo build --release --locked -p kprtfwd --target ${{ matrix.target }}
 
       - name: Name the binary
         run: cp target/${{ matrix.target }}/release/kprtfwd ${{ matrix.asset }}
+
+      - name: Check that the binary is static
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          file ${{ matrix.asset }}
+          ldd ${{ matrix.asset }} || true
+          if ! file ${{ matrix.asset }} | grep -Eq '(statically|static-pie) linked'; then
+            echo "::error::${{ matrix.asset }} is not statically linked"
+            exit 1
+          fi
+          if ldd ${{ matrix.asset }} 2>&1 | grep -q '=>'; then
+            echo "::error::${{ matrix.asset }} needs shared libraries"
+            exit 1
+          fi
+          ./${{ matrix.asset }} --version
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
