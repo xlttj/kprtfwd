@@ -47,19 +47,22 @@ struct Token {
 }
 
 impl Login {
-    /// Takes the exec plugin out of `auth`, if that is how the context logs
-    /// in. kube-rs prefers other credentials over the plugin, so with those
-    /// everything stays as it is.
+    /// Takes the exec plugin out of `auth`, so that kube-rs never runs it, and
+    /// returns it if that is how the context logs in. kube-rs prefers, in
+    /// this order, an auth provider, a username together with a password, a
+    /// token and a token file over the plugin; with one of those the plugin
+    /// is never used.
     pub fn take(auth: &mut AuthInfo) -> Option<Self> {
+        let exec = auth.exec.take()?;
         let other_credentials = auth.auth_provider.is_some()
-            || auth.username.is_some()
+            || (auth.username.is_some() && auth.password.is_some())
             || auth.token.is_some()
             || auth.token_file.is_some();
         if other_credentials {
             return None;
         }
         Some(Self {
-            exec: Arc::new(auth.exec.take()?),
+            exec: Arc::new(exec),
             token: Arc::default(),
         })
     }
@@ -450,20 +453,54 @@ mod tests {
 
     #[test]
     fn takes_the_plugin_only_if_it_is_the_login() {
-        let mut auth = AuthInfo {
+        let with_exec = |auth: AuthInfo| AuthInfo {
             exec: Some(exec("kubectl", &[], &[])),
-            ..Default::default()
+            ..auth
         };
-        assert!(Login::take(&mut auth).is_some());
-        assert!(auth.exec.is_none());
+        // kube-rs uses a username only together with a password, so with a
+        // username alone it would run the plugin itself.
+        for auth in [
+            AuthInfo::default(),
+            AuthInfo {
+                username: Some("admin".into()),
+                ..Default::default()
+            },
+        ] {
+            let mut auth = with_exec(auth);
+            assert!(Login::take(&mut auth).is_some(), "{auth:?}");
+            assert!(auth.exec.is_none());
+        }
 
-        let mut auth = AuthInfo {
-            exec: Some(exec("kubectl", &[], &[])),
-            token_file: Some("/token".into()),
-            ..Default::default()
-        };
-        assert!(Login::take(&mut auth).is_none());
-        assert!(auth.exec.is_some());
+        // Other credentials win; the plugin is still taken out, so that
+        // kube-rs never runs it.
+        for auth in [
+            AuthInfo {
+                username: Some("admin".into()),
+                password: Some("secret".to_owned().into()),
+                ..Default::default()
+            },
+            AuthInfo {
+                token: Some("abc".to_owned().into()),
+                ..Default::default()
+            },
+            AuthInfo {
+                token_file: Some("/token".into()),
+                ..Default::default()
+            },
+            AuthInfo {
+                auth_provider: Some(kube::config::AuthProviderConfig {
+                    name: "oidc".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ] {
+            let mut auth = with_exec(auth);
+            assert!(Login::take(&mut auth).is_none(), "{auth:?}");
+            assert!(auth.exec.is_none());
+        }
+
+        assert!(Login::take(&mut AuthInfo::default()).is_none());
     }
 
     #[test]
