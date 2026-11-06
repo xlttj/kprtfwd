@@ -11,7 +11,7 @@
 //! the token of the last successful run, or no credentials at all.
 
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -20,6 +20,8 @@ use hyper::header::{AUTHORIZATION, HeaderValue};
 use kube::client::Body;
 use kube::config::{AuthInfo, ExecAuthCluster, ExecConfig};
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
+use tokio::process::{Child, ChildStderr, ChildStdout};
 use tower::util::MapRequestLayer;
 
 /// Log in again this long before the token expires, as kube-rs does.
@@ -27,6 +29,9 @@ const REFRESH_BEFORE: Duration = Duration::from_secs(60);
 /// The longest a login may take. A browser login waits for the user;
 /// kubelogin gives up after 3 minutes.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// How long the plugin's output is read after it has exited. It is in the
+/// pipes by then; only a process the plugin started can keep them open.
+const AFTER_EXIT: Duration = Duration::from_millis(500);
 /// Values shorter than this stay in messages: replacing them would garble
 /// the text, and a secret is longer.
 const MIN_SECRET: usize = 4;
@@ -117,8 +122,10 @@ impl Login {
         })
     }
 
-    /// Runs the plugin and keeps the token it returns. Dropping the future
-    /// ends the plugin. The error never contains the plugin's arguments.
+    /// Runs the plugin and keeps the token it returns. The run ends when the
+    /// plugin exits, even if a process it started keeps its output open.
+    /// Dropping the future ends the plugin. The error never contains the
+    /// plugin's arguments.
     pub async fn run(&self) -> Result<(), String> {
         let name = self.name();
         let command = self
@@ -134,9 +141,9 @@ impl Login {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let output = match tokio::time::timeout(LOGIN_TIMEOUT, cmd.output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 let hint = self
                     .exec
                     .install_hint
@@ -146,6 +153,11 @@ impl Login {
                     .unwrap_or_default();
                 return Err(format!("{command} not found{hint}"));
             }
+            Err(err) => return Err(format!("cannot run {name}: {err}")),
+        };
+        let mut pipes = Pipes::of(&mut child);
+        let output = match tokio::time::timeout(LOGIN_TIMEOUT, pipes.output(&mut child)).await {
+            Ok(Ok(output)) => output,
             Ok(Err(err)) => return Err(format!("cannot run {name}: {err}")),
             Err(_) => {
                 return Err(format!(
@@ -174,6 +186,75 @@ impl Login {
             .iter()
             .fold(text.to_owned(), |text, secret| replace_word(&text, secret));
         mask_tokens(&text)
+    }
+}
+
+/// The plugin's stdout and stderr.
+///
+/// A process the plugin starts, such as a browser opened for the login, may
+/// inherit them and hold them open long after the plugin has exited. So the
+/// login ends when the plugin exits, not when the pipes close, and once
+/// dropped they are emptied in the background until every holder has closed
+/// them: closing them instead would make that process's writes fail, and
+/// leaving them unread could block it.
+struct Pipes {
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
+}
+
+impl Pipes {
+    fn of(child: &mut Child) -> Self {
+        Self {
+            stdout: child.stdout.take(),
+            stderr: child.stderr.take(),
+        }
+    }
+
+    /// Waits for the plugin to exit and returns what it wrote. Reads both
+    /// pipes meanwhile, so that it never blocks on a full one, and for at
+    /// most [`AFTER_EXIT`] once it has exited.
+    async fn output(&mut self, child: &mut Child) -> std::io::Result<Output> {
+        let (Some(stdout), Some(stderr)) = (&mut self.stdout, &mut self.stderr) else {
+            return Err(std::io::Error::other("the plugin's output is not piped"));
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let status = {
+            let reading = async {
+                let _ = tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
+            };
+            tokio::pin!(reading);
+            tokio::select! {
+                status = child.wait() => {
+                    // What the plugin wrote is in the pipes by now.
+                    let _ = tokio::time::timeout(AFTER_EXIT, &mut reading).await;
+                    status?
+                }
+                () = &mut reading => child.wait().await?,
+            }
+        };
+        Ok(Output {
+            status,
+            stdout: out,
+            stderr: err,
+        })
+    }
+}
+
+impl Drop for Pipes {
+    fn drop(&mut self) {
+        let (Some(mut stdout), Some(mut stderr)) = (self.stdout.take(), self.stderr.take()) else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let (mut out, mut err) = (tokio::io::sink(), tokio::io::sink());
+                let _ = tokio::join!(
+                    tokio::io::copy(&mut stdout, &mut out),
+                    tokio::io::copy(&mut stderr, &mut err),
+                );
+            });
+        }
     }
 }
 
@@ -387,7 +468,10 @@ pub(crate) mod fake {
 
     /// A plugin that appends its `KUBERNETES_EXEC_INFO` to `$RUNS` and then,
     /// by `$MODE`: prints the token "good" (`ok`), the token "bad" (`bad`),
-    /// or fails with its arguments on stderr (`fail`).
+    /// fails with its arguments on stderr (`fail`), or leaves a process
+    /// behind that holds its stdout and stderr, as a browser it opened
+    /// would, writes that process's ID to `$LINGER` and prints the token
+    /// "good" (`linger`).
     pub fn plugin(dir: &Path) -> PathBuf {
         let path = dir.join("plugin");
         std::fs::write(
@@ -401,6 +485,10 @@ case "$MODE" in
     exit 1 ;;
   bad)
     echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"bad"}}' ;;
+  linger)
+    sleep 30 &
+    echo $! > "$LINGER"
+    echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"good"}}' ;;
   *)
     echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"good","expirationTimestamp":"2999-01-01T00:00:00Z"}}' ;;
 esac
@@ -667,5 +755,35 @@ mod tests {
             missing.run().await.unwrap_err(),
             "/does/not/exist not found"
         );
+    }
+
+    /// A browser the plugin opens may inherit its stdout and stderr and keep
+    /// them open; the login still ends when the plugin exits.
+    #[tokio::test]
+    async fn ends_when_the_plugin_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = fake::plugin(dir.path());
+        let runs = dir.path().join("runs");
+        let lingering = dir.path().join("lingering");
+        let login = login(exec(
+            plugin.to_str().unwrap(),
+            &["get-token"],
+            &[
+                ("RUNS", runs.to_str().unwrap()),
+                ("MODE", "linger"),
+                ("LINGER", lingering.to_str().unwrap()),
+            ],
+        ));
+        let started = std::time::Instant::now();
+        let result = login.run().await;
+        let took = started.elapsed();
+        let pid = std::fs::read_to_string(&lingering).unwrap();
+        std::process::Command::new("kill")
+            .arg(pid.trim())
+            .status()
+            .unwrap();
+        result.unwrap();
+        assert!(login.has_token());
+        assert!(took < Duration::from_secs(5), "took {took:?}");
     }
 }

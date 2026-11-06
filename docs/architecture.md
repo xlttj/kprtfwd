@@ -440,6 +440,10 @@ them itself:
   the error, and `KUBERNETES_EXEC_INFO` says `interactive: false`. kubelogin
   ignores that flag and opens the browser anyway, which is why the rules above
   are needed. A login that takes longer than 5 minutes is stopped.
+- A login ends when the plugin exits. A browser it started may inherit its
+  stdout and stderr and keep them open; the daemon reads them for another
+  0.5 s at most, then empties them in the background until the browser
+  closes them, so that its writes neither block nor fail.
 - Errors name the plugin by its command and first argument, never the other
   arguments: kubeconfigs pass client secrets there. In the plugin's own error
   text every value it was given is masked, whatever its name, and so is
@@ -726,8 +730,9 @@ These are shown in the INFO column and by `kprtfwd status`.
     channel);
   - login tests with a fake exec plugin and API server: no login while the API
     server is unreachable, one login once it answers, none after a failed or
-    rejected login, and no secrets in the error. They probe ten times faster
-    than in use;
+    rejected login, no secrets in the error, and a login that ends when the
+    plugin exits although a process it left behind holds its output. They
+    probe ten times faster than in use;
   - unit tests with a fake API server on a local port (`fake.rs`): the probe's
     state machine with a given time and the rule for restarting watches;
     `Engine::reconcile` and `reconnect` with a kubeconfig of their own, never
