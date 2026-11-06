@@ -9,7 +9,6 @@ use std::time::{Duration, Instant, SystemTime};
 use kprtfwd_core::Forward;
 use kprtfwd_core::state::{Bind, ContextState, Observed, Target};
 use kprtfwd_core::svctype::{ServiceType, classify as service_type};
-use kube::Client;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, JoinSet};
@@ -234,6 +233,9 @@ async fn run(spec: Forward, context: Arc<Context>, shared: Arc<Shared>) {
     // just noise in its logs.
     let warm = service_type(&spec.service, spec.remote_port) == ServiceType::Http;
     let mut context_state = context.subscribe();
+    let mut healthy = context_state.borrow_and_update().is_healthy();
+    // The outage took a warm stream, so the recovery opens one again.
+    let mut rewarm = false;
     // Owned here, so stopping the forward also ends its connections.
     let mut connections = JoinSet::new();
     loop {
@@ -257,15 +259,41 @@ async fn run(spec: Forward, context: Arc<Context>, shared: Arc<Shared>) {
                 let state = context_state.borrow_and_update().clone();
                 if !state.is_healthy() {
                     // Opened before the outage, so most likely dead.
-                    shared.warm.lock().unwrap().take();
+                    let dropped = shared.warm.lock().unwrap().take().is_some();
+                    rewarm |= dropped || shared.refilling.load(Ordering::Acquire);
+                } else if !healthy {
+                    recovered(&spec, &context, &shared, std::mem::take(&mut rewarm));
                 }
                 if matches!(state, ContextState::Unreachable { .. }) {
                     close_connections(&spec, &shared, &mut connections, &state);
                 }
+                healthy = state.is_healthy();
             }
             Some(_) = connections.join_next() => {}
         }
     }
+}
+
+/// After an outage (docs §6.2, §6.5): a 403 from before is checked afresh
+/// by the next port-forward, and a warm stream the outage took is opened
+/// again. The context restarted its watches, but the cache keeps what they
+/// listed until they list again, so the pod is the one from before the
+/// outage; if it is gone, opening the stream fails as any refill may.
+fn recovered(spec: &Forward, context: &Arc<Context>, shared: &Arc<Shared>, rewarm: bool) {
+    if shared.forbidden.lock().unwrap().take().is_some() {
+        debug!(id = %spec.id, "port-forward to be checked again");
+    }
+    if !rewarm {
+        return;
+    }
+    let Some(endpoints) = context
+        .namespace(&spec.namespace)
+        .and_then(|cache| cache.endpoints(&spec.service, spec.remote_port).ok())
+    else {
+        return;
+    };
+    let target = shared.choose(&endpoints, spec);
+    refill(context.clone(), spec, target, shared.clone());
 }
 
 /// Ends the open connections once the context is declared unreachable. They
@@ -401,12 +429,7 @@ async fn connection(
     };
     shared.forbidden.lock().unwrap().take();
     if warm {
-        refill(
-            client,
-            spec.namespace.clone(),
-            target.clone(),
-            shared.clone(),
-        );
+        refill(context.clone(), &spec, target.clone(), shared.clone());
     }
 
     shared.active.fetch_add(1, Ordering::Relaxed);
@@ -430,29 +453,52 @@ async fn connection(
 }
 
 fn open_failed(spec: &Forward, shared: &Shared, err: &PortForwardError) {
-    if let PortForwardError::Connect(kube_err) = err
-        && let Failure::Forbidden(message) = classify(kube_err)
-    {
-        warn!(id = %spec.id, %message, "port-forward forbidden");
-        shared
-            .events
-            .push(format!("port-forward forbidden: {message}"));
-        *shared.forbidden.lock().unwrap() = Some(message);
-        return;
+    if !forbidden(spec, shared, err) {
+        shared.record_error(spec, err.to_string());
     }
-    shared.record_error(spec, err.to_string());
+}
+
+/// Remembers a port-forward the API server refused with 403, so the target
+/// shows it until a port-forward works or the context recovers. Returns
+/// whether it was one.
+fn forbidden(spec: &Forward, shared: &Shared, err: &PortForwardError) -> bool {
+    let PortForwardError::Connect(kube_err) = err else {
+        return false;
+    };
+    let Failure::Forbidden(message) = classify(kube_err) else {
+        return false;
+    };
+    warn!(id = %spec.id, %message, "port-forward forbidden");
+    shared
+        .events
+        .push(format!("port-forward forbidden: {message}"));
+    *shared.forbidden.lock().unwrap() = Some(message);
+    true
 }
 
 /// Opens the next warm stream in the background, unless one is already being
-/// opened (a browser opens several connections at once).
-fn refill(client: Client, namespace: String, target: Endpoint, shared: Arc<Shared>) {
+/// opened (a browser opens several connections at once). It is kept only
+/// while the context is healthy: one that opened as an outage began goes over
+/// a connection that is most likely dead.
+fn refill(context: Arc<Context>, spec: &Forward, target: Endpoint, shared: Arc<Shared>) {
+    let Some(client) = context.client().cloned() else {
+        return;
+    };
     if shared.refilling.swap(true, Ordering::AcqRel) {
         return;
     }
+    let spec = spec.clone();
     tokio::spawn(async move {
-        match portforward::open(&client, &namespace, &target.pod, target.port).await {
+        match portforward::open(&client, &spec.namespace, &target.pod, target.port).await {
+            Ok(_) if !context.state().is_healthy() => {
+                debug!(id = %spec.id, "warm stream dropped: context not healthy");
+            }
             Ok(stream) => shared.store_warm(target, stream),
-            Err(err) => debug!(%err, "cannot open warm stream"),
+            Err(err) => {
+                if !forbidden(&spec, &shared, &err) {
+                    debug!(id = %spec.id, %err, "cannot open warm stream");
+                }
+            }
         }
         shared.refilling.store(false, Ordering::Release);
     });
@@ -599,6 +645,16 @@ mod tests {
                 .filter(|stream| stream.open)
                 .map(|stream| stream.number)
                 .collect()
+        }
+
+        /// The port-forward requests so far; a recovery also restarts the
+        /// watches, whose requests do not count.
+        fn port_forwards(&self) -> usize {
+            self.api
+                .requests()
+                .iter()
+                .filter(|request| request.contains("/portforward"))
+                .count()
         }
 
         /// A warm stream is stored and no other is being opened.
@@ -865,6 +921,117 @@ mod tests {
         );
     }
 
+    /// A 403 from before an outage is checked afresh after it: the target no
+    /// longer shows it, and the next port-forward finds whether it holds.
+    #[tokio::test]
+    async fn a_forbidden_port_forward_is_checked_again_after_an_outage() {
+        let forbidden = Arc::new(AtomicBool::new(true));
+        let reply = {
+            let forbidden = forbidden.clone();
+            move |_: &fake::Request| {
+                if forbidden.load(Ordering::Relaxed) {
+                    Reply::Json(403, status(403, "pods \"db-0\" is forbidden"))
+                } else {
+                    Reply::Kubelet(Kubelet::Echo)
+                }
+            }
+        };
+        let test = Test::start("db", 5432, &[("db-0", true)], reply).await;
+        let is_forbidden = |t: &Test| matches!(t.observe().target, Target::Forbidden(_));
+        assert_eq!(test.send("a").await, "");
+        assert!(is_forbidden(&test));
+
+        // A login state is no outage of the API server, but it is not
+        // healthy either; the recovery from it checks again too.
+        for outage in [unreachable(), ContextState::LoggingIn] {
+            test.context.force_state(outage);
+            // The forward sees the outage before the recovery.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            test.context.force_state(healthy());
+            test.wait("checked again", |t| {
+                t.observe().target == Target::Endpoints { ready: 1, total: 1 }
+            })
+            .await;
+            assert_eq!(test.send("b").await, "");
+            assert!(is_forbidden(&test));
+        }
+
+        forbidden.store(false, Ordering::Relaxed);
+        test.context.force_state(unreachable());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        test.context.force_state(healthy());
+        test.wait("checked again", |t| !is_forbidden(t)).await;
+        assert_eq!(test.send("c").await, "db-0#1:c");
+    }
+
+    /// The warm stream that an outage took is opened again after it, which
+    /// checks the port-forward at once: a 403 shows without a connection.
+    #[tokio::test]
+    async fn the_warm_stream_after_an_outage_finds_a_forbidden_port_forward() {
+        let forbidden = Arc::new(AtomicBool::new(false));
+        let reply = {
+            let forbidden = forbidden.clone();
+            move |_: &fake::Request| {
+                if forbidden.load(Ordering::Relaxed) {
+                    Reply::Json(403, status(403, "pods \"web-0\" is forbidden"))
+                } else {
+                    Reply::Kubelet(Kubelet::Echo)
+                }
+            }
+        };
+        let test = Test::start("frontend", 80, &[("web-0", true)], reply).await;
+        assert_eq!(test.send("a").await, "web-0#1:a");
+        test.wait("a warm stream", |t| {
+            t.warm_ready() && t.open_streams() == [2]
+        })
+        .await;
+
+        test.context.force_state(unreachable());
+        test.wait("no warm stream", |t| t.open_streams().is_empty())
+            .await;
+        forbidden.store(true, Ordering::Relaxed);
+        test.context.force_state(healthy());
+        test.wait("forbidden", |t| {
+            matches!(t.observe().target, Target::Forbidden(_))
+        })
+        .await;
+        assert!(test.handle.shared.warm.lock().unwrap().is_none());
+        assert_eq!(test.port_forwards(), 3);
+        assert_eq!(test.handle.last_error(), None);
+    }
+
+    /// A forward that had no warm stream when the outage began opens none
+    /// after it, as it would have none without the outage.
+    #[tokio::test]
+    async fn no_warm_stream_after_an_outage_without_one() {
+        let test = Test::start("frontend", 80, &[("web-0", true)], echo).await;
+        test.context.force_state(unreachable());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        test.context.force_state(healthy());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(test.port_forwards(), 0, "{:?}", test.api.requests());
+    }
+
+    #[tokio::test]
+    async fn a_warm_stream_opened_during_an_outage_is_not_kept() {
+        let api = FakeApi::start(echo).await;
+        let context = Context::fake(api.client(), unreachable());
+        let shared = Arc::new(Shared::new(EventLog::default()));
+        refill(
+            context,
+            &spec("frontend", 80, 18080),
+            endpoint("web-0"),
+            shared.clone(),
+        );
+        let started = Instant::now();
+        while shared.refilling.load(Ordering::Acquire) || api.streams().iter().any(|s| s.open) {
+            assert!(started.elapsed() < Duration::from_secs(5), "stream kept");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(api.streams().len(), 1);
+        assert!(shared.warm.lock().unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn the_error_channel_becomes_the_last_error() {
         let text = "error forwarding port 8080 to pod db-0: connection refused";
@@ -908,11 +1075,16 @@ mod tests {
         .await;
         assert_eq!(test.api.streams()[4].pod, "web-1");
 
-        // An outage drops it too.
+        // An outage drops it too, and the recovery opens it again.
         test.context.force_state(unreachable());
         test.wait("no warm stream", |t| t.open_streams().is_empty())
             .await;
         test.context.force_state(healthy());
+        test.wait("a warm stream after the outage", |t| {
+            t.warm_ready() && t.open_streams() == [6]
+        })
+        .await;
+        assert_eq!(test.api.streams()[5].pod, "web-1");
         assert_eq!(test.send("d").await, "web-1#6:d");
 
         // So does stopping the forward.

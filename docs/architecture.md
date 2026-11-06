@@ -275,7 +275,10 @@ stop as forwards are enabled and disabled.
 
 1. Restart all watches, because a silently dropped watch can stay stale for up to
    ~290 s.
-2. Then signal the forwards to open new warm forwards.
+2. Then signal the forwards. A forward whose warm forward the outage took opens a
+   new one, to the pod its next connection would use; the cache keeps its objects
+   until the watches have listed again, so that is the pod from before the
+   outage. A remembered 403 is cleared, so the next port-forward checks it again.
 
 **State.** The actor publishes its `ContextState` through a `tokio::sync::watch`
 channel.
@@ -318,7 +321,10 @@ of time for the next one, and kept for at most 60 s.
   connection is just noise in the server's logs, and server-first protocols such
   as MySQL would send their greeting into a stream nobody reads yet.
 - It is discarded when the pod changes, when the context has an outage, when it
-  receives anything before it is used, or after 60 s.
+  receives anything before it is used, or after 60 s. One that finishes opening
+  while the context is not healthy is not kept. After an outage that took it, it
+  is opened again (section 6.2); a 403 for it marks the forward forbidden, as
+  one for a connection does.
 
 There is no setting for this either.
 
@@ -788,8 +794,9 @@ These are shown in the INFO column and by `kprtfwd status`.
     the forward actor through a fake kubelet: pod choice and the move to
     another pod, connections closed at once while not ready, open connections
     closed once the context is unreachable but not while it logs in, a refused
-    port-forward, the error channel, warm streams and when they are dropped,
-    the `::1` listener and a busy port;
+    port-forward and its check after an outage, the error channel, warm
+    streams and when they are dropped or opened again after an outage, the
+    `::1` listener and a busy port;
   - cluster tests in `crates/engine/tests/cluster.rs`, run in CI against kind
     (job `cluster`) and locally against any throwaway cluster. They only run
     when `KPRTFWD_TEST_CONTEXT` is set; each creates and deletes its own
