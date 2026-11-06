@@ -250,11 +250,17 @@ Main dependencies:
   the same reason a kubeconfig that cannot be parsed is reported by line and
   column only, never with the lines around the error.
 - **Stop.** `kprtfwd daemon stop`, SIGTERM, the idle exit, or the last TUI
-  quitting: close listeners, close forwards, close the database. Only the last
-  one switches the forwards off first. The socket and `daemon.pid` are removed
-  on every exit once the socket is bound, also when the start fails (a failed
-  take-over of `~/.kprtfwd`, a database that cannot be opened); the lock goes
-  last, with the process.
+  quitting. The daemon first closes its socket and removes the file, so a
+  client from then on finds no daemon and starts the next one, which waits
+  for the lock; a connection that arrived just before is reset. Then it
+  waits for a request still in progress, closes forwards and the database,
+  removes `daemon.pid`, and the lock goes last, with the process. Only the
+  last TUI quitting switches the forwards off, and only if no TUI attached
+  while the daemon waited for that request. The daemon answers `Shutdown`
+  before it exits, and `daemon stop` returns once the socket is gone and
+  the lock is free. The socket and `daemon.pid` are removed on every exit
+  once the socket is bound, also when the start fails (a failed take-over
+  of `~/.kprtfwd`, a database that cannot be opened).
 - **Upgrade.** Clients compare versions in the handshake. A daemon of another
   version is reported with the hint `kprtfwd daemon restart`; the desired state
   is persisted, so forwards come back on their own. The daemon writes its PID to
@@ -876,6 +882,8 @@ These are shown in the INFO column and by `kprtfwd status`.
   failed take-over leaves no socket and is tried again on the next start; a
   stale socket is replaced, eight daemons started at once on a stale socket
   leave exactly one, whose PID is in `daemon.pid`, while the others exit with 0;
+  a client that connects while the daemon exits after the last TUI quit, here
+  waiting for the database the test holds, is told at once that no daemon runs;
   with a 400 ms idle exit the daemon stays while a client is connected and exits
   after it left, and a database it cannot read (a renamed table) keeps it
   running until the table is back; SIGTERM and `daemon stop` (exit code 0)

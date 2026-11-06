@@ -17,7 +17,7 @@ use common::{
 };
 use kprtfwd_core::Store;
 use kprtfwd_core::config::TEMPLATE;
-use kprtfwd_proto::{Client, Request, Response, Snapshot};
+use kprtfwd_proto::{Client, ClientError, Request, Response, Snapshot};
 
 #[tokio::test]
 async fn quitting_the_last_tui_switches_the_forwards_off() {
@@ -34,7 +34,7 @@ async fn quitting_the_last_tui_switches_the_forwards_off() {
     assert!(snapshot.forwards[0].forward.enabled);
 
     drop(second);
-    wait_until("stopped", || !home.socket().exists()).await;
+    wait_until("stopped", || gone(&home)).await;
     let store = Store::snapshot(&db).unwrap();
     assert!(!store.forwards().unwrap()[0].enabled);
     assert!(!store.paused().unwrap(), "the pause stays on");
@@ -42,6 +42,37 @@ async fn quitting_the_last_tui_switches_the_forwards_off() {
         std::fs::read_to_string(home.data_dir().join("config.toml")).unwrap(),
         TEMPLATE
     );
+}
+
+/// While the daemon exits after the last TUI quit, a client is told at once
+/// that no daemon runs, so it starts the next one, which waits for the lock.
+/// It must not wait on a socket nobody accepts on and then read "another
+/// version". Here switching the forwards off waits for the database, which
+/// the test holds.
+#[tokio::test]
+async fn a_client_during_the_exit_finds_no_daemon() {
+    let home = Home::new();
+    database(&home.db());
+    home.start_daemon();
+    let tui = home.attach().await;
+    let sql = rusqlite::Connection::open(home.db()).unwrap();
+    sql.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    drop(tui);
+    let exiting = || daemon_log(&home).contains("switching all forwards off");
+    wait_until("exiting", exiting).await;
+    let socket = home.socket();
+    let connect = Client::connect(&socket);
+    match tokio::time::timeout(Duration::from_secs(2), connect).await {
+        Ok(Err(ClientError::NotRunning(_))) => {}
+        Ok(Ok(_)) => panic!("served while exiting"),
+        Ok(Err(err)) => panic!("{err}"),
+        Err(_) => panic!("no answer while the daemon exits"),
+    }
+
+    sql.execute_batch("COMMIT").unwrap();
+    wait_until("stopped", || gone(&home)).await;
+    assert!(!enabled(&home.db()));
 }
 
 #[tokio::test]
@@ -246,7 +277,8 @@ async fn sigterm_and_daemon_stop_clean_up() {
     let output = home.run(&["daemon", "stop"]);
     assert!(output.status.success(), "{output:?}");
     assert_eq!(String::from_utf8_lossy(&output.stdout), "daemon stopped\n");
-    wait_until("stopped", || gone(&home)).await;
+    // `daemon stop` returns once the daemon released its lock.
+    assert!(gone(&home), "daemon stop returned early");
     assert!(enabled(&home.db()), "daemon stop switched the forwards off");
 }
 

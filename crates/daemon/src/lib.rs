@@ -235,7 +235,7 @@ async fn serve(data_dir: &Path) -> Result<()> {
     let mut idle_check = tokio::time::interval(idle_check(idle_exit));
     let mut idle_since: Option<Instant> = None;
 
-    loop {
+    let last_tui_quit = loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
@@ -251,16 +251,16 @@ async fn serve(data_dir: &Path) -> Result<()> {
             },
             _ = terminate.recv() => {
                 info!("terminated");
-                break;
+                break false;
             }
             _ = interrupt.recv() => {
                 info!("interrupted");
-                break;
+                break false;
             }
             _ = hangup.recv() => debug!("ignoring SIGHUP"),
             () = shutdown.notified() => {
                 info!("shutdown requested");
-                break;
+                break false;
             }
             () = tuis.last_left.notified() => {
                 if tuis.count.load(Ordering::SeqCst) > 0 {
@@ -270,11 +270,7 @@ async fn serve(data_dir: &Path) -> Result<()> {
                     debug!("last TUI quit, forwards keep running");
                     continue;
                 }
-                info!("last TUI quit, switching all forwards off");
-                if let Err(err) = daemon.lock().await.switch_all_off() {
-                    warn!(%err, "cannot switch the forwards off");
-                }
-                break;
+                break true;
             }
             _ = idle_check.tick() => {
                 // A failed read must not end a daemon that may run forwards.
@@ -287,13 +283,32 @@ async fn serve(data_dir: &Path) -> Result<()> {
                     idle_since = None;
                 } else if idle_since.get_or_insert_with(Instant::now).elapsed() >= idle_exit {
                     info!("nothing to do, exiting");
-                    break;
+                    break false;
                 }
             }
         }
-    }
+    };
 
-    daemon.lock().await.engine.shutdown();
+    // Closed first, before waiting for the lock: a client from now on finds
+    // no daemon and starts the next one, which waits for the lock of the
+    // data directory, instead of waiting for an answer that never comes.
+    drop(listener);
+    files.remove_socket();
+    let mut daemon = daemon.lock().await;
+    if last_tui_quit {
+        // A TUI that attached while the lock was busy keeps the forwards,
+        // and finds them on the next daemon.
+        if tuis.count.load(Ordering::SeqCst) > 0 {
+            info!("last TUI quit, another attached meanwhile; forwards keep running");
+        } else {
+            info!("last TUI quit, switching all forwards off");
+            if let Err(err) = daemon.switch_all_off() {
+                warn!(%err, "cannot switch the forwards off");
+            }
+        }
+    }
+    daemon.engine.shutdown();
+    drop(daemon);
     drop(files);
     info!("daemon stopped");
     Ok(())
@@ -304,6 +319,12 @@ async fn serve(data_dir: &Path) -> Result<()> {
 struct DaemonFiles {
     socket: PathBuf,
     pid: PathBuf,
+}
+
+impl DaemonFiles {
+    fn remove_socket(&self) {
+        let _ = fs::remove_file(&self.socket);
+    }
 }
 
 impl Drop for DaemonFiles {
@@ -465,11 +486,9 @@ async fn serve_client(
             }
         };
         let id = message.id;
+        let shutdown_requested = matches!(message.request, Request::Shutdown);
         let result = match message.request {
-            Request::Shutdown => {
-                shutdown.notify_one();
-                Ok(Response::Done)
-            }
+            Request::Shutdown => Ok(Response::Done),
             Request::Attach => {
                 attached.get_or_insert_with(|| Attached::new(&tuis));
                 Ok(Response::Done)
@@ -494,7 +513,13 @@ async fn serve_client(
             Ok(response) => ServerMessage::Response { id, response },
             Err(message) => ServerMessage::Error { id, message },
         };
-        if write_message(&mut writer, &reply).await.is_err() {
+        let written = write_message(&mut writer, &reply).await;
+        // Answered first: the daemon exits at once, and ending the runtime
+        // ends this task too.
+        if shutdown_requested {
+            shutdown.notify_one();
+        }
+        if written.is_err() {
             return;
         }
     }

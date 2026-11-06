@@ -186,7 +186,11 @@ pub async fn connect_or_start(socket: &Path, exe: &Path) -> Result<Client, Clien
 /// PID in `pid_file`. Returns `false` if no daemon was running.
 pub async fn stop_daemon(socket: &Path, pid_file: &Path) -> Result<bool, ClientError> {
     match Client::connect(socket).await {
-        Ok(mut client) => client.act(Request::Shutdown).await?,
+        Ok(mut client) => match client.act(Request::Shutdown).await {
+            // A daemon of an earlier build may exit before its answer.
+            Ok(()) | Err(ClientError::Closed) => {}
+            Err(err) => return Err(err),
+        },
         Err(ClientError::NotRunning(_)) => return Ok(false),
         Err(ClientError::Incompatible | ClientError::ProtocolMismatch { .. }) => {
             let pid = std::fs::read_to_string(pid_file)
@@ -205,9 +209,11 @@ pub async fn stop_daemon(socket: &Path, pid_file: &Path) -> Result<bool, ClientE
         }
         Err(err) => return Err(err),
     }
-    // The daemon removes its socket as the last step.
+    // The daemon removes its socket first and releases the lock of its
+    // directory last, with the process.
+    let lock = socket.with_file_name("daemon.lock");
     for _ in 0..100 {
-        if !socket.exists() {
+        if !socket.exists() && unlocked(&lock) {
             return Ok(true);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -216,4 +222,11 @@ pub async fn stop_daemon(socket: &Path, pid_file: &Path) -> Result<bool, ClientE
         "the daemon on {} did not stop within 5 s",
         socket.display()
     )))
+}
+
+/// Whether no daemon holds the lock file `path`. Builds before the lock have
+/// no such file, and one that cannot be opened cannot be checked; both count
+/// as unlocked. Holds the lock only for the check.
+fn unlocked(path: &Path) -> bool {
+    std::fs::File::open(path).map_or(true, |file| file.try_lock().is_ok())
 }
