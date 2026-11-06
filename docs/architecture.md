@@ -749,7 +749,12 @@ Keys:
 | `l` | events of the selected forward, the newest at the bottom; `j k`, `PgUp PgDn`, `g G` scroll back |
 | `?` | key help |
 | `ctrl+l` | redraw the screen |
-| `q` | quit and switch all forwards off; with `keep_forwards_running` they keep running |
+| `q`, `ctrl+c` | quit and switch all forwards off; with `keep_forwards_running` they keep running |
+
+A key with `ctrl` or `alt` does nothing unless it is named here, so `ctrl+q`
+does not quit and `ctrl+y` does not confirm a delete. In text inputs (the
+filter, the forms, a project's name) `backspace` or `ctrl+h` deletes a
+character, `ctrl+w` a word and `ctrl+u` the whole input.
 
 **Projects are made from the list.** Filter until the list shows what belongs
 together, then `p`:

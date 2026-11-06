@@ -423,7 +423,7 @@ impl App {
                 Vec::new()
             }
             Msg::Key(key) => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                if ctrl(key, 'c') {
                     self.quit = true;
                     return Vec::new();
                 }
@@ -435,7 +435,7 @@ impl App {
                     Mode::Discovery(step) => self.discovery_key(key, step),
                     Mode::Events { id, entries, back } => self.events_key(key, id, entries, back),
                     Mode::Confirm { cmd, .. } => {
-                        if key.code == KeyCode::Char('y') {
+                        if plain(key) == KeyCode::Char('y') {
                             vec![cmd]
                         } else {
                             Vec::new()
@@ -466,7 +466,7 @@ impl App {
 
     fn list_key(&mut self, key: KeyEvent) -> Vec<Cmd> {
         let page = self.list.rows.get().max(1) as isize;
-        match key.code {
+        match plain(key) {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
@@ -627,7 +627,7 @@ impl App {
     ) -> Vec<Cmd> {
         let page = self.popup.rows.get().max(1);
         let oldest = entries.len().saturating_sub(page);
-        let back = match key.code {
+        let back = match plain(key) {
             KeyCode::Esc | KeyCode::Char('q' | 'l') => return Vec::new(),
             KeyCode::Up | KeyCode::Char('k') => back + 1,
             KeyCode::Down | KeyCode::Char('j') => back.saturating_sub(1),
@@ -646,13 +646,9 @@ impl App {
     }
 
     fn filter_key(&mut self, key: KeyEvent) -> Vec<Cmd> {
-        match key.code {
+        match plain(key) {
             KeyCode::Enter => return Vec::new(),
             KeyCode::Esc => self.filter.clear(),
-            KeyCode::Backspace => {
-                self.filter.pop();
-                self.mode = Mode::Filter;
-            }
             KeyCode::Up => {
                 self.move_selection(-1);
                 self.mode = Mode::Filter;
@@ -661,11 +657,10 @@ impl App {
                 self.move_selection(1);
                 self.mode = Mode::Filter;
             }
-            KeyCode::Char(c) => {
-                self.filter.push(c);
+            _ => {
+                edit(&mut self.filter, key, |_| true);
                 self.mode = Mode::Filter;
             }
-            _ => self.mode = Mode::Filter,
         }
         self.keep_selection();
         Vec::new()
@@ -676,7 +671,7 @@ impl App {
         let projects = &self.snapshot.projects;
 
         if let Some(mut name) = naming {
-            match key.code {
+            match plain(key) {
                 KeyCode::Esc => {}
                 KeyCode::Enter if !name.trim().is_empty() => {
                     let name = name.trim().to_owned();
@@ -694,23 +689,8 @@ impl App {
                         },
                     }];
                 }
-                KeyCode::Backspace => {
-                    name.pop();
-                    self.mode = Mode::Projects {
-                        selected,
-                        naming: Some(name),
-                    };
-                    return Vec::new();
-                }
-                KeyCode::Char(c) => {
-                    name.push(c);
-                    self.mode = Mode::Projects {
-                        selected,
-                        naming: Some(name),
-                    };
-                    return Vec::new();
-                }
                 _ => {
+                    edit(&mut name, key, |_| true);
                     self.mode = Mode::Projects {
                         selected,
                         naming: Some(name),
@@ -731,7 +711,7 @@ impl App {
             naming: None,
         };
         let name = projects.get(selected).map(|p| p.name.clone());
-        match (key.code, name) {
+        match (plain(key), name) {
             (KeyCode::Esc | KeyCode::Char('q' | 'p'), _) => return Vec::new(),
             (KeyCode::Up | KeyCode::Char('k'), _) => self.mode = stay(selected.saturating_sub(1)),
             (KeyCode::Down | KeyCode::Char('j'), _) => self.mode = stay((selected + 1).min(last)),
@@ -800,16 +780,12 @@ impl App {
 
     fn form_key(&mut self, key: KeyEvent, mut form: Form) -> Vec<Cmd> {
         let numeric = form.focus >= 3;
-        match key.code {
+        match plain(key) {
             KeyCode::Esc => return Vec::new(),
             KeyCode::Tab | KeyCode::Down => form.focus = (form.focus + 1) % FORM_LABELS.len(),
             KeyCode::BackTab | KeyCode::Up => {
                 form.focus = (form.focus + FORM_LABELS.len() - 1) % FORM_LABELS.len();
             }
-            KeyCode::Backspace => {
-                form.fields[form.focus].pop();
-            }
-            KeyCode::Char(c) if !numeric || c.is_ascii_digit() => form.fields[form.focus].push(c),
             KeyCode::Enter => match self.form_forward(&form) {
                 Ok(forward) => {
                     let success = match &form.editing {
@@ -827,7 +803,10 @@ impl App {
                 }
                 Err(err) => form.error = Some(err),
             },
-            _ => {}
+            _ => {
+                let field = &mut form.fields[form.focus];
+                edit(field, key, |c| !numeric || c.is_ascii_digit());
+            }
         }
         self.mode = Mode::Form(form);
         Vec::new()
@@ -877,18 +856,18 @@ impl App {
         let mut keep = |step| self.mode = Mode::Discovery(step);
         match step {
             Discovery::Loading(what) => {
-                if key.code != KeyCode::Esc {
+                if plain(key) != KeyCode::Esc {
                     keep(Discovery::Loading(what));
                 }
             }
             Discovery::Listing { context, request } => {
                 // Esc leaves; the answer will find nothing waiting for it.
-                if key.code != KeyCode::Esc {
+                if plain(key) != KeyCode::Esc {
                     keep(Discovery::Listing { context, request });
                 }
             }
             Discovery::Failed(_) => {}
-            Discovery::Contexts { names, selected } => match key.code {
+            Discovery::Contexts { names, selected } => match plain(key) {
                 KeyCode::Esc => {}
                 KeyCode::Up | KeyCode::Char('k') => keep(Discovery::Contexts {
                     selected: selected.saturating_sub(1),
@@ -904,7 +883,7 @@ impl App {
                 }),
                 _ => keep(Discovery::Contexts { names, selected }),
             },
-            Discovery::Namespace { context, mut input } => match key.code {
+            Discovery::Namespace { context, mut input } => match plain(key) {
                 KeyCode::Esc => {}
                 KeyCode::Enter => {
                     self.discoveries += 1;
@@ -919,15 +898,10 @@ impl App {
                         request,
                     }];
                 }
-                KeyCode::Backspace => {
-                    input.pop();
+                _ => {
+                    edit(&mut input, key, |_| true);
                     keep(Discovery::Namespace { context, input });
                 }
-                KeyCode::Char(c) => {
-                    input.push(c);
-                    keep(Discovery::Namespace { context, input });
-                }
-                _ => keep(Discovery::Namespace { context, input }),
             },
             Discovery::Services(mut services) => {
                 let cmds = services_key(key, &mut services);
@@ -941,10 +915,51 @@ impl App {
     }
 }
 
+/// Whether `key` is ctrl+`c`.
+fn ctrl(key: KeyEvent, c: char) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(c)
+}
+
+/// The key's code when it comes without modifiers but shift. With ctrl,
+/// alt or another one it is `Null`, which no action takes: ctrl+q must not
+/// quit like q. Only ^H counts, as backspace, which some terminals send.
+fn plain(key: KeyEvent) -> KeyCode {
+    if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+        key.code
+    } else if ctrl(key, 'h') {
+        KeyCode::Backspace
+    } else {
+        KeyCode::Null
+    }
+}
+
+/// Edits a line of text as in a shell: backspace deletes a character,
+/// ctrl+w a word, ctrl+u the whole line; plain characters that `accept`
+/// takes are typed. Other keys change nothing.
+fn edit(line: &mut String, key: KeyEvent, accept: impl Fn(char) -> bool) {
+    if ctrl(key, 'w') {
+        let kept = line
+            .trim_end()
+            .trim_end_matches(|c: char| !c.is_whitespace())
+            .len();
+        line.truncate(kept);
+    } else if ctrl(key, 'u') {
+        line.clear();
+    } else {
+        match plain(key) {
+            KeyCode::Backspace => {
+                line.pop();
+            }
+            KeyCode::Char(c) if accept(c) => line.push(c),
+            _ => {}
+        }
+    }
+}
+
 /// Keys in the service list of discovery. `None` closes discovery.
 fn services_key(key: KeyEvent, s: &mut Services) -> Option<Vec<Cmd>> {
     if let Some(mut port) = s.editing.take() {
-        match key.code {
+        match plain(key) {
             KeyCode::Enter => {
                 if let Some(index) = s.visible().get(s.selected).copied()
                     && let Ok(local) = port.parse::<u16>()
@@ -955,30 +970,21 @@ fn services_key(key: KeyEvent, s: &mut Services) -> Option<Vec<Cmd>> {
                 }
             }
             KeyCode::Esc => {}
-            KeyCode::Backspace => {
-                port.pop();
+            _ => {
+                edit(&mut port, key, |c| c.is_ascii_digit());
                 s.editing = Some(port);
             }
-            KeyCode::Char(c) if c.is_ascii_digit() => {
-                port.push(c);
-                s.editing = Some(port);
-            }
-            _ => s.editing = Some(port),
         }
         return Some(Vec::new());
     }
     if s.filtering {
-        match key.code {
+        match plain(key) {
             KeyCode::Enter => s.filtering = false,
             KeyCode::Esc => {
                 s.filter.clear();
                 s.filtering = false;
             }
-            KeyCode::Backspace => {
-                s.filter.pop();
-            }
-            KeyCode::Char(c) => s.filter.push(c),
-            _ => {}
+            _ => edit(&mut s.filter, key, |_| true),
         }
         s.selected = 0;
         return Some(Vec::new());
@@ -986,7 +992,7 @@ fn services_key(key: KeyEvent, s: &mut Services) -> Option<Vec<Cmd>> {
 
     let visible = s.visible();
     let last = visible.len().saturating_sub(1);
-    match key.code {
+    match plain(key) {
         KeyCode::Esc => return None,
         KeyCode::Up | KeyCode::Char('k') => s.selected = s.selected.saturating_sub(1),
         KeyCode::Down | KeyCode::Char('j') => s.selected = (s.selected + 1).min(last),
@@ -1845,6 +1851,129 @@ pub(crate) mod tests {
         assert_eq!(app.selected, Some(ForwardId::new("stg-web")));
         app.update(without("stg-web"));
         assert_eq!(app.selected, Some(ForwardId::new("prd-web")));
+    }
+
+    fn chord(code: KeyCode, modifiers: KeyModifiers) -> Msg {
+        Msg::Key(KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })
+    }
+
+    fn ctrl_key(c: char) -> Msg {
+        chord(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn keys_with_ctrl_or_alt_do_nothing_unless_bound() {
+        let mut app = App::new(snapshot());
+        // ctrl+space arrives as ctrl and a space.
+        for c in ['q', ' ', 'd', 'r', 'x', 'j', 'l', 'y', 'o'] {
+            assert!(app.update(ctrl_key(c)).is_empty(), "ctrl+{c}");
+            assert!(
+                app.update(chord(KeyCode::Char(c), KeyModifiers::ALT))
+                    .is_empty()
+            );
+        }
+        assert!(
+            app.update(chord(KeyCode::Down, KeyModifiers::CONTROL))
+                .is_empty()
+        );
+        assert!(!app.quit, "ctrl+q quit and switched the forwards off");
+        assert!(matches!(app.mode, Mode::List));
+        assert_eq!(app.selected, Some(ForwardId::new("prd-web")));
+
+        // Shift is part of the key.
+        app.update(chord(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        assert_eq!(app.selected, Some(ForwardId::new("stg-web")));
+
+        // Only a plain y deletes.
+        app.update(key(KeyCode::Char('x')));
+        assert!(app.update(ctrl_key('y')).is_empty());
+        assert!(matches!(app.mode, Mode::List));
+
+        // ctrl+u is no u among the projects.
+        app.update(key(KeyCode::Char('p')));
+        assert!(app.update(ctrl_key('u')).is_empty());
+        assert!(app.update(ctrl_key('x')).is_empty());
+        assert!(matches!(app.mode, Mode::Projects { .. }));
+    }
+
+    #[test]
+    fn text_inputs_take_backspace_ctrl_h_ctrl_w_and_ctrl_u() {
+        let mut app = App::new(snapshot());
+        app.update(key(KeyCode::Char('/')));
+        type_text(&mut app, "stag  mysql");
+        app.update(ctrl_key('w'));
+        assert_eq!(app.filter, "stag  ");
+        app.update(ctrl_key('w'));
+        assert_eq!(app.filter, "");
+        type_text(&mut app, "stagx");
+        app.update(ctrl_key('h'));
+        app.update(chord(KeyCode::Char('x'), KeyModifiers::ALT));
+        assert_eq!(app.filter, "stag");
+        assert_eq!(ids(&app), ["stg-db", "stg-web"]);
+        app.update(ctrl_key('u'));
+        assert_eq!(app.filter, "");
+        assert!(matches!(app.mode, Mode::Filter));
+        app.update(key(KeyCode::Esc));
+
+        // The form: a port field takes digits only, as before.
+        app.update(key(KeyCode::Char('a')));
+        type_text(&mut app, "api");
+        app.update(ctrl_key('h'));
+        app.update(key(KeyCode::Tab));
+        type_text(&mut app, "8080");
+        app.update(ctrl_key('u'));
+        app.update(ctrl_key('a'));
+        type_text(&mut app, "80");
+        let Mode::Form(form) = &app.mode else {
+            panic!("form closed")
+        };
+        assert_eq!(form.fields[2..4], ["ap", "80"]);
+        app.update(key(KeyCode::Esc));
+
+        // Naming a project.
+        app.update(key(KeyCode::Char('p')));
+        app.update(key(KeyCode::Char('n')));
+        type_text(&mut app, "web shop");
+        app.update(ctrl_key('w'));
+        assert!(matches!(&app.mode, Mode::Projects { naming: Some(name), .. } if name == "web "));
+        app.update(key(KeyCode::Esc));
+        app.update(key(KeyCode::Esc));
+
+        // The namespaces to discover, then the services' filter and port.
+        app.update(key(KeyCode::Char('d')));
+        app.update(Msg::Contexts(Ok((vec!["staging".into()], None))));
+        app.update(key(KeyCode::Enter));
+        type_text(&mut app, "shop-*");
+        app.update(ctrl_key('u'));
+        type_text(&mut app, "shop");
+        app.update(ctrl_key('h'));
+        assert!(matches!(
+            &app.mode,
+            Mode::Discovery(Discovery::Namespace { input, .. }) if input == "sho"
+        ));
+        app.mode = Mode::Discovery(listing("staging", 1));
+        app.update(Msg::Discovered {
+            request: 1,
+            result: Ok(found(vec![port("api"), port("web")])),
+        });
+        app.update(key(KeyCode::Char('/')));
+        type_text(&mut app, "apix");
+        app.update(ctrl_key('h'));
+        app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::Char('e')));
+        app.update(ctrl_key('u'));
+        type_text(&mut app, "18080");
+        app.update(ctrl_key('h'));
+        let Mode::Discovery(Discovery::Services(services)) = &app.mode else {
+            panic!("services closed")
+        };
+        assert_eq!(services.filter, "api");
+        assert_eq!(services.editing.as_deref(), Some("1808"));
     }
 
     #[test]

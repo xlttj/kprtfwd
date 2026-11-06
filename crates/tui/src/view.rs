@@ -576,6 +576,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
         "r                        reconnect the selected forward's context",
         "l                        events of the selected forward",
         "ctrl+l                   redraw the screen",
+        "ctrl+w  ctrl+u           in a text input: delete a word / everything",
         quit,
     ]
     .into_iter()
