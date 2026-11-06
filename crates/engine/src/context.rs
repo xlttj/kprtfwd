@@ -7,12 +7,21 @@ use std::time::{Duration, SystemTime};
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use http_body_util::BodyExt;
+use hyper::{Request, Response};
+use hyper_timeout::TimeoutConnector;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::TokioExecutor;
 use kprtfwd_core::state::{ContextState, NetCause};
-use kube::client::ClientBuilder;
+use kube::client::retry::RetryPolicy;
+use kube::client::{ClientBuilder, ConfigExt, DynBody};
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Client, Config};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tower::retry::RetryLayer;
+use tower::util::BoxService;
+use tower::{BoxError, ServiceBuilder, ServiceExt};
 use tracing::{info, warn};
 
 use crate::auth::{self, Login};
@@ -85,12 +94,60 @@ pub async fn client_for(context: &str) -> Result<(Client, Option<Login>), String
 
 fn build(mut config: Config) -> Result<(Client, Option<Login>), String> {
     let login = Login::take(&mut config.auth_info);
-    let builder = ClientBuilder::try_from(config).map_err(|err| err.to_string())?;
+    let builder = client_builder(config).map_err(|err| err.to_string())?;
     let client = match &login {
         Some(login) => builder.with_layer(&login.layer()).build(),
         None => builder.build(),
     };
     Ok((client, login))
+}
+
+/// TCP keepalive on the connections to the API server. A connection whose
+/// path died silently, e.g. as the VPN came back with another address before
+/// the probe noticed the outage, fails about 30 s after its last packet
+/// instead of hanging; that is no quicker than the probe declares an outage.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const KEEPALIVE_PROBES: u32 = 3;
+
+/// The stack `kube::client::ClientBuilder` builds by default.
+type Stack = BoxService<Request<kube::client::Body>, Response<Box<DynBody>>, BoxError>;
+
+/// The client stack kube builds with [`ClientBuilder::try_from`], with a
+/// TCP connector of its own: kube's has no keepalive and no hook to set one.
+fn client_builder(config: Config) -> Result<ClientBuilder<Stack>, kube::Error> {
+    // kube's builder handles proxies; with the features built, it rejects
+    // them.
+    if config.proxy_url.is_some() {
+        return ClientBuilder::try_from(config);
+    }
+    let mut tcp = HttpConnector::new();
+    tcp.enforce_http(false);
+    tcp.set_keepalive(Some(KEEPALIVE_IDLE));
+    tcp.set_keepalive_interval(Some(KEEPALIVE_INTERVAL));
+    tcp.set_keepalive_retries(Some(KEEPALIVE_PROBES));
+    let mut connector = TimeoutConnector::new(config.rustls_https_connector_with_connector(tcp)?);
+    connector.set_connect_timeout(config.connect_timeout);
+    connector.set_read_timeout(config.read_timeout);
+    connector.set_write_timeout(config.write_timeout);
+    let http = hyper_util::client::legacy::Builder::new(TokioExecutor::new()).build(connector);
+    let retry = config
+        .default_retry
+        .then(|| RetryLayer::new(RetryPolicy::server_retry()));
+    let service = ServiceBuilder::new()
+        .layer(config.base_uri_layer())
+        .option_layer(retry)
+        .option_layer(config.auth_layer()?)
+        .layer(config.extra_headers_layer()?)
+        .map_err(BoxError::from)
+        .service(http)
+        .map_response(|response| {
+            response.map(|body| Box::new(body.map_err(BoxError::from)) as Box<DynBody>)
+        });
+    Ok(ClientBuilder::new(
+        BoxService::new(service),
+        config.default_namespace,
+    ))
 }
 
 impl Context {
@@ -500,9 +557,11 @@ mod tests {
 
     use kube::config::Kubeconfig;
 
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
     use crate::auth::fake;
-    use crate::fake::{FakeApi, Reply, VERSION, closed_port, status};
+    use crate::fake::{FakeApi, Kubelet, Reply, VERSION, closed_port, status};
 
     /// Probes ten times faster than in use.
     const FAST: Timing = Timing {
@@ -593,6 +652,80 @@ current-context: test
             assert!(started.elapsed() < Duration::from_secs(10), "not {what}");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// The client's own stack sends what kube's would: the credentials and
+    /// the impersonation of the kubeconfig, on requests and port-forwards.
+    #[tokio::test]
+    async fn the_client_sends_the_credentials_of_the_kubeconfig() {
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let api = FakeApi::start({
+            let heads = heads.clone();
+            move |request| {
+                heads.lock().unwrap().push(request.head.clone());
+                if request.port_forward().is_some() {
+                    Reply::Kubelet(Kubelet::Echo)
+                } else {
+                    Reply::Json(200, VERSION.into())
+                }
+            }
+        })
+        .await;
+        let yaml = format!(
+            r#"
+apiVersion: v1
+kind: Config
+clusters:
+- name: test
+  cluster:
+    server: {}
+users:
+- name: test
+  user:
+    token: t0ken
+    as: dev
+contexts:
+- name: test
+  context:
+    cluster: test
+    user: test
+"#,
+            api.url
+        );
+        let kubeconfig = Kubeconfig::from_yaml(&yaml).unwrap();
+        let (client, login) = build(load("test", Some(&kubeconfig)).await.unwrap()).unwrap();
+        assert!(login.is_none());
+
+        assert_eq!(probe(&client, PROBE_TIMEOUT).await, Ok("v1.33.0".into()));
+        let stream = crate::portforward::open(&client, "shop", "web-0", 8080)
+            .await
+            .unwrap();
+        let (mut app, local) = tokio::io::duplex(1024);
+        let pump = tokio::spawn(stream.pump(local));
+        app.write_all(b"a").await.unwrap();
+        let mut answer = [0; 9];
+        app.read_exact(&mut answer).await.unwrap();
+        assert_eq!(&answer, b"web-0#1:a");
+        drop(app);
+        pump.await.unwrap().unwrap();
+
+        let heads = heads.lock().unwrap();
+        assert_eq!(heads.len(), 2);
+        for head in heads.iter() {
+            assert!(head.contains("authorization: bearer t0ken\r\n"), "{head}");
+            assert!(head.contains("impersonate-user: dev\r\n"), "{head}");
+        }
+    }
+
+    /// A proxy is left to kube's own builder, which rejects it in this build.
+    #[test]
+    fn a_proxy_is_left_to_kube() {
+        let mut config = Config::new("https://127.0.0.1:6443".parse().unwrap());
+        config.proxy_url = Some("socks5://127.0.0.1:1080".parse().unwrap());
+        let Err(message) = build(config) else {
+            panic!("a client with a proxy");
+        };
+        assert!(message.contains("kube/socks5"), "{message}");
     }
 
     #[tokio::test]

@@ -247,8 +247,9 @@ forward**. Other contexts stay idle: no client, no probes, no exec plugin calls.
 So opening the TUI never triggers a login to a cluster you are not using.
 
 **Building the client.** The actor builds a `kube::Client` from the kubeconfig
-context. An exec plugin is taken out of the client's settings first; the actor
-runs it itself (section 6.7).
+context, with kube's default stack and a TCP connector that sets a keepalive
+(section 6.4). An exec plugin is taken out of the client's settings first; the
+actor runs it itself (section 6.7).
 
 **Health probe.** The probe is `GET /version`, sent with the context's
 credentials.
@@ -355,9 +356,21 @@ are closed. Their streams go over a connection to the API server that is most
 likely dead and might not fail for minutes, or never while neither side sends;
 closed, their clients notice and connect again, as with kubectl, which exits when
 it loses the API server. A login state does not close them, as an open stream
-stays authorized. A warm stream waits in a small keeper task that reads from it: a close, an error
+stays authorized.
+
+Connections to the API server have a TCP keepalive: after 15 s without traffic,
+a probe every 5 s, and after 3 unanswered ones the connection fails. So a path
+that died while the context stayed healthy, e.g. as the VPN came back with
+another address before the probe noticed the outage, ends its streams about 30 s
+after their last packet; that is no quicker than an outage is declared. kube's
+default connector sets no keepalive and has no hook for one, so the context
+builds kube's default client stack with a connector of its own; with a proxy it
+leaves the client to kube, which rejects proxies with the features built.
+
+A warm stream waits in a small keeper task that reads from it: a close, an error
 or unexpected data ends it. A stream that dies silently is caught by the 60 s
-maximum age and by the context's health probe. WebSocket pings are not used.
+maximum age, the keepalive and the context's health probe. WebSocket pings are
+not used.
 
 **Close.** The protocol has no half-close. When either side ends, the WebSocket is
 closed, as in kubectl's WebSocket mode and in kube-rs.
@@ -759,7 +772,9 @@ These are shown in the INFO column and by `kprtfwd status`.
     shows, and a renewal keeps the context healthy until the API server
     rejects the old token. They probe ten times faster than in use;
   - unit tests with a fake API server on a local port (`fake.rs`): the probe's
-    state machine with a given time and the rule for restarting watches;
+    state machine with a given time and the rule for restarting watches; the
+    client's own stack, which sends the kubeconfig's token and impersonation on
+    requests and port-forwards and leaves a proxy to kube;
     `Engine::reconcile` and `reconnect` with a kubeconfig of their own, never
     `~/.kube/config`; kubeconfig fingerprints (maps read in any order, the
     default namespace), merging with missing files, and the watcher on
@@ -897,7 +912,7 @@ Risks:
 |---|---|---|
 | One WebSocket per connection | +80–100 ms per new connection over VPN | warm forward (measured 87 ms vs kubectl 193 ms) |
 | Own protocol implementation misses edge cases | broken or stuck connections | kube-rs and the spike (git history) as reference; framing unit tests; kind tests; manual checks against every configured context |
-| A warm stream dies silently | one request after an idle phase fails | keeper task reads the stream; 60 s maximum age; dropped on any outage; HTTP services only |
+| A warm stream dies silently | one request after an idle phase fails | keeper task reads the stream; 60 s maximum age; TCP keepalive; dropped on any outage; HTTP services only |
 | A watch stays stale after a silent drop | connections go to a pod that is gone | restart watches on recovery; the watcher's idle timeout (~290 s) as a backstop |
 | An exec plugin opens a browser tab per attempt | tabs pile up while the API server is unreachable or nobody logs in | the daemon runs the plugin itself: only while the API server answers, one at a time, not again after a failure (section 6.7) |
 | Many long-lived connections (watches, warm forwards) | load on the API server | watches only for namespaces with enabled forwards; warm forwards only while healthy |
