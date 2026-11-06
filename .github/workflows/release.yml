@@ -34,8 +34,16 @@ jobs:
           fi
           echo "Tag ${GITHUB_REF_NAME} matches the crate version."
 
-  build:
+  # The whole CI (fmt, clippy, tests, audit, cluster tests) on the tagged
+  # commit, so a tag cannot ship untested code. Pull requests run ci.yml
+  # on their own.
+  ci:
+    if: startsWith(github.ref, 'refs/tags/')
     needs: version
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: [version, ci]
     # Pull requests skip the release checks above and build anyway.
     if: ${{ !cancelled() && !failure() }}
     strategy:
@@ -104,7 +112,7 @@ jobs:
     # Without a status function, this also requires every job in needs
     # to have succeeded.
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [version, build]
+    needs: [version, ci, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write

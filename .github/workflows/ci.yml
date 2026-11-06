@@ -5,6 +5,8 @@ on:
     branches:
       - main
   pull_request:
+  # release.yml runs these checks on the tagged commit before building.
+  workflow_call:
 
 permissions:
   contents: read
