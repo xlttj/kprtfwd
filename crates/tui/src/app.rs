@@ -23,6 +23,8 @@ pub enum Msg {
     Events(Result<Vec<EventEntry>, String>),
     /// The daemon is lost, or still cannot be reached; why.
     Lost(String),
+    /// A signal asks the TUI to end.
+    Quit,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -261,6 +263,10 @@ impl App {
             }
             Msg::Lost(reason) => {
                 self.lost = Some(reason);
+                Vec::new()
+            }
+            Msg::Quit => {
+                self.quit = true;
                 Vec::new()
             }
             Msg::Done(result) => {
@@ -1560,6 +1566,12 @@ pub(crate) mod tests {
         let mut app = App::new(snapshot());
         app.update(key(KeyCode::Char('a')));
         assert!(app.update(ctrl_c).is_empty());
+        assert!(app.quit);
+
+        // So does a signal.
+        let mut app = App::new(snapshot());
+        app.update(key(KeyCode::Char('a')));
+        assert!(app.update(Msg::Quit).is_empty());
         assert!(app.quit);
     }
 }

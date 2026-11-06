@@ -783,6 +783,8 @@ Internal structure:
   open until the new one has attached, so the daemon never takes the TUI for
   gone and switches the forwards off. Discovery runs on a connection and in a
   task of its own, for at most 6 minutes (a browser login may take 5).
+- **Signals.** SIGTERM and SIGINT end the TUI like `q`, so the terminal is
+  restored; in raw mode ctrl+c is a key.
 - **Tests:** `App::update` is tested key by key; the drawing with ratatui's
   `TestBackend`. The flows were also driven end to end with `expect` against
   orbstack (ratatui only redraws changed cells, so such scripts match single

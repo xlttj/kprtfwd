@@ -53,8 +53,9 @@ pub async fn run() -> Result<()> {
     app.keep_forwards_running = config.keep_forwards_running;
     app.config_path = home_relative(&config_path);
 
-    let mut terminal = ratatui::init();
     let (tx, rx) = mpsc::unbounded_channel::<Msg>();
+    quit_on_signals(tx.clone())?;
+    let mut terminal = ratatui::init();
     read_terminal(tx.clone());
     let result = event_loop(&mut terminal, Socket, client, &mut app, rx, tx).await;
     ratatui::restore();
@@ -136,6 +137,23 @@ fn home_relative(path: &std::path::Path) -> String {
             || path.display().to_string(),
             |rest| format!("~/{}", rest.display()),
         )
+}
+
+/// SIGTERM and SIGINT end the TUI like q, so the terminal is restored. (In
+/// raw mode ctrl+c is a key, not SIGINT.) A closed terminal still ends it
+/// with SIGHUP; there is nothing left to restore.
+fn quit_on_signals(tx: mpsc::UnboundedSender<Msg>) -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+        let _ = tx.send(Msg::Quit);
+    });
+    Ok(())
 }
 
 /// Terminal input blocks, so it gets its own thread.
