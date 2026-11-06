@@ -741,7 +741,7 @@ Keys:
 | `+` / `-` | all listed forwards on / off |
 | `p` | projects (see below) |
 | `o` | open `http://localhost:<port>` |
-| `y` | copy `localhost:<port>` |
+| `y` | copy `localhost:<port>`, with `pbcopy`, or the first of `wl-copy`, `xclip` and `xsel` that works |
 | `e` / `a` / `x` | edit, add, delete a forward |
 | `d` | discover services |
 | `P` | pause or resume all |

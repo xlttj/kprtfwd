@@ -36,6 +36,18 @@ const CONNECT_WITHIN: Duration = Duration::from_secs(15);
 const RECONNECT_EVERY: Duration = Duration::from_secs(1);
 /// How long discovery may take: the daemon gives a browser login 5 minutes.
 const DISCOVER_WITHIN: Duration = Duration::from_secs(6 * 60);
+/// How long a clipboard tool that failed may take to close its stderr.
+const REASON_WITHIN: Duration = Duration::from_millis(200);
+/// The clipboard tools, tried in turn until one works.
+const CLIPBOARD: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+    &[("pbcopy", &[])]
+} else {
+    &[
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ]
+};
 const NOT_CONNECTED: &str = "not connected to the daemon";
 const UNEXPECTED: &str = "unexpected answer from the daemon";
 
@@ -511,50 +523,96 @@ fn run_cmd<D: Daemon>(
             } else {
                 "xdg-open"
             };
-            let result = Command::new(opener)
-                .arg(&url)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map(|_| format!("opened {url}"))
-                .map_err(|err| format!("cannot run {opener}: {err}"));
-            app.update(Msg::Done(result));
+            app.update(Msg::Done(open(opener, &url, tx.clone())));
         }
         Cmd::Copy(text) => {
-            let result = copy(&text).map(|()| format!("copied {text}"));
+            let result = copy(CLIPBOARD, &text).map(|()| format!("copied {text}"));
             app.update(Msg::Done(result));
         }
     }
 }
 
-/// Puts `text` on the clipboard with the platform's tool.
-fn copy(text: &str) -> Result<(), String> {
-    use std::io::Write;
-    let tools: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
-        &[("pbcopy", &[])]
-    } else {
-        &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])]
-    };
-    for (tool, args) in tools {
-        let Ok(mut child) = Command::new(tool)
-            .args(*args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        else {
-            continue;
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
+/// Opens `url` with `opener`. A thread waits for the opener, so it does not
+/// stay behind as a zombie, and reports through `tx` when it fails.
+fn open(opener: &str, url: &str, tx: mpsc::UnboundedSender<Msg>) -> Result<String, String> {
+    let mut child = Command::new(opener)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| format!("cannot run {opener}: {err}"))?;
+    let failed = format!("{opener} could not open {url}");
+    std::thread::spawn(move || {
+        if let Ok(status) = child.wait()
+            && !status.success()
+        {
+            let _ = tx.send(Msg::Done(Err(format!("{failed} ({status})"))));
         }
-        return match child.wait() {
-            Ok(status) if status.success() => Ok(()),
-            _ => Err(format!("{tool} failed")),
-        };
+    });
+    Ok(format!("opened {url}"))
+}
+
+/// Puts `text` on the clipboard with the first of `tools` that works: one
+/// that is missing or fails hands over to the next. When all fail, says why
+/// each one did.
+fn copy(tools: &[(&str, &[&str])], text: &str) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for (tool, args) in tools {
+        match copy_with(tool, args, text) {
+            Ok(()) => return Ok(()),
+            Err(Some(why)) => failures.push(why),
+            Err(None) => {}
+        }
     }
-    Err("no clipboard tool found (pbcopy, wl-copy or xclip)".into())
+    if failures.is_empty() {
+        let names: Vec<&str> = tools.iter().map(|(tool, _)| *tool).collect();
+        return Err(format!("no clipboard tool found ({})", names.join(", ")));
+    }
+    Err(failures.join("; "))
+}
+
+/// Puts `text` on the clipboard with `tool`. `Err(None)` when the tool is
+/// not installed, otherwise why it failed.
+fn copy_with(tool: &str, args: &[&str], text: &str) -> Result<(), Option<String>> {
+    use std::io::{Read, Write};
+    let mut child = match Command::new(tool)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(None),
+        Err(err) => return Err(Some(format!("cannot run {tool}: {err}"))),
+    };
+    // wl-copy, xclip and xsel leave a process behind that serves the
+    // clipboard and keeps stderr open. So stderr is read aside, and only
+    // waited for when the tool failed, which happens before that process
+    // starts.
+    let (said, heard) = std::sync::mpsc::channel();
+    if let Some(mut stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stderr.read_to_end(&mut bytes);
+            let _ = said.send(String::from_utf8_lossy(&bytes).into_owned());
+        });
+    }
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    let status = child.wait().map_err(|err| Some(format!("{tool}: {err}")))?;
+    if status.success() {
+        return Ok(());
+    }
+    let reason = heard.recv_timeout(REASON_WITHIN).unwrap_or_default();
+    Err(Some(
+        match reason.lines().map(str::trim).find(|line| !line.is_empty()) {
+            Some(line) => format!("{tool}: {line}"),
+            None => format!("{tool} failed ({status})"),
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -1132,6 +1190,83 @@ mod tests {
         let screen = screen(&terminal);
         assert!(screen.contains("prd-web"), "{screen}");
         assert!(screen.contains("on: prd-web"), "{screen}");
+    }
+
+    #[test]
+    fn copy_tries_the_next_tool_when_one_is_missing_or_fails() {
+        let tools = [
+            ("kprtfwd-test-no-such-tool", &[][..]),
+            ("sh", &["-c", "echo 'cannot open display' >&2; exit 1"][..]),
+            ("sh", &["-c", "test \"$(cat)\" = localhost:10080"][..]),
+        ];
+        assert_eq!(copy(&tools, "localhost:10080"), Ok(()));
+
+        // When all fail, each one says why.
+        let tools = [
+            (
+                "sh",
+                &[
+                    "-c",
+                    "echo 'cannot open display' >&2; echo more >&2; exit 1",
+                ][..],
+            ),
+            ("kprtfwd-test-no-such-tool", &[][..]),
+            ("sh", &["-c", "cat >/dev/null; exit 2"][..]),
+        ];
+        assert_eq!(
+            copy(&tools, "localhost:10080"),
+            Err("sh: cannot open display; sh failed (exit status: 2)".into())
+        );
+
+        let tools = [("kprtfwd-test-no-such-tool", &[][..])];
+        assert_eq!(
+            copy(&tools, "x"),
+            Err("no clipboard tool found (kprtfwd-test-no-such-tool)".into())
+        );
+    }
+
+    #[test]
+    fn copy_does_not_wait_for_what_a_tool_leaves_behind() {
+        // Like wl-copy or xclip: a process keeps stderr open after the tool
+        // has ended.
+        let started = std::time::Instant::now();
+        assert_eq!(
+            copy(&[("sh", &["-c", "cat >/dev/null; sleep 2 &"][..])], "x"),
+            Ok(())
+        );
+        let failed = copy(
+            &[("sh", &["-c", "sleep 2 & echo oops >&2; exit 1"][..])],
+            "x",
+        );
+        assert_eq!(failed, Err("sh failed (exit status: 1)".into()));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn open_waits_for_the_opener_and_reports_its_failure() {
+        let url = "http://localhost:10080";
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert_eq!(open("true", url, tx), Ok(format!("opened {url}")));
+        // The waiting thread ends without a word once the opener is reaped.
+        assert!(rx.blocking_recv().is_none());
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert_eq!(open("false", url, tx), Ok(format!("opened {url}")));
+        let Some(Msg::Done(Err(text))) = rx.blocking_recv() else {
+            panic!("no failure reported");
+        };
+        assert_eq!(text, format!("false could not open {url} (exit status: 1)"));
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let missing = open("kprtfwd-test-no-such-opener", url, tx).unwrap_err();
+        assert!(
+            missing.starts_with("cannot run kprtfwd-test-no-such-opener: "),
+            "{missing}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
