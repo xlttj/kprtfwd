@@ -743,6 +743,12 @@ These are shown in the INFO column and by `kprtfwd status`.
   a temporary directory: quitting the last TUI switches the forwards off and
   lifts the pause, another client or `keep_forwards_running` keeps them, and a
   daemon still running in `~/.kprtfwd` is stopped and its database copied.
+- **cli:** unit tests for the exit code rules; `kprtfwd/tests/cli.rs` runs the
+  binary the same way: exit code 2 without a daemon and for one that cannot
+  start, 3 while an enabled forward is not ready and 0 once it is paused, `up`
+  and `down` by words and with `--all`, `prune` against a fake API server
+  (declined, confirmed, `-y`, the daemon's current context), and `logs` with
+  and without `-f`.
 - **tui:** key-by-key tests of `App::update`, drawing tests with `TestBackend`,
   tests of the event loop against a fake daemon on tokio's paused clock (a
   lost daemon and the reconnect, a request's result and the fresh snapshot, a

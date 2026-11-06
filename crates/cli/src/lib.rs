@@ -126,17 +126,21 @@ pub async fn run(command: Command) -> ExitCode {
             if start_failed && let Some(logs) = paths::log_dir() {
                 eprintln!("log: {}", logs.display());
             }
-            let no_daemon = err.downcast_ref::<ClientError>().is_some_and(|err| {
-                matches!(
-                    err,
-                    ClientError::NotRunning(_)
-                        | ClientError::StartTimeout(_)
-                        | ClientError::StartFailed(_)
-                )
-            });
-            ExitCode::from(if no_daemon { EXIT_NO_DAEMON } else { 1 })
+            ExitCode::from(exit_code(&err))
         }
     }
+}
+
+/// [`EXIT_NO_DAEMON`] if the daemon is not running and could not be
+/// started, 1 for any other error.
+fn exit_code(err: &anyhow::Error) -> u8 {
+    let no_daemon = err.downcast_ref::<ClientError>().is_some_and(|err| {
+        matches!(
+            err,
+            ClientError::NotRunning(_) | ClientError::StartTimeout(_) | ClientError::StartFailed(_)
+        )
+    });
+    if no_daemon { EXIT_NO_DAEMON } else { 1 }
 }
 
 async fn execute(command: Command) -> Result<ExitCode> {
@@ -211,17 +215,21 @@ async fn status(all: bool, json: bool) -> Result<ExitCode> {
         }
         println!("\nkubeconfig: {}", snapshot.kubeconfig_files.join(", "));
     }
-    let not_ready = snapshot.forwards.iter().any(|view| {
-        view.forward.enabled
-            && !matches!(
+    Ok(if all_ready(&snapshot) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(EXIT_NOT_READY)
+    })
+}
+
+/// Whether every enabled forward is ready; a paused one counts as ready.
+fn all_ready(snapshot: &Snapshot) -> bool {
+    snapshot.forwards.iter().all(|view| {
+        !view.forward.enabled
+            || matches!(
                 view.state,
                 ForwardState::Ready { .. } | ForwardState::Paused
             )
-    });
-    Ok(if not_ready {
-        ExitCode::from(EXIT_NOT_READY)
-    } else {
-        ExitCode::SUCCESS
     })
 }
 
@@ -791,5 +799,69 @@ mod tests {
         assert_eq!(info(&ready, &healthy), "connection refused");
         ready.last_error.as_mut().unwrap().at = SystemTime::UNIX_EPOCH;
         assert_eq!(info(&ready, &healthy), "");
+    }
+
+    #[test]
+    fn only_a_missing_daemon_exits_with_2() {
+        use std::os::unix::process::ExitStatusExt;
+        let missing = || std::io::Error::from(std::io::ErrorKind::NotFound);
+        let no_daemon = [
+            ClientError::NotRunning(missing()),
+            ClientError::StartTimeout(Duration::from_secs(10)),
+            ClientError::StartFailed(std::process::ExitStatus::from_raw(256)),
+        ];
+        for err in no_daemon {
+            let text = err.to_string();
+            assert_eq!(exit_code(&err.into()), EXIT_NO_DAEMON, "{text}");
+        }
+        let wrapped = anyhow::Error::from(ClientError::NotRunning(missing())).context("connect");
+        assert_eq!(exit_code(&wrapped), EXIT_NO_DAEMON);
+
+        let others = [
+            anyhow::Error::from(ClientError::Daemon("unknown forward".into())),
+            anyhow::anyhow!("no project or forward matches \"redis\""),
+        ];
+        for err in others {
+            assert_eq!(exit_code(&err), 1, "{err}");
+        }
+    }
+
+    #[test]
+    fn status_is_ready_when_every_enabled_forward_is_ready_or_paused() {
+        let with = |states: &[(bool, ForwardState)]| {
+            let mut snapshot = snapshot();
+            snapshot.forwards = states
+                .iter()
+                .map(|(enabled, state)| {
+                    let mut view = view("stg-api", "staging", "api");
+                    view.forward.enabled = *enabled;
+                    view.state = state.clone();
+                    view
+                })
+                .collect();
+            all_ready(&snapshot)
+        };
+        let ready = ForwardState::Ready {
+            pod: None,
+            active_conns: 0,
+        };
+        let waiting = ForwardState::WaitingForPods { ready: 0, total: 1 };
+        assert!(with(&[]));
+        assert!(with(&[(true, ready.clone()), (true, ForwardState::Paused)]));
+        assert!(with(&[
+            (false, ForwardState::Disabled),
+            (true, ready.clone())
+        ]));
+        for not_ready in [
+            ForwardState::Starting,
+            waiting,
+            ForwardState::WaitingForContext,
+            ForwardState::PortBusy { holder: None },
+        ] {
+            assert!(
+                !with(&[(true, ready.clone()), (true, not_ready.clone())]),
+                "{not_ready:?}"
+            );
+        }
     }
 }
