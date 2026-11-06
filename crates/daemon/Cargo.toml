@@ -11,6 +11,7 @@ kprtfwd-core.workspace = true
 kprtfwd-engine.workspace = true
 kprtfwd-proto.workspace = true
 anyhow.workspace = true
+rustix = { workspace = true, features = ["process"] }
 tokio.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true

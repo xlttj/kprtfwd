@@ -78,8 +78,23 @@ impl Home {
 
     pub fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_kprtfwd"));
+        command.args(args);
+        self.isolate(command)
+    }
+
+    /// Runs kprtfwd from `sh` after `setup`, e.g. `ulimit -Sn 256`.
+    pub fn command_after(&self, setup: &str, args: &[&str]) -> Command {
+        let mut command = Command::new("sh");
         command
-            .args(args)
+            .arg("-c")
+            .arg(format!(r#"{setup} && exec "$0" "$@""#))
+            .arg(env!("CARGO_BIN_EXE_kprtfwd"))
+            .args(args);
+        self.isolate(command)
+    }
+
+    fn isolate(&self, mut command: Command) -> Command {
+        command
             .env("HOME", self.path())
             .env_remove("KPRTFWD_HOME")
             .env_remove("XDG_CONFIG_HOME")

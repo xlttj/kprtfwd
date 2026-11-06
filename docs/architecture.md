@@ -206,9 +206,14 @@ Main dependencies:
   and a handshake succeeds, another daemon is running and this one exits. If the
   connection fails, the socket is stale; the daemon removes and rebinds it.
 - **Start.**
-  1. Open the database and run migrations.
-  2. Load forwards and their desired state.
-  3. Start a context actor for every context with an enabled forward.
+  1. Raise the soft limit of open files to 10240, or to the hard limit if
+     that is lower; a higher limit is kept. The daemon inherits the limit of
+     the shell that started its client, 256 in a macOS terminal, and every
+     forward holds two listeners and every connection two sockets. Exec
+     plugins and `lsof` inherit the raised limit.
+  2. Open the database and run migrations.
+  3. Load forwards and their desired state.
+  4. Start a context actor for every context with an enabled forward.
 - **Kubeconfig.** The daemon inherits `KUBECONFIG` from the client that started
   it; `kprtfwd status` shows which files are in use. The engine merges them in
   one place, for clients, discovery and the hashes below, and skips files that
@@ -837,7 +842,8 @@ These are shown in the INFO column and by `kprtfwd status`.
   rewrite of a user with env entries cause no reconnect and no login while a
   moved cluster causes exactly one; `status` shows a context and its forward
   `logging in` while the plugin waits; discovery does not propose a port that
-  another process holds on `::1` only.
+  another process holds on `::1` only; a daemon started with a soft limit of
+  256 open files raises it.
 - **cli:** unit tests for the exit code rules; `kprtfwd/tests/cli.rs` runs the
   binary the same way: exit code 2 without a daemon and for one that cannot
   start, 3 while an enabled forward is not ready and 0 once it is paused, `up`

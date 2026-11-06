@@ -1247,6 +1247,7 @@ dependencies = [
  "kprtfwd-core",
  "kprtfwd-engine",
  "kprtfwd-proto",
+ "rustix",
  "tokio",
  "tracing",
  "tracing-appender",

@@ -24,6 +24,7 @@ use kprtfwd_proto::{
     LastError, PROTOCOL_VERSION, ProjectView, Request, Response, ServerMessage, Snapshot,
     read_message, stop_daemon, write_message,
 };
+use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
@@ -38,6 +39,9 @@ const IDLE_EXIT: Duration = Duration::from_secs(10 * 60);
 /// by the context state, instead.
 const DEFAULT_LOG_FILTER: &str =
     "info,kube=warn,kube_client=off,kube_runtime=off,hyper=warn,tower=warn,rustls=warn";
+/// The soft limit of open files the daemon raises its own to. macOS takes
+/// at most `kern.maxfilesperproc`, which is 10240 or more.
+const OPEN_FILES: u64 = 10_240;
 
 pub struct Options {
     /// Log to stderr instead of the log directory.
@@ -52,6 +56,7 @@ pub fn run(options: Options) -> Result<()> {
         .create(&data_dir)
         .with_context(|| format!("create {}", data_dir.display()))?;
     let _log_guard = init_logging(&options, &data_dir)?;
+    raise_open_files_limit();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -90,6 +95,36 @@ fn init_logging(
         .with_writer(writer)
         .init();
     Ok(Some(guard))
+}
+
+/// Raises the soft limit of open files, which the daemon inherits from the
+/// shell that started its client: 256 in a macOS terminal. Every forward
+/// holds two listeners and every connection two sockets, so a few dozen
+/// forwards and some browser tabs reach it. Child processes, exec plugins
+/// and `lsof`, inherit the raised limit.
+fn raise_open_files_limit() {
+    let limit = getrlimit(Resource::Nofile);
+    let Some(raised) = open_files_limit(limit.current, limit.maximum) else {
+        debug!(soft = ?limit.current, hard = ?limit.maximum, "open files limit kept");
+        return;
+    };
+    let from = limit.current.unwrap_or_default();
+    let new = Rlimit {
+        current: Some(raised),
+        maximum: limit.maximum,
+    };
+    match setrlimit(Resource::Nofile, new) {
+        Ok(()) => info!(from, to = raised, "open files limit raised"),
+        Err(err) => warn!(%err, from, to = raised, "cannot raise the open files limit"),
+    }
+}
+
+/// The soft limit of open files to set, given the current soft and hard
+/// limits (`None` is unlimited): [`OPEN_FILES`], or the hard limit if that is
+/// lower. `None` keeps the current limit, which is never lowered.
+fn open_files_limit(soft: Option<u64>, hard: Option<u64>) -> Option<u64> {
+    let wanted = hard.map_or(OPEN_FILES, |hard| hard.min(OPEN_FILES));
+    soft.filter(|soft| *soft < wanted).map(|_| wanted)
 }
 
 async fn serve(data_dir: &Path) -> Result<()> {
@@ -797,6 +832,22 @@ mod tests {
             .iter()
             .map(|(ns, name)| ((*ns).to_owned(), (*name).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn raises_the_open_files_limit_up_to_the_hard_limit_only() {
+        // A macOS terminal: 256, hard limit unlimited.
+        assert_eq!(open_files_limit(Some(256), None), Some(OPEN_FILES));
+        assert_eq!(
+            open_files_limit(Some(1024), Some(524_288)),
+            Some(OPEN_FILES)
+        );
+        assert_eq!(open_files_limit(Some(256), Some(4096)), Some(4096));
+        // Already enough, or as high as allowed: kept, never lowered.
+        assert_eq!(open_files_limit(Some(OPEN_FILES), None), None);
+        assert_eq!(open_files_limit(Some(1_048_576), None), None);
+        assert_eq!(open_files_limit(None, None), None);
+        assert_eq!(open_files_limit(Some(4096), Some(4096)), None);
     }
 
     #[test]

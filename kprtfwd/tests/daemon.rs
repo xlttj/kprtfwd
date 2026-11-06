@@ -324,3 +324,25 @@ contexts:
         assert_eq!(ports[0].local_port, 10080, "{ports:?}");
     }
 }
+
+/// A macOS terminal starts with a soft limit of 256 open files, which a few
+/// dozen forwards with their connections reach; the daemon raises its own.
+#[tokio::test]
+async fn the_daemon_raises_its_limit_of_open_files() {
+    let home = Home::new();
+    let output = home
+        .command_after("ulimit -Sn 256", &["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let raised = || {
+        daemon_log(&home)
+            .lines()
+            .find(|line| line.contains("open files limit raised"))
+            .map(str::to_owned)
+    };
+    wait_until("raised", || raised().is_some()).await;
+    let line = raised().unwrap();
+    assert!(line.contains("from=256"), "{line}");
+    assert!(!line.contains("to=256"), "{line}");
+}
