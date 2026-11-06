@@ -421,7 +421,16 @@ mod tests {
 
     /// A context whose exec plugin is [`fake::plugin`] in `mode`.
     async fn context(dir: &Path, port: u16, mode: &str) -> Arc<Context> {
+        context_with(dir, port, mode, &[]).await
+    }
+
+    /// [`context`] with more variables for the plugin.
+    async fn context_with(dir: &Path, port: u16, mode: &str, env: &[(&str, &str)]) -> Arc<Context> {
         let plugin = fake::plugin(dir);
+        let env: String = env
+            .iter()
+            .map(|(name, value)| format!("\n      - name: {name}\n        value: {value}"))
+            .collect();
         let yaml = format!(
             r#"
 apiVersion: v1
@@ -441,7 +450,7 @@ users:
       - name: RUNS
         value: {runs}
       - name: MODE
-        value: {mode}
+        value: {mode}{env}
 contexts:
 - name: test
   context:
@@ -491,6 +500,24 @@ current-context: test
         assert_eq!(fake::runs(&runs).len(), 1);
 
         // The token lasts, so the next five probes need no login.
+        tokio::time::sleep(FAST.healthy_interval * 5).await;
+        assert_eq!(fake::runs(&runs).len(), 1);
+        context.stop();
+    }
+
+    /// A plugin that hands out its cached token until that expires does not
+    /// run on every probe of the token's last minute.
+    #[tokio::test]
+    async fn a_token_that_keeps_its_expiry_is_not_renewed_on_every_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let api = FakeApi::start(version_for_good_tokens).await;
+        let port = api.url.rsplit(':').next().unwrap().parse().unwrap();
+        let expires = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(30);
+        let expires = format!("'{expires}'");
+        let context = context_with(dir.path(), port, "ok", &[("EXPIRES", &expires)]).await;
+
+        wait_for(&context, "healthy", ContextState::is_healthy).await;
         tokio::time::sleep(FAST.healthy_interval * 5).await;
         assert_eq!(fake::runs(&runs).len(), 1);
         context.stop();

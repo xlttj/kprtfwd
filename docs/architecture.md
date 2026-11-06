@@ -429,7 +429,11 @@ them itself:
   only while the API server answers. While it is unreachable, for example
   without VPN, nothing runs and no browser opens.
 - The probe logs in when there is no token, when it expires within 60 s, or
-  when the API server rejects it. A layer in the client adds the token to every
+  when the API server rejects it. A token that the plugin returns with less
+  than 60 s left, such as one it hands out from its own cache until it
+  expires, is renewed only once it has expired, and one already expired by
+  the local clock only when the API server rejects it; otherwise the plugin
+  would run on every probe. A layer in the client adds the token to every
   request; watches and port-forwards never run the plugin.
 - The watches of a context with an exec plugin start after its first login.
 - After a failed login the probe stops, and the context stays `AuthFailed`.
@@ -730,9 +734,10 @@ These are shown in the INFO column and by `kprtfwd status`.
     channel);
   - login tests with a fake exec plugin and API server: no login while the API
     server is unreachable, one login once it answers, none after a failed or
-    rejected login, no secrets in the error, and a login that ends when the
-    plugin exits although a process it left behind holds its output. They
-    probe ten times faster than in use;
+    rejected login, no secrets in the error, a login that ends when the
+    plugin exits although a process it left behind holds its output, and no
+    login on every probe for a token that keeps its expiry. They probe ten
+    times faster than in use;
   - unit tests with a fake API server on a local port (`fake.rs`): the probe's
     state machine with a given time and the rule for restarting watches;
     `Engine::reconcile` and `reconnect` with a kubeconfig of their own, never

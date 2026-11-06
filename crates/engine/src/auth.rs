@@ -49,6 +49,8 @@ pub struct Login {
 struct Token {
     header: HeaderValue,
     expires: Option<SystemTime>,
+    /// When to log in again; see [`renewal`].
+    renew: Option<SystemTime>,
 }
 
 impl Login {
@@ -91,13 +93,11 @@ impl Login {
         self.token.read().unwrap().is_some()
     }
 
-    /// Whether there is no token, or it expires soon.
+    /// Whether there is no token, or it is time to renew it.
     pub fn needed(&self) -> bool {
         match &*self.token.read().unwrap() {
             None => true,
-            Some(token) => token
-                .expires
-                .is_some_and(|expires| SystemTime::now() + REFRESH_BEFORE >= expires),
+            Some(token) => token.renew.is_some_and(|at| SystemTime::now() >= at),
         }
     }
 
@@ -457,7 +457,26 @@ fn parse(stdout: &[u8]) -> Result<Token, String> {
     let mut header = HeaderValue::try_from(format!("Bearer {token}"))
         .map_err(|_| "returned a token that cannot be sent".to_owned())?;
     header.set_sensitive(true);
-    Ok(Token { header, expires })
+    Ok(Token {
+        header,
+        expires,
+        renew: renewal(expires, SystemTime::now()),
+    })
+}
+
+/// When to log in again for a token that expires at `expires`, returned at
+/// `now`: [`REFRESH_BEFORE`] ahead. A token that already expires within that
+/// time, such as one a plugin hands out from its cache until it really
+/// expires, is renewed only once it has expired, else the plugin would run on
+/// every probe; one that has already expired by this machine's clock only
+/// when the API server rejects it.
+fn renewal(expires: Option<SystemTime>, now: SystemTime) -> Option<SystemTime> {
+    let expires = expires?;
+    match expires.checked_sub(REFRESH_BEFORE) {
+        Some(early) if early > now => Some(early),
+        _ if expires > now => Some(expires),
+        _ => None,
+    }
 }
 
 /// Fake exec plugins for tests.
@@ -467,7 +486,8 @@ pub(crate) mod fake {
     use std::path::{Path, PathBuf};
 
     /// A plugin that appends its `KUBERNETES_EXEC_INFO` to `$RUNS` and then,
-    /// by `$MODE`: prints the token "good" (`ok`), the token "bad" (`bad`),
+    /// by `$MODE`: prints the token "good", which expires at `$EXPIRES` or
+    /// in the year 2999 (`ok`), the token "bad" (`bad`),
     /// fails with its arguments on stderr (`fail`), or leaves a process
     /// behind that holds its stdout and stderr, as a browser it opened
     /// would, writes that process's ID to `$LINGER` and prints the token
@@ -490,7 +510,7 @@ case "$MODE" in
     echo $! > "$LINGER"
     echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"good"}}' ;;
   *)
-    echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"good","expirationTimestamp":"2999-01-01T00:00:00Z"}}' ;;
+    echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"good","expirationTimestamp":"'"${EXPIRES:-2999-01-01T00:00:00Z}"'"}}' ;;
 esac
 "#,
         )
@@ -703,23 +723,41 @@ mod tests {
     }
 
     #[test]
-    fn logs_in_again_shortly_before_the_token_expires() {
+    fn logs_in_again_when_the_token_is_due() {
         let login = login(exec("kubectl", &[], &[]));
         assert!(login.needed());
-        let set = |expires| {
+        let set = |renew| {
             *login.token.write().unwrap() = Some(Token {
                 header: HeaderValue::from_static("Bearer abc"),
-                expires,
+                expires: None,
+                renew,
             });
         };
         set(None);
         assert!(!login.needed());
         set(Some(SystemTime::now() + Duration::from_secs(3600)));
         assert!(!login.needed());
-        set(Some(SystemTime::now() + Duration::from_secs(30)));
+        set(Some(SystemTime::now() - Duration::from_secs(1)));
         assert!(login.needed());
         login.forget();
         assert!(!login.has_token());
+    }
+
+    #[test]
+    fn renews_a_token_a_minute_early_unless_it_came_with_less() {
+        let at = |seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
+        let now = at(1000);
+        assert_eq!(renewal(None, now), None);
+        assert_eq!(renewal(Some(at(4600)), now), Some(at(4540)));
+        assert_eq!(renewal(Some(at(1061)), now), Some(at(1001)));
+        // Within the minute, as a plugin's cached token in its last minute:
+        // only once it has expired.
+        assert_eq!(renewal(Some(at(1060)), now), Some(at(1060)));
+        assert_eq!(renewal(Some(at(1030)), now), Some(at(1030)));
+        // Expired by this machine's clock: only when the API server rejects
+        // it.
+        assert_eq!(renewal(Some(at(1000)), now), None);
+        assert_eq!(renewal(Some(at(900)), now), None);
     }
 
     #[tokio::test]
