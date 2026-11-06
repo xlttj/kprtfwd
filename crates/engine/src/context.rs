@@ -115,6 +115,8 @@ type Stack = BoxService<Request<kube::client::Body>, Response<Box<DynBody>>, Box
 
 /// The client stack kube builds with [`ClientBuilder::try_from`], with a
 /// TCP connector of its own: kube's has no keepalive and no hook to set one.
+/// Its sockets also send at once, as Go's do, so a forwarded client's small
+/// writes are not held back until the API server acknowledged the last one.
 fn client_builder(config: Config) -> Result<ClientBuilder<Stack>, kube::Error> {
     // kube's builder handles proxies; with the features built, it rejects
     // them.
@@ -123,6 +125,7 @@ fn client_builder(config: Config) -> Result<ClientBuilder<Stack>, kube::Error> {
     }
     let mut tcp = HttpConnector::new();
     tcp.enforce_http(false);
+    tcp.set_nodelay(true);
     tcp.set_keepalive(Some(KEEPALIVE_IDLE));
     tcp.set_keepalive_interval(Some(KEEPALIVE_INTERVAL));
     tcp.set_keepalive_retries(Some(KEEPALIVE_PROBES));

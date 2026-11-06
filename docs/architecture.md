@@ -351,6 +351,10 @@ until the health probe notices the outage (about 15 s, two probe timeouts).
   It is checked.
 - Data goes straight between the WebSocket and the local socket. kube-rs puts an
   extra in-memory pipe (up to 1 MB buffered) in between; v2 does without it.
+- Both the local socket and the connection to the API server set `TCP_NODELAY`,
+  as kubectl's Go sockets do: a small write, such as the second half of a
+  request, goes out at once instead of waiting until the last one was
+  acknowledged, which over a VPN can take a round trip plus a delayed ACK.
 
 **Error channel.** Text from the kubelet, e.g. "connection refused" inside the pod,
 becomes a forward event and shows up in the TUI.

@@ -242,6 +242,11 @@ async fn run(spec: Forward, context: Arc<Context>, shared: Arc<Shared>) {
         tokio::select! {
             accepted = listeners.accept() => match accepted {
                 Ok((socket, _)) => {
+                    // Each answer from the pod is written as it comes, not
+                    // held back until the client acknowledged the last one.
+                    if let Err(err) = socket.set_nodelay(true) {
+                        debug!(id = %spec.id, %err, "cannot set TCP_NODELAY");
+                    }
                     connections.spawn(connection(
                         socket,
                         spec.clone(),
