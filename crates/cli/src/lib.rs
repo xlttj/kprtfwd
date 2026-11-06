@@ -172,6 +172,26 @@ fn write_stdout(bytes: &[u8]) -> Result<()> {
     }
 }
 
+/// [`StdoutClosed`] if the reader of stdout went away: a pipe whose other
+/// end is closed polls as hung up (macOS) or failed (Linux). Lets
+/// `logs -f | head` end while nothing new is written; a terminal or a file
+/// never counts as closed.
+fn check_stdout() -> Result<()> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let stdout = std::io::stdout();
+    let mut fds = [PollFd::new(&stdout, PollFlags::OUT)];
+    let now = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let closed = poll(&mut fds, Some(&now)).is_ok()
+        && fds[0].revents().intersects(PollFlags::ERR | PollFlags::HUP);
+    if closed {
+        return Err(StdoutClosed.into());
+    }
+    Ok(())
+}
+
 /// [`EXIT_NO_DAEMON`] if the daemon could not be reached: it is not running
 /// and could not be started, it does not answer, or the connection failed or
 /// closed during the command. 1 for any other error, also for a daemon of
@@ -603,6 +623,7 @@ async fn events(query: &[String], follow: bool) -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
+        check_stdout()?;
     }
 }
 
@@ -623,6 +644,7 @@ async fn daemon_log(follow: bool) -> Result<ExitCode> {
     }
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
+        check_stdout()?;
         let lines = log.read()?;
         if !lines.is_empty() {
             write_stdout(&lines)?;

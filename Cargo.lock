@@ -1224,6 +1224,7 @@ dependencies = [
  "clap",
  "kprtfwd-core",
  "kprtfwd-proto",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

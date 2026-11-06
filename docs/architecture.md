@@ -580,7 +580,8 @@ them itself:
   `kprtfwd logs` without arguments shows the daemon's log file. Both follow
   with `-f`: the log file by the bytes read, in whole lines, and at the daily
   switch to a new file after the rest of the old one; a reader that goes
-  away (`| head`) ends them quietly with 0. Times are local. Events include:
+  away (`| head`) ends them quietly with 0, also while nothing new is
+  written. Times are local. Events include:
   - state changes,
   - refused connections and why,
   - pod switches,

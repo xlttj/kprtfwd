@@ -561,9 +561,8 @@ fn logs_follow_the_daemon_log_until_the_reader_goes_away() {
         assert_eq!(line, expected);
     }
 
-    // The reader goes away, as with `| head`.
+    // The reader goes away, as with `| head`, while nothing is written.
     drop(out);
-    append("daemon.2026-11-07.log", "unread\n");
     let (status, err) = exit_of(follow);
     assert_eq!(status.code(), Some(0), "{err}");
     assert_eq!(err, "");
