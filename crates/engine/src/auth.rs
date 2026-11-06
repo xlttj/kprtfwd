@@ -8,7 +8,8 @@
 //!
 //! So the daemon takes the plugin out of the client's settings and runs it
 //! itself, from one place only: the context's health probe. The client sends
-//! the token of the last successful run, or no credentials at all.
+//! the token of the last successful run, or no credentials at all. Plugins
+//! run one at a time across all contexts; see [`turn`].
 
 use std::path::Path;
 use std::process::{Output, Stdio};
@@ -22,6 +23,7 @@ use kube::config::{AuthInfo, ExecAuthCluster, ExecConfig};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStderr, ChildStdout};
+use tokio::sync::{Mutex, MutexGuard};
 use tower::util::MapRequestLayer;
 
 /// Log in again this long before the token expires, as kube-rs does.
@@ -38,6 +40,33 @@ const MIN_SECRET: usize = 4;
 /// Runs of token characters at least this long, with digits and both cases,
 /// count as tokens.
 const MIN_TOKEN: usize = 32;
+
+/// Held by the plugin that runs; see [`turn`].
+static TURN: Mutex<()> = Mutex::const_new(());
+
+/// The right to run a plugin.
+pub struct Turn {
+    _running: MutexGuard<'static, ()>,
+    /// Whether another plugin ran meanwhile.
+    pub waited: bool,
+}
+
+/// Waits until no other plugin runs. Plugins run one at a time across all
+/// contexts, discovery and prune included: a browser login then opens one
+/// tab at a time, and the next plugin may find the first one's tokens in
+/// its cache.
+pub async fn turn() -> Turn {
+    match TURN.try_lock() {
+        Ok(running) => Turn {
+            _running: running,
+            waited: false,
+        },
+        Err(_) => Turn {
+            _running: TURN.lock().await,
+            waited: true,
+        },
+    }
+}
 
 /// A context's exec plugin and the token it returned last.
 #[derive(Clone)]
@@ -121,11 +150,11 @@ impl Login {
         })
     }
 
-    /// Runs the plugin and keeps the token it returns. The run ends when the
-    /// plugin exits, even if a process it started keeps its output open.
-    /// Dropping the future ends the plugin. The error never contains the
-    /// plugin's arguments.
-    pub async fn run(&self) -> Result<(), String> {
+    /// Runs the plugin in its `turn` and keeps the token it returns. The run
+    /// ends when the plugin exits, even if a process it started keeps its
+    /// output open. Dropping the future ends the plugin. The error never
+    /// contains the plugin's arguments.
+    pub async fn run(&self, _turn: &Turn) -> Result<(), String> {
         let name = self.name();
         let command = self
             .exec
@@ -489,7 +518,8 @@ pub(crate) mod fake {
     /// fails with its arguments on stderr (`fail`), or leaves a process
     /// behind that holds its stdout and stderr, as a browser it opened
     /// would, writes that process's ID to `$LINGER` and prints the token
-    /// "good" (`linger`).
+    /// "good" (`linger`), or waits until the file `$GATE` exists and then
+    /// prints the token "good" (`wait`).
     pub fn plugin(dir: &Path) -> PathBuf {
         let path = dir.join("plugin");
         std::fs::write(
@@ -503,6 +533,9 @@ case "$MODE" in
     exit 1 ;;
   bad)
     echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"bad"}}' ;;
+  wait)
+    while [ ! -e "$GATE" ]; do sleep 0.02; done
+    echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"good"}}' ;;
   linger)
     sleep 30 &
     echo $! > "$LINGER"
@@ -767,7 +800,7 @@ mod tests {
         let path = plugin.to_str().unwrap();
 
         let ok = login(exec(path, &["get-token"], &[("RUNS", runs_env)]));
-        ok.run().await.unwrap();
+        ok.run(&turn().await).await.unwrap();
         assert!(ok.has_token());
         let info: serde_json::Value = serde_json::from_str(&fake::runs(&runs)[0]).unwrap();
         assert_eq!(info["spec"]["interactive"], false);
@@ -778,7 +811,7 @@ mod tests {
             &["get-token", "--client-secret=s3cr3t"],
             &[("RUNS", runs_env), ("MODE", "fail")],
         ));
-        let message = failing.run().await.unwrap_err();
+        let message = failing.run(&turn().await).await.unwrap_err();
         assert_eq!(
             message,
             "plugin get-token failed (exit status: 1): error: login timed out, \
@@ -788,7 +821,7 @@ mod tests {
 
         let missing = login(exec("/does/not/exist", &[], &[]));
         assert_eq!(
-            missing.run().await.unwrap_err(),
+            missing.run(&turn().await).await.unwrap_err(),
             "/does/not/exist not found"
         );
     }
@@ -811,7 +844,7 @@ mod tests {
             ],
         ));
         let started = std::time::Instant::now();
-        let result = login.run().await;
+        let result = login.run(&turn().await).await;
         let took = started.elapsed();
         let pid = std::fs::read_to_string(&lingering).unwrap();
         std::process::Command::new("kill")

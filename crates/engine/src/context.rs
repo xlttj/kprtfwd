@@ -13,7 +13,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::auth::Login;
+use crate::auth::{self, Login};
 use crate::cache::NamespaceCache;
 use crate::errors::{Failure, classify};
 use crate::events::EventLog;
@@ -215,8 +215,14 @@ impl Context {
         } else {
             self.set_state(ContextState::Connecting);
         }
-        if let Err(message) = login.run().await {
-            return failed(&previous, Failure::Auth(message), SystemTime::now());
+        match log_in(login, client, self.timing.probe_timeout).await {
+            Ok(()) => {}
+            Err(LoginError::Failed(message)) => {
+                return failed(&previous, Failure::Auth(message), SystemTime::now());
+            }
+            Err(LoginError::Unanswered(failure)) => {
+                return next_state(&previous, Err(failure), timeouts, SystemTime::now());
+            }
         }
         let answer = probe(client, self.timing.probe_timeout).await;
         if let Err(Failure::Auth(message)) = &answer {
@@ -318,6 +324,35 @@ async fn probe_health(context: Weak<Context>) {
         drop(context);
         tokio::time::sleep(interval).await;
     }
+}
+
+/// Why [`log_in`] did not log in.
+pub(crate) enum LoginError {
+    /// The API server stopped answering while the login waited for its turn.
+    Unanswered(Failure),
+    /// The plugin failed; the message says why.
+    Failed(String),
+}
+
+/// Logs in through `login` once no other plugin runs (see [`auth::turn`]).
+/// A login may open the browser, so it runs only while the API server
+/// answers: the caller has just probed it, and a login that had to wait for
+/// its turn probes it again.
+pub(crate) async fn log_in(
+    login: &Login,
+    client: &Client,
+    probe_timeout: Duration,
+) -> Result<(), LoginError> {
+    let turn = auth::turn().await;
+    if turn.waited {
+        let answer = probe(client, probe_timeout).await;
+        if let Err(failure) = &answer
+            && !answered(&answer)
+        {
+            return Err(LoginError::Unanswered(failure.clone()));
+        }
+    }
+    login.run(&turn).await.map_err(LoginError::Failed)
 }
 
 /// Whether a change of state restarts the watches: watches of a context with
@@ -426,7 +461,12 @@ mod tests {
 
     /// [`context`] with more variables for the plugin.
     async fn context_with(dir: &Path, port: u16, mode: &str, env: &[(&str, &str)]) -> Arc<Context> {
-        let plugin = fake::plugin(dir);
+        // Contexts of one test share the plugin; rewriting it could break a
+        // run of it.
+        let plugin = dir.join("plugin");
+        if !plugin.exists() {
+            fake::plugin(dir);
+        }
         let env: String = env
             .iter()
             .map(|(name, value)| format!("\n      - name: {name}\n        value: {value}"))
@@ -480,6 +520,14 @@ current-context: test
         }
     }
 
+    async fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let started = Instant::now();
+        while !done() {
+            assert!(started.elapsed() < Duration::from_secs(10), "not {what}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     #[tokio::test]
     async fn logs_in_only_while_the_api_server_answers() {
         let dir = tempfile::tempdir().unwrap();
@@ -505,6 +553,69 @@ current-context: test
         context.stop();
     }
 
+    /// Two contexts that both need a login, for example with the same
+    /// identity provider, log in one after the other.
+    #[tokio::test]
+    async fn contexts_log_in_one_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let gate = dir.path().join("gate");
+        let wait = [("GATE", gate.to_str().unwrap())];
+        let api = FakeApi::start(version_for_good_tokens).await;
+        let staging = context_with(dir.path(), api.port(), "wait", &wait).await;
+        let production = context_with(dir.path(), api.port(), "wait", &wait).await;
+
+        wait_until("logging in", || !fake::runs(&runs).is_empty()).await;
+        tokio::time::sleep(FAST.unhealthy_interval * 5).await;
+        assert_eq!(fake::runs(&runs).len(), 1, "two logins at once");
+
+        std::fs::write(&gate, "").unwrap();
+        for context in [&staging, &production] {
+            wait_for(context, "healthy", ContextState::is_healthy).await;
+            context.stop();
+        }
+        assert_eq!(fake::runs(&runs).len(), 2);
+    }
+
+    /// A login that waited for another one runs only if the API server still
+    /// answers then.
+    #[tokio::test]
+    async fn a_login_that_waited_for_its_turn_asks_the_api_server_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let gate = dir.path().join("gate");
+        let wait = [("GATE", gate.to_str().unwrap())];
+        let api = FakeApi::start(version_for_good_tokens).await;
+        let staging = context_with(dir.path(), api.port(), "wait", &wait).await;
+        wait_until("logging in", || fake::runs(&runs).len() == 1).await;
+
+        // The API server answers the first probe of production, whose login
+        // then waits, and is gone when its turn comes.
+        let port = closed_port();
+        let production_api = FakeApi::start_at(port, version_for_good_tokens).await;
+        let production = context_with(dir.path(), port, "wait", &wait).await;
+        wait_until("probed", || !production_api.requests().is_empty()).await;
+        drop(production_api);
+        wait_until("gone", || {
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_err()
+        })
+        .await;
+        std::fs::write(&gate, "").unwrap();
+        wait_for(&staging, "healthy", ContextState::is_healthy).await;
+        wait_for(&production, "unreachable", |state| {
+            matches!(state, ContextState::Unreachable { .. })
+        })
+        .await;
+        tokio::time::sleep(FAST.unhealthy_interval * 5).await;
+        assert_eq!(fake::runs(&runs).len(), 1, "logged in while unreachable");
+
+        let _api = FakeApi::start_at(port, version_for_good_tokens).await;
+        wait_for(&production, "healthy", ContextState::is_healthy).await;
+        assert_eq!(fake::runs(&runs).len(), 2);
+        staging.stop();
+        production.stop();
+    }
+
     /// A plugin that hands out its cached token until that expires does not
     /// run on every probe of the token's last minute.
     #[tokio::test]
@@ -512,7 +623,7 @@ current-context: test
         let dir = tempfile::tempdir().unwrap();
         let runs = dir.path().join("runs");
         let api = FakeApi::start(version_for_good_tokens).await;
-        let port = api.url.rsplit(':').next().unwrap().parse().unwrap();
+        let port = api.port();
         let expires = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(30);
         let expires = format!("'{expires}'");
         let context = context_with(dir.path(), port, "ok", &[("EXPIRES", &expires)]).await;
@@ -532,7 +643,7 @@ current-context: test
             let dir = tempfile::tempdir().unwrap();
             let runs = dir.path().join("runs");
             let api = FakeApi::start(version_for_good_tokens).await;
-            let port = api.url.rsplit(':').next().unwrap().parse().unwrap();
+            let port = api.port();
             let context = context(dir.path(), port, mode).await;
 
             wait_for(&context, "login needed", |state| {

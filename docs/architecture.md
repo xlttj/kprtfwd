@@ -425,9 +425,13 @@ Exec plugins such as `kubectl oidc-login get-token` may log in through the
 browser. kube-rs would run them inside requests (section 4), so the daemon runs
 them itself:
 
-- Only the context actor's health probe runs the plugin: one run at a time, and
-  only while the API server answers. While it is unreachable, for example
-  without VPN, nothing runs and no browser opens.
+- Only the context actor's health probe runs the plugin, and only while the API
+  server answers. While it is unreachable, for example without VPN, nothing
+  runs and no browser opens.
+- Plugins run one at a time across all contexts, discovery and prune
+  included, so a browser login opens one tab at a time, and the next plugin
+  may find the first one's tokens in its cache. A login that had to wait for
+  another one asks the API server again before it runs.
 - The probe logs in when there is no token, when it expires within 60 s, or
   when the API server rejects it. A token that the plugin returns with less
   than 60 s left, such as one it hands out from its own cache until it
@@ -454,8 +458,8 @@ them itself:
   anything that looks like a token.
 - Plugins that return a client certificate instead of a token are not
   supported yet.
-- Discovery and prune log in the same way, once per call, and only if the API
-  server answers.
+- Discovery and prune log in the same way, once per call, in turn with all
+  other logins, and only if the API server answers.
 
 ### 6.8 Logging and events
 
@@ -735,9 +739,10 @@ These are shown in the INFO column and by `kprtfwd status`.
   - login tests with a fake exec plugin and API server: no login while the API
     server is unreachable, one login once it answers, none after a failed or
     rejected login, no secrets in the error, a login that ends when the
-    plugin exits although a process it left behind holds its output, and no
-    login on every probe for a token that keeps its expiry. They probe ten
-    times faster than in use;
+    plugin exits although a process it left behind holds its output, no
+    login on every probe for a token that keeps its expiry, two contexts that
+    log in one after the other, and a login that waited for its turn and
+    finds the API server gone. They probe ten times faster than in use;
   - unit tests with a fake API server on a local port (`fake.rs`): the probe's
     state machine with a given time and the rule for restarting watches;
     `Engine::reconcile` and `reconnect` with a kubeconfig of their own, never

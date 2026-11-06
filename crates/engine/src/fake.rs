@@ -108,6 +108,10 @@ impl FakeApi {
         Self { url, log, task }
     }
 
+    pub fn port(&self) -> u16 {
+        self.url.rsplit(':').next().unwrap().parse().unwrap()
+    }
+
     /// A client without credentials for this server.
     pub fn client(&self) -> Client {
         Client::try_from(Config::new(self.url.parse().unwrap())).unwrap()

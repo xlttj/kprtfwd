@@ -9,7 +9,7 @@ use kprtfwd_core::state::NetCause;
 use kube::api::ListParams;
 use kube::{Api, Client, ResourceExt};
 
-use crate::context::{PROBE_TIMEOUT, answered, client_for, probe};
+use crate::context::{LoginError, PROBE_TIMEOUT, answered, client_for, log_in, probe};
 use crate::errors::{Failure, classify};
 use crate::kubeconfig;
 
@@ -49,10 +49,12 @@ pub async fn services(context: &str, namespace_filter: &str) -> Result<Vec<Servi
         {
             return Err(describe(failure, context));
         }
-        login
-            .run()
+        log_in(&login, &client, PROBE_TIMEOUT)
             .await
-            .map_err(|message| format!("login failed: {message}"))?;
+            .map_err(|err| match err {
+                LoginError::Unanswered(failure) => describe(&failure, context),
+                LoginError::Failed(message) => format!("login failed: {message}"),
+            })?;
     }
     list_services(&client, context, namespace_filter).await
 }

@@ -134,8 +134,8 @@ On its first start, kprtfwd 2 copies the database of version 1 from
 
 Some kubeconfigs log in through an exec plugin, for example `kubectl
 oidc-login`, which opens the browser. The daemon runs such a plugin only while
-the API server answers, so nothing opens while you are off the VPN, and never
-more than one login per context at a time. If a login fails or nobody
+the API server answers, so nothing opens while you are off the VPN, and only
+one login at a time across all contexts. If a login fails or nobody
 completes it, the forward shows `login needed`; press `r` (or run
 `kprtfwd reconnect <context>`) to log in again.
 
