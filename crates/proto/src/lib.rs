@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 pub use client::{Client, ClientError, connect_or_start, spawn_daemon, stop_daemon};
 
 /// Bumped on every incompatible change to the messages.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// A request with its ID. The request is nested, not flattened, because
 /// requests have fields of their own named `id`.
@@ -80,11 +80,14 @@ pub enum Request {
         context: String,
         namespace_filter: String,
     },
-    /// Deletes forwards whose service no longer exists, or only lists them.
+    /// Lists the forwards in `context` whose service no longer exists, or
+    /// deletes some of them. With `delete`, only the forwards of these IDs
+    /// that are still gone are deleted: a client lists first and sends the
+    /// IDs the user confirmed.
     Prune {
         context: String,
         namespace_filter: String,
-        dry_run: bool,
+        delete: Option<Vec<ForwardId>>,
     },
     /// Recent events of these forwards and of their contexts.
     Events {
@@ -117,6 +120,7 @@ pub enum Response {
     Discovered {
         ports: Vec<DiscoveredPort>,
     },
+    /// The forwards whose service is gone, or with `delete` those deleted.
     Pruned {
         forwards: Vec<Forward>,
     },
@@ -295,7 +299,12 @@ mod tests {
             Request::Prune {
                 context: "staging".into(),
                 namespace_filter: "*".into(),
-                dry_run: true,
+                delete: None,
+            },
+            Request::Prune {
+                context: "staging".into(),
+                namespace_filter: "*".into(),
+                delete: Some(vec![id()]),
             },
             Request::Events { ids: vec![id()] },
             Request::Shutdown,

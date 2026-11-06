@@ -346,8 +346,11 @@ async fn report(client: &mut Client, ids: &[ForwardId]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Lists the forwards whose service is gone, asks, and deletes exactly those
+/// the user saw; the daemon spares any whose service is back by then.
 async fn prune(context: Option<String>, namespace: &str, yes: bool) -> Result<ExitCode> {
     let mut client = connect().await?;
+    let defaulted = context.is_none();
     let context = match context {
         Some(context) => context,
         None => match client.request(Request::ListContexts).await? {
@@ -358,19 +361,21 @@ async fn prune(context: Option<String>, namespace: &str, yes: bool) -> Result<Ex
             _ => bail!("no current context in the kubeconfig; pass --context"),
         },
     };
-    let request = |dry_run| Request::Prune {
+    let scope = prune_scope(&context, defaulted, namespace);
+    let request = |delete| Request::Prune {
         context: context.clone(),
         namespace_filter: namespace.to_owned(),
-        dry_run,
+        delete,
     };
-    let gone = match client.request(request(true)).await? {
+    let gone = match client.request(request(None)).await? {
         kprtfwd_proto::Response::Pruned { forwards } => forwards,
         _ => bail!("unexpected answer from the daemon"),
     };
     if gone.is_empty() {
-        println!("Nothing to prune in {context}.");
+        println!("Nothing to prune in {scope}.");
         return Ok(ExitCode::SUCCESS);
     }
+    println!("Forwards whose service is gone, in {scope}:\n");
     let rows: Vec<Vec<String>> = gone
         .iter()
         .map(|f| {
@@ -382,16 +387,42 @@ async fn prune(context: Option<String>, namespace: &str, yes: bool) -> Result<Ex
         })
         .collect();
     print_table(&["SERVICE", "LOCAL", "ID"], &rows);
-    if !yes && !confirm(&format!("\nDelete these {} forwards? [y/N] ", gone.len()))? {
+    let question = match gone.len() {
+        1 => format!("\nDelete this forward of context {context}? [y/N] "),
+        n => format!("\nDelete these {n} forwards of context {context}? [y/N] "),
+    };
+    if !yes && !confirm(&question)? {
         return Ok(ExitCode::SUCCESS);
     }
-    match client.request(request(false)).await? {
-        kprtfwd_proto::Response::Pruned { forwards } => {
-            println!("Deleted {} forwards.", forwards.len());
-        }
+    let confirmed: Vec<ForwardId> = gone.into_iter().map(|f| f.id).collect();
+    let deleted = match client.request(request(Some(confirmed.clone()))).await? {
+        kprtfwd_proto::Response::Pruned { forwards } => forwards,
         _ => bail!("unexpected answer from the daemon"),
+    };
+    for forward in &deleted {
+        println!("Deleted {}", forward.id);
+    }
+    for id in confirmed
+        .iter()
+        .filter(|id| !deleted.iter().any(|f| &f.id == *id))
+    {
+        println!("Not deleted: {id} (its service is back, or the forward changed)");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Names what `prune` works on: the context, whether it is the default, and
+/// the namespace filter.
+fn prune_scope(context: &str, defaulted: bool, namespace_filter: &str) -> String {
+    let mut scope = format!("context {context}");
+    if defaulted {
+        scope.push_str(" (the daemon's current context)");
+    }
+    let filter = namespace_filter.trim();
+    if !filter.is_empty() && filter != "*" {
+        scope.push_str(&format!(", namespaces {filter}"));
+    }
+    scope
 }
 
 fn confirm(question: &str) -> Result<bool> {
@@ -727,6 +758,19 @@ mod tests {
     #[test]
     fn no_match_is_an_error() {
         assert!(select(&snapshot(), &["redis".into()]).is_err());
+    }
+
+    #[test]
+    fn prune_names_the_context_and_the_namespace_filter() {
+        assert_eq!(prune_scope("staging", false, "*"), "context staging");
+        assert_eq!(
+            prune_scope("staging", true, ""),
+            "context staging (the daemon's current context)"
+        );
+        assert_eq!(
+            prune_scope("staging", false, " shop-* "),
+            "context staging, namespaces shop-*"
+        );
     }
 
     #[test]

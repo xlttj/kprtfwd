@@ -489,7 +489,7 @@ enum Request {
     DeleteProject { name: String },
     ListContexts,
     Discover { context: String, namespace_filter: String },
-    Prune { context: String, namespace_filter: String, dry_run: bool },
+    Prune { context: String, namespace_filter: String, delete: Option<Vec<ForwardId>> },
     Events { ids: Vec<ForwardId> },
     Shutdown,
 }
@@ -507,6 +507,12 @@ enum Response {
 
 `SetEnabled` takes a list, so the TUI can switch every forward in its current list
 on or off with one request (`+` / `-`).
+
+`Prune` without `delete` only lists the forwards whose service is gone. The
+confirmed call sends the IDs the user was shown, and the daemon deletes those
+of them that are still gone after listing the cluster again: a forward that
+was not shown is never deleted, and one whose service came back while the
+prompt waited is kept.
 
 ## 8. Persistence and migration
 
@@ -667,7 +673,7 @@ Internal structure:
 | `kprtfwd up <project or words>...` / `down ...` | enable or disable a project, or every forward the words match (as in the TUI filter); `down --all` |
 | `kprtfwd switch <project>` | enable the project, disable everything else |
 | `kprtfwd pause` / `resume` | global pause |
-| `kprtfwd prune [--context C] [--namespace 'app-*'] [-y]` | as in v1: lists forwards whose service is gone and deletes them after asking; nothing is deleted if the cluster cannot be listed |
+| `kprtfwd prune [--context C] [--namespace 'app-*'] [-y]` | as in v1: lists forwards whose service is gone and deletes them after asking; only the listed forwards are deleted, and nothing if the cluster cannot be listed. The list names the context, which defaults to the daemon's current context (its kubeconfig may differ from the shell's) |
 | `kprtfwd logs [-f] [project or words]` | events of the matching forwards and their contexts; without arguments the daemon log |
 | `kprtfwd discover ...` | not built; the TUI's `d` covers it |
 | `kprtfwd reconnect <context>` | rebuild a context's client, watches and forwards |
