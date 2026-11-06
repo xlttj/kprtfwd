@@ -286,6 +286,28 @@ impl Drop for Pipes {
     }
 }
 
+#[cfg(test)]
+impl Login {
+    /// A login through `kubectl`, without a token.
+    pub(crate) fn fake() -> Self {
+        Self {
+            exec: Arc::new(ExecConfig {
+                command: Some("kubectl".into()),
+                ..Default::default()
+            }),
+            token: Arc::default(),
+        }
+    }
+
+    /// Gives it a token that is due for renewal at `renew`, or never.
+    pub(crate) fn set_token(&self, renew: Option<SystemTime>) {
+        *self.token.write().unwrap() = Some(Token {
+            header: HeaderValue::from_static("Bearer good"),
+            renew,
+        });
+    }
+}
+
 /// `KUBERNETES_EXEC_INFO`, as kubectl sets it.
 #[derive(Serialize)]
 struct ExecInfo<'a> {
@@ -513,19 +535,24 @@ pub(crate) mod fake {
     use std::path::{Path, PathBuf};
 
     /// A plugin that appends its `KUBERNETES_EXEC_INFO` to `$RUNS` and then,
-    /// by `$MODE`: prints the token "good", which expires at `$EXPIRES` or
-    /// in the year 2999 (`ok`), the token "bad" (`bad`),
-    /// fails with its arguments on stderr (`fail`), or leaves a process
-    /// behind that holds its stdout and stderr, as a browser it opened
-    /// would, writes that process's ID to `$LINGER` and prints the token
-    /// "good" (`linger`), or waits until the file `$GATE` exists and then
-    /// prints the token "good" (`wait`).
+    /// by `$MODE`:
+    /// - `ok`: prints the token "good", which expires at `$EXPIRES`, by
+    ///   default in the year 2999;
+    /// - `bad`: prints the token "bad";
+    /// - `fail`: fails with its arguments on stderr;
+    /// - `wait`: waits until the file `$GATE` exists, from the run numbered
+    ///   `$WAIT_FROM` on (the lines in `$RUNS`, by default 1), then does
+    ///   what `ok` does;
+    /// - `linger`: leaves a process behind that holds its stdout and stderr,
+    ///   as a browser it opened would, writes that process's ID to
+    ///   `$LINGER`, then does what `ok` does.
     pub fn plugin(dir: &Path) -> PathBuf {
         let path = dir.join("plugin");
         std::fs::write(
             &path,
             r#"#!/bin/sh
 echo "$KUBERNETES_EXEC_INFO" >> "$RUNS"
+good='{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"good","expirationTimestamp":"'"${EXPIRES:-2999-01-01T00:00:00Z}"'"}}'
 case "$MODE" in
   fail)
     echo "opening the browser" >&2
@@ -534,14 +561,16 @@ case "$MODE" in
   bad)
     echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"bad"}}' ;;
   wait)
-    while [ ! -e "$GATE" ]; do sleep 0.02; done
-    echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"good"}}' ;;
+    if [ "$(wc -l < "$RUNS" | tr -d ' ')" -ge "${WAIT_FROM:-1}" ]; then
+      while [ ! -e "$GATE" ]; do sleep 0.02; done
+    fi
+    echo "$good" ;;
   linger)
     sleep 30 &
     echo $! > "$LINGER"
-    echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"good"}}' ;;
+    echo "$good" ;;
   *)
-    echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"good","expirationTimestamp":"'"${EXPIRES:-2999-01-01T00:00:00Z}"'"}}' ;;
+    echo "$good" ;;
 esac
 "#,
         )
@@ -756,19 +785,13 @@ mod tests {
 
     #[test]
     fn logs_in_again_when_the_token_is_due() {
-        let login = login(exec("kubectl", &[], &[]));
+        let login = Login::fake();
         assert!(login.needed());
-        let set = |renew| {
-            *login.token.write().unwrap() = Some(Token {
-                header: HeaderValue::from_static("Bearer abc"),
-                renew,
-            });
-        };
-        set(None);
+        login.set_token(None);
         assert!(!login.needed());
-        set(Some(SystemTime::now() + Duration::from_secs(3600)));
+        login.set_token(Some(SystemTime::now() + Duration::from_secs(3600)));
         assert!(!login.needed());
-        set(Some(SystemTime::now() - Duration::from_secs(1)));
+        login.set_token(Some(SystemTime::now() - Duration::from_secs(1)));
         assert!(login.needed());
         login.forget();
         assert!(!login.has_token());

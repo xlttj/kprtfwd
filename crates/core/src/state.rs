@@ -14,6 +14,10 @@ pub enum ContextState {
     /// No enabled forward uses the context, so nothing runs for it.
     Idle,
     Connecting,
+    /// The context's exec plugin is logging in, maybe through the browser,
+    /// and the API server does not accept the context's credentials until
+    /// it is done.
+    LoggingIn,
     Healthy {
         server_version: String,
     },
@@ -63,6 +67,7 @@ impl ContextState {
         match self {
             Self::Idle => "idle".into(),
             Self::Connecting => "connecting".into(),
+            Self::LoggingIn => "logging in".into(),
             Self::Healthy { .. } => "ok".into(),
             Self::Unreachable { cause, .. } => format!("unreachable ({})", cause.short()),
             Self::AuthFailed { .. } => "login needed".into(),
@@ -129,6 +134,7 @@ impl ForwardState {
                 ContextState::Unreachable { cause, .. } => {
                     format!("API unreachable ({})", cause.short())
                 }
+                ContextState::LoggingIn => "logging in".into(),
                 ContextState::AuthFailed { .. } => "login needed: reconnect (r) to log in".into(),
                 ContextState::ConfigError { message } => format!("kubeconfig: {message}"),
                 ContextState::Idle | ContextState::Connecting => "connecting".into(),
@@ -293,6 +299,12 @@ mod tests {
             (
                 true,
                 false,
+                Some(observed(Bind::Bound, ContextState::LoggingIn, pods.clone())),
+                ForwardState::WaitingForContext,
+            ),
+            (
+                true,
+                false,
                 Some(observed(Bind::Bound, healthy(), Target::Syncing)),
                 ForwardState::Starting,
             ),
@@ -351,6 +363,11 @@ mod tests {
             ForwardState::WaitingForContext.info(&auth),
             "login needed: reconnect (r) to log in"
         );
+        assert_eq!(
+            ForwardState::WaitingForContext.info(&ContextState::LoggingIn),
+            "logging in"
+        );
+        assert_eq!(ContextState::LoggingIn.summary(), "logging in");
         assert_eq!(
             ForwardState::WaitingForPods { ready: 0, total: 2 }.info(&healthy()),
             "0/2 pods ready"

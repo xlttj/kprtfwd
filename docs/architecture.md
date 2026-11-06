@@ -365,6 +365,7 @@ closed, as in kubectl's WebSocket mode and in kube-rs.
 enum ContextState {
     Idle,                                       // no enabled forwards
     Connecting,
+    LoggingIn,                                  // exec plugin running, no accepted token
     Healthy { server_version: String },
     Unreachable { since: SystemTime, cause: NetCause },
     AuthFailed { since: SystemTime, message: String },
@@ -425,9 +426,15 @@ Exec plugins such as `kubectl oidc-login get-token` may log in through the
 browser. kube-rs would run them inside requests (section 4), so the daemon runs
 them itself:
 
-- Only the context actor's health probe runs the plugin, and only while the API
-  server answers. While it is unreachable, for example without VPN, nothing
-  runs and no browser opens.
+- Only the context actor's health probe starts the plugin, and only while the
+  API server answers. While it is unreachable, for example without VPN,
+  nothing runs and no browser opens.
+- The login runs next to the probe, not inside it, so the probe goes on: a
+  VPN drop during a browser login still shows. While the context has no
+  token the API server accepts (none yet, or a rejected one), its state is
+  `LoggingIn` and its forwards wait with `logging in`; while the old token
+  still works, the context stays `Healthy`. Every login is a context event,
+  `logging in with <plugin>`.
 - Plugins run one at a time across all contexts, discovery and prune
   included, so a browser login opens one tab at a time, and the next plugin
   may find the first one's tokens in its cache. A login that had to wait for
@@ -721,6 +728,7 @@ These are shown in the INFO column and by `kprtfwd status`.
 |---|---|
 | DNS lookup of the API host fails | `API unreachable (DNS)`; header: `staging unreachable (DNS, VPN?)` |
 | refused or timed out | `API unreachable (timeout)` |
+| exec plugin logging in, no accepted token yet | `logging in` |
 | login failed or rejected (401) | `login needed: reconnect (r) to log in` |
 | 403 on watch or port-forward | `forbidden: port-forward in namespace X` |
 | `EADDRINUSE` | `port busy: mysqld (pid 812)` |
@@ -741,8 +749,10 @@ These are shown in the INFO column and by `kprtfwd status`.
     rejected login, no secrets in the error, a login that ends when the
     plugin exits although a process it left behind holds its output, no
     login on every probe for a token that keeps its expiry, two contexts that
-    log in one after the other, and a login that waited for its turn and
-    finds the API server gone. They probe ten times faster than in use;
+    log in one after the other, a login that waited for its turn and finds
+    the API server gone, and a login next to the probe: an outage meanwhile
+    shows, and a renewal keeps the context healthy until the API server
+    rejects the old token. They probe ten times faster than in use;
   - unit tests with a fake API server on a local port (`fake.rs`): the probe's
     state machine with a given time and the rule for restarting watches;
     `Engine::reconcile` and `reconnect` with a kubeconfig of their own, never

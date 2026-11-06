@@ -132,6 +132,8 @@ fn header_line(snapshot: &Snapshot, width: u16) -> Line<'static> {
             let style = match &c.state {
                 ContextState::Healthy { .. } => Style::new().fg(Color::Green),
                 ContextState::Idle | ContextState::Connecting => dim(),
+                // The browser may be waiting for the user.
+                ContextState::LoggingIn => Style::new().fg(Color::Yellow),
                 _ => Style::new().fg(Color::Red),
             };
             let mut text = c.state.summary();

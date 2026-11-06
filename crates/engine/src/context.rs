@@ -5,13 +5,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
+use futures::FutureExt;
+use futures::future::BoxFuture;
 use kprtfwd_core::state::{ContextState, NetCause};
 use kube::client::ClientBuilder;
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Client, Config};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::auth::{self, Login};
 use crate::cache::NamespaceCache;
@@ -191,46 +193,15 @@ impl Context {
         }
     }
 
-    /// Probes the API server once, logs in if the context needs to, and
-    /// returns the new state.
-    ///
-    /// A login may open the browser, so it only happens here, one at a time,
-    /// and only while the API server answers.
-    async fn check(&self, client: &Client, timeouts: &mut u32) -> ContextState {
-        let previous = self.state();
-        let answer = probe(client, self.timing.probe_timeout).await;
-        let Some(login) = &self.login else {
-            return next_state(&previous, answer, timeouts, SystemTime::now());
-        };
-        let rejected = matches!(answer, Err(Failure::Auth(_)));
-        if !answered(&answer) || !(rejected || login.needed()) {
-            return next_state(&previous, answer, timeouts, SystemTime::now());
-        }
-
-        if rejected {
-            login.forget();
-        }
-        if previous.is_healthy() {
-            debug!(context = %self.name, "refreshing the login");
-        } else {
-            self.set_state(ContextState::Connecting);
-        }
-        match log_in(login, client, self.timing.probe_timeout).await {
-            Ok(()) => {}
-            Err(LoginError::Failed(message)) => {
-                return failed(&previous, Failure::Auth(message), SystemTime::now());
-            }
-            Err(LoginError::Unanswered(failure)) => {
-                return next_state(&previous, Err(failure), timeouts, SystemTime::now());
-            }
-        }
-        let answer = probe(client, self.timing.probe_timeout).await;
-        if let Err(Failure::Auth(message)) = &answer {
-            login.forget();
-            let message = format!("the API server rejected the login: {message}");
-            return failed(&previous, Failure::Auth(message), SystemTime::now());
-        }
-        next_state(&previous, answer, timeouts, SystemTime::now())
+    /// Starts a login through the context's plugin; see [`probe_health`].
+    fn start_login(&self, client: &Client) -> Option<BoxFuture<'static, Result<(), LoginError>>> {
+        let login = self.login.clone()?;
+        let plugin = login.name();
+        info!(context = %self.name, %plugin, "logging in");
+        self.events.push(format!("logging in with {plugin}"));
+        let client = client.clone();
+        let probe_timeout = self.timing.probe_timeout;
+        Some(async move { log_in(&login, &client, probe_timeout).await }.boxed())
     }
 
     /// Logs a change of state, keeps it in the context's events and
@@ -248,9 +219,11 @@ impl Context {
                 info!(context = %self.name, %server_version, "API server reachable");
                 format!("API server reachable ({server_version})")
             }
-            ContextState::Connecting => {
+            ContextState::LoggingIn => {
                 let plugin = self.login.as_ref().map(Login::name).unwrap_or_default();
-                info!(context = %self.name, %plugin, "logging in");
+                info!(context = %self.name, %plugin, "waiting for the login");
+                // The same text as the start of the login, so the two make
+                // one event when they come together.
                 format!("logging in with {plugin}")
             }
             ContextState::AuthFailed { message, .. } => {
@@ -296,17 +269,36 @@ impl Context {
     }
 }
 
-/// Probes the API server until the context is dropped or stopped.
-async fn probe_health(context: Weak<Context>) {
-    let mut timeouts = 0;
+/// Probes the API server until the context is dropped or stopped, and logs
+/// in when the context needs to.
+///
+/// A login may open the browser, so it starts only here and only while the
+/// API server answers. It runs next to the probe, not inside it: a browser
+/// login can wait minutes for the user, and an outage in the meantime must
+/// still show.
+async fn probe_health(weak: Weak<Context>) {
+    let mut probed = Probed::default();
+    // The login the probe started, while it runs.
+    let mut login = None;
     loop {
-        let Some(context) = context.upgrade() else {
+        let Some(context) = weak.upgrade() else {
             return;
         };
         let Some(client) = context.client.clone() else {
             return;
         };
-        let next = context.check(&client, &mut timeouts).await;
+        let answer = probe(&client, context.timing.probe_timeout).await;
+        let (next, log_in) = after_probe(
+            &context.state(),
+            answer,
+            context.login.as_ref(),
+            login.is_some(),
+            &mut probed,
+            SystemTime::now(),
+        );
+        if log_in {
+            login = context.start_login(&client);
+        }
         let login_failed =
             context.login.is_some() && matches!(next, ContextState::AuthFailed { .. });
         context.set_state(next);
@@ -322,7 +314,81 @@ async fn probe_health(context: Weak<Context>) {
             context.timing.unhealthy_interval
         };
         drop(context);
-        tokio::time::sleep(interval).await;
+        let Some(running) = &mut login else {
+            tokio::time::sleep(interval).await;
+            continue;
+        };
+        let ended = tokio::select! {
+            ended = running => ended,
+            () = tokio::time::sleep(interval) => continue,
+        };
+        // The login ended; probe again at once.
+        login = None;
+        match ended {
+            // Whether the API server takes the new token.
+            Ok(()) => probed.unverified = true,
+            // The API server stopped answering while the login waited for
+            // its turn; the probe will show it.
+            Err(LoginError::Unanswered(_)) => {}
+            Err(LoginError::Failed(message)) => {
+                if let Some(context) = weak.upgrade() {
+                    let now = SystemTime::now();
+                    context.set_state(failed(&context.state(), Failure::Auth(message), now));
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// What the probe keeps from one probe to the next.
+#[derive(Debug, Default)]
+struct Probed {
+    /// Timeouts in a row; see [`next_state`].
+    timeouts: u32,
+    /// Set when a login succeeded, until the API server answers. If it
+    /// rejects the new token, another login would only get the same.
+    unverified: bool,
+}
+
+/// The state after a probe at `now`, and whether to start a login, for a
+/// context that logs in through `login`, if it has one, while `logging_in`
+/// says whether a login runs.
+///
+/// A context logs in when the API server answers and the token is missing,
+/// due or rejected. While it has no token the server accepts, the login
+/// decides whether it is usable, so its state is [`ContextState::LoggingIn`];
+/// while the old token still works, it stays healthy. Probes that get no
+/// answer change the state as without a login; a login that runs goes on, as
+/// the user may be in the middle of it.
+fn after_probe(
+    previous: &ContextState,
+    answer: Result<String, Failure>,
+    login: Option<&Login>,
+    logging_in: bool,
+    probed: &mut Probed,
+    now: SystemTime,
+) -> (ContextState, bool) {
+    let Some(login) = login.filter(|_| answered(&answer)) else {
+        return (
+            next_state(previous, answer, &mut probed.timeouts, now),
+            false,
+        );
+    };
+    let unverified = std::mem::take(&mut probed.unverified);
+    if let Err(Failure::Auth(message)) = &answer {
+        login.forget();
+        if unverified {
+            let message = format!("the API server rejected the login: {message}");
+            return (failed(previous, Failure::Auth(message), now), false);
+        }
+    }
+    let log_in = !logging_in && login.needed();
+    let next = next_state(previous, answer, &mut probed.timeouts, now);
+    if (logging_in || log_in) && !login.has_token() {
+        (ContextState::LoggingIn, log_in)
+    } else {
+        (next, log_in)
     }
 }
 
@@ -429,6 +495,7 @@ fn failed(previous: &ContextState, failure: Failure, now: SystemTime) -> Context
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
 
     use kube::config::Kubeconfig;
@@ -551,6 +618,185 @@ current-context: test
         tokio::time::sleep(FAST.healthy_interval * 5).await;
         assert_eq!(fake::runs(&runs).len(), 1);
         context.stop();
+    }
+
+    /// A login that waits for the user does not stop the probe: an outage in
+    /// the meantime shows, and while the API server answers, the context is
+    /// logging in.
+    #[tokio::test]
+    async fn a_login_runs_next_to_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let gate = dir.path().join("gate");
+        let port = closed_port();
+        let api = FakeApi::start_at(port, version_for_good_tokens).await;
+        let wait = [("GATE", gate.to_str().unwrap())];
+        let context = context_with(dir.path(), port, "wait", &wait).await;
+        let logging_in = |state: &ContextState| *state == ContextState::LoggingIn;
+        wait_for(&context, "logging in", logging_in).await;
+
+        drop(api);
+        wait_for(&context, "unreachable", |state| {
+            matches!(state, ContextState::Unreachable { .. })
+        })
+        .await;
+        let _api = FakeApi::start_at(port, version_for_good_tokens).await;
+        wait_for(&context, "logging in again", logging_in).await;
+
+        std::fs::write(&gate, "").unwrap();
+        wait_for(&context, "healthy", ContextState::is_healthy).await;
+        assert_eq!(fake::runs(&runs).len(), 1);
+        let events: Vec<String> = context
+            .events
+            .entries()
+            .into_iter()
+            .map(|event| event.message)
+            .collect();
+        let login = "logging in with plugin get-token";
+        assert_eq!(
+            events.first().map(String::as_str),
+            Some(login),
+            "{events:?}"
+        );
+        assert_eq!(
+            events.iter().filter(|event| *event == login).count(),
+            2,
+            "{events:?}"
+        );
+        assert_eq!(
+            events.last().map(String::as_str),
+            Some("API server reachable (v1.33.0)")
+        );
+        context.stop();
+    }
+
+    /// While a login renews a token that still works, the context stays
+    /// healthy and is probed; once the API server rejects the token, it is
+    /// logging in.
+    #[tokio::test]
+    async fn a_renewal_keeps_the_context_healthy_while_the_token_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let gate = dir.path().join("gate");
+        let expired = Arc::new(AtomicBool::new(false));
+        let api = FakeApi::start({
+            let expired = expired.clone();
+            move |request| {
+                if expired.load(Ordering::Relaxed) {
+                    Reply::Json(401, status(401, "Unauthorized"))
+                } else {
+                    version_for_good_tokens(request)
+                }
+            }
+        })
+        .await;
+        // Only the second login, the renewal, waits.
+        let env = [("GATE", gate.to_str().unwrap()), ("WAIT_FROM", "2")];
+        let context = context_with(dir.path(), api.port(), "wait", &env).await;
+        wait_for(&context, "healthy", ContextState::is_healthy).await;
+        // The token is due, but still works.
+        let login = context.login.as_ref().unwrap();
+        login.set_token(Some(SystemTime::now()));
+        wait_until("renewing", || fake::runs(&runs).len() == 2).await;
+
+        let probes = api.requests().len();
+        tokio::time::sleep(FAST.healthy_interval * 3).await;
+        assert!(context.state().is_healthy(), "{:?}", context.state());
+        assert!(api.requests().len() > probes, "not probed while renewing");
+
+        expired.store(true, Ordering::Relaxed);
+        wait_for(&context, "logging in", |state| {
+            *state == ContextState::LoggingIn
+        })
+        .await;
+        expired.store(false, Ordering::Relaxed);
+        std::fs::write(&gate, "").unwrap();
+        wait_for(&context, "healthy", ContextState::is_healthy).await;
+        assert_eq!(fake::runs(&runs).len(), 2);
+        context.stop();
+    }
+
+    #[test]
+    fn a_context_is_logging_in_while_it_has_no_token_the_server_takes() {
+        let login = Login::fake();
+        let mut probed = Probed::default();
+        let ok = || Ok("v1.33.0".to_owned());
+        let rejected = || Err(Failure::Auth("Unauthorized".into()));
+        let mut step = |previous: &ContextState, answer, logging_in| {
+            after_probe(
+                previous,
+                answer,
+                Some(&login),
+                logging_in,
+                &mut probed,
+                at(10),
+            )
+        };
+        // Without a token it logs in, and waits for that.
+        assert_eq!(
+            step(&ContextState::Connecting, ok(), false),
+            (ContextState::LoggingIn, true)
+        );
+        // While the login runs, an outage shows; nothing else starts.
+        assert_eq!(
+            step(&ContextState::LoggingIn, timeout(), true),
+            (unreachable(10, NetCause::Timeout), false)
+        );
+        assert_eq!(
+            step(&unreachable(10, NetCause::Timeout), rejected(), true),
+            (ContextState::LoggingIn, false)
+        );
+
+        // A token that works and is due is renewed while the context stays
+        // healthy, until the API server rejects it.
+        login.set_token(Some(at(0)));
+        assert_eq!(step(&healthy(), ok(), false), (healthy(), true));
+        assert_eq!(step(&healthy(), ok(), true), (healthy(), false));
+        assert_eq!(
+            step(&healthy(), rejected(), true),
+            (ContextState::LoggingIn, false)
+        );
+        assert!(!login.has_token());
+    }
+
+    #[test]
+    fn a_new_token_the_server_rejects_ends_the_logins() {
+        let login = Login::fake();
+        login.set_token(None);
+        let mut probed = Probed {
+            unverified: true,
+            ..Probed::default()
+        };
+        let (state, log_in) = after_probe(
+            &ContextState::LoggingIn,
+            Err(Failure::Auth("Unauthorized".into())),
+            Some(&login),
+            false,
+            &mut probed,
+            at(10),
+        );
+        assert_eq!(
+            state,
+            ContextState::AuthFailed {
+                since: at(10),
+                message: "the API server rejected the login: Unauthorized".into(),
+            }
+        );
+        assert!(!log_in);
+
+        // An answer that takes the token ends the check.
+        login.set_token(None);
+        probed.unverified = true;
+        let step = after_probe(
+            &ContextState::LoggingIn,
+            Ok("v1.33.0".into()),
+            Some(&login),
+            false,
+            &mut probed,
+            at(10),
+        );
+        assert_eq!(step, (healthy(), false));
+        assert!(!probed.unverified);
     }
 
     /// Two contexts that both need a login, for example with the same
