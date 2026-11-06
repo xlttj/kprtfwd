@@ -163,7 +163,8 @@ pub struct Snapshot {
     /// All forwards, sorted by context, namespace, service and port.
     pub forwards: Vec<ForwardView>,
     pub projects: Vec<ProjectView>,
-    /// The kubeconfig files the daemon reads.
+    /// The kubeconfig files the daemon reads; one that does not exist ends
+    /// with ` (missing)`.
     pub kubeconfig_files: Vec<String>,
 }
 

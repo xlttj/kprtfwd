@@ -7,7 +7,6 @@ use k8s_openapi::api::core::v1::{Namespace, Service};
 use kprtfwd_core::filter::wildcard;
 use kprtfwd_core::state::NetCause;
 use kube::api::ListParams;
-use kube::config::Kubeconfig;
 use kube::{Api, Client, ResourceExt};
 
 use crate::context::{PROBE_TIMEOUT, answered, client_for, probe};
@@ -32,7 +31,7 @@ pub struct PortInfo {
 
 /// The context names in the kubeconfig, sorted, and the current context.
 pub fn contexts() -> Result<(Vec<String>, Option<String>), String> {
-    let config = Kubeconfig::read().map_err(|err| kubeconfig::describe(&err))?;
+    let config = kubeconfig::read()?;
     let mut names: Vec<String> = config.contexts.iter().map(|c| c.name.clone()).collect();
     names.sort();
     Ok((names, config.current_context))

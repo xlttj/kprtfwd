@@ -210,8 +210,11 @@ Main dependencies:
   2. Load forwards and their desired state.
   3. Start a context actor for every context with an enabled forward.
 - **Kubeconfig.** The daemon inherits `KUBECONFIG` from the client that started
-  it; `kprtfwd status` shows which files are in use. Every 2 s it checks their
-  modification times. After a change it hashes, per context, what its client
+  it; `kprtfwd status` shows which files are in use. The engine merges them in
+  one place, for clients, discovery and the hashes below, and skips files that
+  do not exist, as kubectl does: a stale entry in `KUBECONFIG` breaks no
+  context, and `status` marks it missing. Every 2 s the daemon checks the
+  files' modification times. After a change it hashes, per context, what its client
   is built from (the names of its cluster and user and their entries) and
   reconnects only the running contexts whose hash changed: a renewed token, a
   moved cluster, a context that was missing. The hash sorts the keys of every

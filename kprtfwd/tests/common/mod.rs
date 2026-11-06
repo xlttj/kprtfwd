@@ -10,6 +10,7 @@
 // Each test file uses a part.
 #![allow(dead_code)]
 
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -20,7 +21,8 @@ use kprtfwd_proto::{Client, Request};
 
 pub struct Home {
     dir: tempfile::TempDir,
-    kubeconfig: Option<PathBuf>,
+    /// `KUBECONFIG` for commands.
+    kubeconfig: Option<OsString>,
 }
 
 impl Home {
@@ -42,9 +44,19 @@ impl Home {
 
     /// Writes a kubeconfig that commands, and so the daemons they start, use.
     pub fn set_kubeconfig(&mut self, yaml: &str) {
-        let path = self.path().join("kubeconfig");
+        let path = self.kubeconfig_file();
         std::fs::write(&path, yaml).unwrap();
-        self.kubeconfig = Some(path);
+        self.kubeconfig = Some(path.into());
+    }
+
+    /// The file [`Home::set_kubeconfig`] writes.
+    pub fn kubeconfig_file(&self) -> PathBuf {
+        self.path().join("kubeconfig")
+    }
+
+    /// Sets `KUBECONFIG` for commands to a list of files.
+    pub fn set_kubeconfig_files(&mut self, files: &[PathBuf]) {
+        self.kubeconfig = Some(std::env::join_paths(files).unwrap());
     }
 
     pub fn data_dir(&self) -> PathBuf {

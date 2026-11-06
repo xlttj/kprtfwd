@@ -575,7 +575,13 @@ impl Daemon {
             projects,
             kubeconfig_files: kubeconfig::files()
                 .iter()
-                .map(|path| path.display().to_string())
+                .map(|path| {
+                    if path.exists() {
+                        path.display().to_string()
+                    } else {
+                        format!("{} (missing)", path.display())
+                    }
+                })
                 .collect(),
         })
     }

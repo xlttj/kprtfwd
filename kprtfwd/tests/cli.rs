@@ -219,6 +219,37 @@ fn prune_deletes_only_what_the_user_confirmed() {
     );
 }
 
+#[test]
+fn a_kubeconfig_file_that_does_not_exist_is_skipped() {
+    let mut home = Home::new();
+    home.set_kubeconfig(&kubeconfig(fake_api()));
+    // A stale entry in KUBECONFIG, as kubectl tolerates it.
+    let gone = home.path().join("gone");
+    let file = home.kubeconfig_file();
+    home.set_kubeconfig_files(&[gone.clone(), file.clone()]);
+    write_database(&home.db(), &[forward("test", "shop", "old", false)], false);
+
+    // The current context and its client come from the file that exists.
+    let output = home.run(&["prune", "-y"]);
+    assert!(output.status.success(), "{output:?}");
+    let out = stdout(&output);
+    assert!(
+        out.contains("in context test (the daemon's current context)"),
+        "{out}"
+    );
+    assert!(out.contains("Deleted test.shop.old-80"), "{out}");
+
+    let out = stdout(&home.run(&["status"]));
+    assert!(
+        out.contains(&format!(
+            "kubeconfig: {} (missing), {}\n",
+            gone.display(),
+            file.display()
+        )),
+        "{out}"
+    );
+}
+
 /// Waits for a line of `lines` that ends with `end`.
 fn wait_for_line(lines: &mpsc::Receiver<String>, end: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);

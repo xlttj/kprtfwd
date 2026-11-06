@@ -1,8 +1,9 @@
-//! Noticing kubeconfig changes per context.
+//! Reading the kubeconfig files, and noticing changes per context.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io;
 use std::path::PathBuf;
 
 use kube::config::{Kubeconfig, KubeconfigError};
@@ -33,13 +34,52 @@ pub fn files() -> Vec<PathBuf> {
 }
 
 /// The kubeconfig files for these values of `$KUBECONFIG` and `$HOME`.
+/// Empty entries of `$KUBECONFIG` are ignored, as kubectl and kube-rs do.
 fn files_of(kubeconfig: Option<OsString>, home: Option<OsString>) -> Vec<PathBuf> {
-    match kubeconfig.filter(|value| !value.is_empty()) {
-        Some(value) => std::env::split_paths(&value).collect(),
-        None => home
-            .map(|home| vec![PathBuf::from(home).join(".kube").join("config")])
-            .unwrap_or_default(),
+    let listed: Vec<PathBuf> = kubeconfig
+        .map(|value| {
+            std::env::split_paths(&value)
+                .filter(|path| !path.as_os_str().is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !listed.is_empty() {
+        return listed;
     }
+    home.map(|home| vec![PathBuf::from(home).join(".kube").join("config")])
+        .unwrap_or_default()
+}
+
+/// The kubeconfig from [`files`], merged as kubectl merges them: the first
+/// file to set a value wins, and a file that does not exist is skipped, so a
+/// stale entry in `$KUBECONFIG` breaks nothing. A file that cannot be read or
+/// parsed is an error, and so is finding no file at all.
+pub fn read() -> Result<Kubeconfig, String> {
+    read_files(&files())
+}
+
+fn read_files(files: &[PathBuf]) -> Result<Kubeconfig, String> {
+    let mut merged = Kubeconfig::default();
+    let mut found = false;
+    for file in files {
+        let config = match Kubeconfig::read_from(file) {
+            Ok(config) => config,
+            Err(KubeconfigError::ReadConfig(err, _)) if err.kind() == io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(err) => return Err(describe(&err)),
+        };
+        merged = merged.merge(config).map_err(|err| describe(&err))?;
+        found = true;
+    }
+    if found {
+        return Ok(merged);
+    }
+    if files.is_empty() {
+        return Err(describe(&KubeconfigError::FindPath));
+    }
+    let names: Vec<String> = files.iter().map(|f| f.display().to_string()).collect();
+    Err(format!("no kubeconfig file found: {}", names.join(", ")))
 }
 
 /// A hash per context over what its client is built from, to tell which
@@ -49,7 +89,7 @@ fn files_of(kubeconfig: Option<OsString>, home: Option<OsString>) -> Vec<PathBuf
 /// reconnect them. Only the hash is kept, never the settings, which include
 /// credentials.
 pub fn fingerprints() -> Result<HashMap<String, u64>, String> {
-    fingerprints_of(&Kubeconfig::read().map_err(|err| describe(&err))?)
+    fingerprints_of(&read()?)
 }
 
 fn fingerprints_of(config: &Kubeconfig) -> Result<HashMap<String, u64>, String> {
@@ -349,13 +389,81 @@ contexts:
             files_of(Some("/k/one:/k/two".into()), Some("/home/dev".into())),
             [PathBuf::from("/k/one"), PathBuf::from("/k/two")]
         );
-        for unset in [None, Some(OsString::new())] {
+        assert_eq!(
+            files_of(Some(":/k/one::".into()), Some("/home/dev".into())),
+            [PathBuf::from("/k/one")]
+        );
+        for unset in [None, Some(OsString::new()), Some(":".into())] {
             assert_eq!(
                 files_of(unset, Some("/home/dev".into())),
                 [PathBuf::from("/home/dev/.kube/config")]
             );
         }
         assert!(files_of(None, None).is_empty());
+    }
+
+    /// Context `d` on cluster one, current.
+    const SECOND: &str = r#"
+apiVersion: v1
+kind: Config
+current-context: d
+clusters:
+- name: one
+  cluster:
+    server: https://elsewhere.example:6443
+users:
+- name: dave
+  user:
+    token: tok-dave
+contexts:
+- name: d
+  context:
+    cluster: one
+    user: dave
+"#;
+
+    #[test]
+    fn files_that_do_not_exist_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        let gone = dir.path().join("gone");
+        let yaml = TEMPLATE
+            .replace("{one}", ONE)
+            .replace("{alice}", TOKEN)
+            .replace("{current}", "a");
+        std::fs::write(&first, &yaml).unwrap();
+        std::fs::write(&second, SECOND).unwrap();
+
+        let merged = read_files(&[gone.clone(), first.clone(), gone.clone(), second]).unwrap();
+        let names: Vec<&str> = merged.contexts.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c", "d"]);
+        // The first file to set a value wins, as in kubectl.
+        assert_eq!(merged.current_context.as_deref(), Some("a"));
+        let one = merged.clusters.iter().find(|c| c.name == "one").unwrap();
+        assert_eq!(one.cluster.as_ref().unwrap().server.as_deref(), Some(ONE));
+
+        // Skipping changes nothing for the files that exist.
+        assert_eq!(
+            fingerprints_of(&read_files(&[first.clone(), gone.clone()]).unwrap()).unwrap(),
+            fingerprints_of(&Kubeconfig::from_yaml(&yaml).unwrap()).unwrap()
+        );
+
+        // No file at all is an error that names the files.
+        let message = read_files(std::slice::from_ref(&gone)).unwrap_err();
+        assert_eq!(
+            message,
+            format!("no kubeconfig file found: {}", gone.display())
+        );
+        assert!(read_files(&[]).is_err());
+
+        // A file that exists but cannot be parsed is still an error.
+        std::fs::write(&first, "users: [\n").unwrap();
+        let message = read_files(&[gone, first]).unwrap_err();
+        assert!(
+            message.starts_with("cannot parse the kubeconfig"),
+            "{message:?}"
+        );
     }
 
     #[test]

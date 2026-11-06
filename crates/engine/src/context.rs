@@ -65,11 +65,13 @@ async fn load(context: &str, kubeconfig: Option<&Kubeconfig>) -> Result<Config, 
         context: Some(context.to_owned()),
         ..Default::default()
     };
-    let config = match kubeconfig {
-        Some(kubeconfig) => Config::from_custom_kubeconfig(kubeconfig.clone(), &options).await,
-        None => Config::from_kubeconfig(&options).await,
+    let kubeconfig = match kubeconfig {
+        Some(kubeconfig) => kubeconfig.clone(),
+        None => kubeconfig::read()?,
     };
-    config.map_err(|err| kubeconfig::describe(&err))
+    Config::from_custom_kubeconfig(kubeconfig, &options)
+        .await
+        .map_err(|err| kubeconfig::describe(&err))
 }
 
 /// A client for a kubeconfig context, and its login if it logs in through an
