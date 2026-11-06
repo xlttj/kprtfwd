@@ -790,7 +790,8 @@ These are shown in the INFO column and by `kprtfwd status`.
   daemon still running in `~/.kprtfwd` is stopped and its database copied,
   and with a fake API server and exec plugin, `use-context`, `kubens` and a
   rewrite of a user with env entries cause no reconnect and no login while a
-  moved cluster causes exactly one.
+  moved cluster causes exactly one; `status` shows a context and its forward
+  `logging in` while the plugin waits.
 - **cli:** unit tests for the exit code rules; `kprtfwd/tests/cli.rs` runs the
   binary the same way: exit code 2 without a daemon and for one that cannot
   start, 3 while an enabled forward is not ready and 0 once it is paused, `up`

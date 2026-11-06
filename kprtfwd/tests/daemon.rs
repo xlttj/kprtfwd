@@ -1,5 +1,6 @@
 //! The daemon through the real binary: switching the forwards off when the
-//! last TUI quits, taking over `~/.kprtfwd`, and watching the kubeconfig.
+//! last TUI quits, taking over `~/.kprtfwd`, watching the kubeconfig, and a
+//! login that waits for the user.
 //!
 //! Every command runs in a home directory of its own; see `common`.
 
@@ -231,4 +232,37 @@ async fn only_new_client_settings_reconnect_a_context() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(count("kubeconfig changed, reconnecting"), 1);
     assert_eq!(logins(), 2);
+}
+
+/// While the exec plugin waits for the user, `status` shows the context and
+/// its forward logging in; once the plugin is done, the context is ok.
+#[tokio::test]
+async fn status_shows_a_login_that_waits() {
+    let mut home = Home::new();
+    let plugin = home.path().join("plugin");
+    std::fs::write(
+        &plugin,
+        r#"#!/bin/sh
+echo login >> "$RUNS"
+while [ ! -e "$0.gate" ]; do sleep 0.02; done
+echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"good","expirationTimestamp":"2999-01-01T00:00:00Z"}}'
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    home.set_kubeconfig(&exec_kubeconfig(&home, &plugin, version_api(), "test", ""));
+    write_database(&home.db(), &[forward("test", "shop", "api", true)], false);
+    home.start_daemon();
+
+    let status = || String::from_utf8_lossy(&home.run(&["status"]).stdout).into_owned();
+    wait_until("logging in", || status().starts_with("test logging in")).await;
+    let rows = status();
+    let row = rows.lines().find(|line| line.contains("shop/api:80"));
+    assert!(
+        row.is_some_and(|row| row.starts_with("waiting") && row.ends_with("logging in")),
+        "{rows}"
+    );
+
+    std::fs::write(plugin.with_extension("gate"), "").unwrap();
+    wait_until("logged in", || status().starts_with("test ok")).await;
 }
