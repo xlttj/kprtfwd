@@ -212,7 +212,9 @@ Main dependencies:
   and user entries and reconnects only the running contexts whose hash changed:
   a renewed token, a moved cluster, a context that was missing. Switching
   `current-context` or editing another context leaves running forwards alone.
-  Only the hashes are kept, not the settings, which include credentials.
+  Only the hashes are kept, not the settings, which include credentials. For
+  the same reason a kubeconfig that cannot be parsed is reported by line and
+  column only, never with the lines around the error.
 - **Stop.** `kprtfwd daemon stop`, SIGTERM, the idle exit, or the last TUI
   quitting: close listeners, close forwards, close the database. Only the last
   one switches the forwards off first.
@@ -422,8 +424,9 @@ them itself:
   ignores that flag and opens the browser anyway, which is why the rules above
   are needed. A login that takes longer than 5 minutes is stopped.
 - Errors name the plugin by its command and first argument, never the other
-  arguments: kubeconfigs pass client secrets there. Values of flags and
-  variables named like a secret are masked in the plugin's error text.
+  arguments: kubeconfigs pass client secrets there. In the plugin's own error
+  text every value it was given is masked, whatever its name, and so is
+  anything that looks like a token.
 - Plugins that return a client certificate instead of a token are not
   supported yet.
 - Discovery and prune log in the same way, once per call, and only if the API
