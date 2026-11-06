@@ -8,14 +8,116 @@ use rusqlite::Connection;
 
 const V1_FIXTURE: &str = include_str!("fixtures/v1.sql");
 
-/// Writes the v1 fixture to `<dir>/kprtfwd.db`, in WAL mode like v1.
+/// Writes the v1 fixture to `<dir>/kprtfwd.db` through [`v1_connection`], so
+/// the file has SQLite's default rollback journal like a v1 file.
 fn v1_database(dir: &Path) -> PathBuf {
     let path = dir.join("kprtfwd.db");
-    let conn = Connection::open(&path).unwrap();
-    conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
-        .unwrap();
-    conn.execute_batch(V1_FIXTURE).unwrap();
+    v1_connection(&path).execute_batch(V1_FIXTURE).unwrap();
     path
+}
+
+/// A connection as released v1 (v1.3.0) opens one: `sql.Open("sqlite", path)`
+/// without pragmas, so foreign keys are off and the journal mode is SQLite's
+/// default. The bundled SQLite turns foreign keys on by default, hence the
+/// pragma.
+fn v1_connection(path: &Path) -> Connection {
+    let conn = Connection::open(path).unwrap();
+    conn.pragma_update(None, "foreign_keys", false).unwrap();
+    conn
+}
+
+// The statements of released v1's store (v1.3.0, pkg/config/sqlite_store.go).
+// v1 has no UPDATE: it edits a forward by deleting and adding it again, and a
+// project by deleting and creating it again.
+
+/// v1's `Add`.
+fn v1_add(v1: &Connection, f: &Forward) {
+    v1.execute(
+        "INSERT INTO port_forwards (id, context, namespace, service, port_remote, port_local)
+         VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            f.id.as_str(),
+            &f.context,
+            &f.namespace,
+            &f.service,
+            f.remote_port,
+            f.local_port,
+        ),
+    )
+    .unwrap();
+}
+
+/// v1's `DeletePortForward`, which removes the memberships itself.
+fn v1_delete_forward(v1: &mut Connection, id: &str) {
+    let tx = v1.transaction().unwrap();
+    tx.execute(
+        "DELETE FROM project_port_forwards WHERE port_forward_id = ?",
+        [id],
+    )
+    .unwrap();
+    tx.execute("DELETE FROM port_forwards WHERE id = ?", [id])
+        .unwrap();
+    tx.commit().unwrap();
+}
+
+/// v1's `CreateProject`, which inserts the members without checking them.
+fn v1_create_project(v1: &mut Connection, name: &str, members: &[&str]) {
+    let tx = v1.transaction().unwrap();
+    tx.execute("INSERT INTO projects (name) VALUES (?)", [name])
+        .unwrap();
+    let project_id = tx.last_insert_rowid();
+    for member in members {
+        tx.execute(
+            "INSERT INTO project_port_forwards (project_id, port_forward_id) VALUES (?, ?)",
+            (project_id, member),
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+}
+
+/// v1's `DeleteProject`; without foreign keys, its memberships stay.
+fn v1_delete_project(v1: &Connection, name: &str) {
+    v1.execute("DELETE FROM projects WHERE name = ?", [name])
+        .unwrap();
+}
+
+/// The IDs v1's `GetAll` returns.
+fn v1_forward_ids(v1: &Connection) -> Vec<String> {
+    v1.prepare(
+        "SELECT id, context, namespace, service, port_remote, port_local FROM port_forwards
+         ORDER BY context, namespace, service",
+    )
+    .unwrap()
+    .query_map([], |row| row.get(0))
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap()
+}
+
+/// What v1's `GetProjects` returns: names with their member IDs.
+fn v1_projects(v1: &Connection) -> Vec<(String, Vec<String>)> {
+    let projects: Vec<(i64, String)> = v1
+        .prepare("SELECT id, name FROM projects ORDER BY name")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let mut members = v1
+        .prepare("SELECT port_forward_id FROM project_port_forwards WHERE project_id = ?")
+        .unwrap();
+    projects
+        .into_iter()
+        .map(|(project_id, name)| {
+            let ids = members
+                .query_map([project_id], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            (name, ids)
+        })
+        .collect()
 }
 
 fn id(id: &str) -> ForwardId {
@@ -134,71 +236,65 @@ fn writes_backup_before_migrating_and_only_once() {
     assert!(!backup.exists());
 }
 
-/// The rollback path: v1 must keep working on a migrated database. These are
-/// the statements v1's store uses.
+/// The rollback path: released v1 must keep working on a migrated database,
+/// with its own statements and foreign keys off.
 #[test]
 fn v1_statements_work_after_migration() {
     let dir = tempfile::tempdir().unwrap();
     let path = v1_database(dir.path());
     drop(Store::open(&path).unwrap());
 
-    let v1 = Connection::open(&path).unwrap();
-    v1.pragma_update(None, "foreign_keys", true).unwrap();
-    v1.execute(
-        "INSERT INTO port_forwards (id, context, namespace, service, port_remote, port_local)
-         VALUES (?, ?, ?, ?, ?, ?)",
-        (
-            "staging.shop.api.api-80",
-            "staging",
-            "shop",
-            "api",
-            80,
-            18091,
-        ),
-    )
-    .unwrap();
-    v1.execute(
-        "UPDATE port_forwards SET context = ?, namespace = ?, service = ?, port_remote = ?, port_local = ? WHERE id = ?",
-        ("staging", "shop", "api", 80, 18092, "staging.shop.api.api-80"),
-    )
-    .unwrap();
-    let listed: Vec<String> = v1
-        .prepare("SELECT id, context, namespace, service, port_remote, port_local FROM port_forwards ORDER BY context, namespace, service")
-        .unwrap()
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(listed.len(), 5);
-    v1.execute("INSERT INTO projects (name) VALUES (?)", ["api"])
-        .unwrap();
-    v1.execute(
-        "INSERT INTO project_port_forwards (project_id, port_forward_id) VALUES (?, ?)",
-        (3, "staging.shop.api.api-80"),
-    )
-    .unwrap();
-    v1.execute(
-        "DELETE FROM port_forwards WHERE id = ?",
-        ["orbstack.cache.redis.redis-6379"],
-    )
-    .unwrap();
+    let mut v1 = v1_connection(&path);
+    let mut api = forward(
+        "staging.shop.api.api-80",
+        "staging",
+        "shop",
+        "api",
+        (80, 18091),
+    );
+    v1_add(&v1, &api);
+    // v1 edits the local port by deleting the forward and adding it again.
+    v1_delete_forward(&mut v1, api.id.as_str());
+    api.local_port = 18092;
+    v1_add(&v1, &api);
+    assert_eq!(v1_forward_ids(&v1).len(), 5);
+    v1_create_project(&mut v1, "api", &["staging.shop.api.api-80"]);
+    // v1 edits a project by deleting it and creating it again.
+    v1_delete_project(&v1, "shop");
+    v1_create_project(&mut v1, "shop", &["staging.mysql.shop"]);
+    v1_delete_forward(&mut v1, "orbstack.cache.redis.redis-6379");
+    assert_eq!(
+        v1_projects(&v1),
+        [
+            ("api".to_owned(), vec!["staging.shop.api.api-80".to_owned()]),
+            ("empty".to_owned(), vec![]),
+            ("shop".to_owned(), vec!["staging.mysql.shop".to_owned()]),
+        ]
+    );
     drop(v1);
 
     let store = Store::open(&path).unwrap();
-    let api = store
-        .forward(&id("staging.shop.api.api-80"))
-        .unwrap()
-        .unwrap();
-    assert_eq!(api.local_port, 18092);
-    assert!(!api.enabled, "rows inserted by v1 get the default");
+    let stored = store.forward(&api.id).unwrap().unwrap();
+    assert_eq!(stored.local_port, 18092);
+    assert!(!stored.enabled, "rows inserted by v1 get the default");
     assert_eq!(store.forwards().unwrap().len(), 4);
-    let api_project = store
-        .projects()
-        .unwrap()
-        .into_iter()
-        .find(|p| p.name == "api")
-        .unwrap();
-    assert_eq!(api_project.forwards, vec![id("staging.shop.api.api-80")]);
+    assert_eq!(
+        store.projects().unwrap(),
+        [
+            Project {
+                name: "api".into(),
+                forwards: vec![api.id.clone()],
+            },
+            Project {
+                name: "empty".into(),
+                forwards: vec![],
+            },
+            Project {
+                name: "shop".into(),
+                forwards: vec![id("staging.mysql.shop")],
+            },
+        ]
+    );
 }
 
 #[test]

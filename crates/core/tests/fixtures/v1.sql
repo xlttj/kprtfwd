@@ -1,5 +1,5 @@
--- A database as kprtfwd v1 creates it: the schema is copied from
--- pkg/config/sqlite_store.go, user_version stays 0.
+-- A database as released kprtfwd v1 (v1.3.0) creates it: the schema is copied
+-- from pkg/config/sqlite_store.go, user_version stays 0.
 CREATE TABLE IF NOT EXISTS port_forwards (
 	id TEXT PRIMARY KEY,
 	context TEXT NOT NULL,
