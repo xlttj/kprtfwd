@@ -316,16 +316,14 @@ impl<D: Daemon> Link<D> {
                 for cmd in self.queue.drain(..) {
                     app.update(refused(cmd, NOT_CONNECTED));
                 }
-                self.retry_at = Some(match self.retry_at {
-                    // Just lost: try again at once, a restart takes a moment.
-                    None => {
-                        app.update(Msg::Done(Err(format!(
-                            "lost the daemon: {reason}; reconnecting"
-                        ))));
-                        Instant::now()
-                    }
-                    Some(_) => Instant::now() + RECONNECT_EVERY,
-                });
+                app.update(Msg::Lost(reason));
+                // Just lost: try again at once, a restart takes a moment.
+                let wait = if self.retry_at.is_some() {
+                    RECONNECT_EVERY
+                } else {
+                    Duration::ZERO
+                };
+                self.retry_at = Some(Instant::now() + wait);
             }
         }
         cmds
@@ -572,8 +570,9 @@ mod tests {
         snapshot: Snapshot,
         /// While false, every call fails like a closed connection.
         connected: bool,
-        /// Whether reconnecting works.
+        /// Whether reconnecting works, and why not.
         daemon_back: bool,
+        attach_error: String,
         /// The daemon's error for every request.
         refuse: Option<String>,
         /// Calls that never get an answer, by the names in `calls`.
@@ -591,6 +590,8 @@ mod tests {
                     snapshot: snapshot(),
                     connected: true,
                     daemon_back: true,
+                    attach_error: ClientError::NotRunning(std::io::ErrorKind::NotFound.into())
+                        .to_string(),
                     refuse: None,
                     stall: Vec::new(),
                     events: Vec::new(),
@@ -649,15 +650,14 @@ mod tests {
             let fake = self.clone();
             async move {
                 fake.take("reconnect".into()).await;
-                let back = {
+                let refusal = {
                     let mut state = fake.state();
                     state.connected = state.daemon_back;
-                    state.connected
+                    (!state.connected).then(|| state.attach_error.clone())
                 };
-                if back {
-                    Ok(fake.connect())
-                } else {
-                    Err(ClientError::NotRunning(std::io::ErrorKind::NotFound.into()).to_string())
+                match refusal {
+                    None => Ok(fake.connect()),
+                    Some(reason) => Err(reason),
                 }
             }
         }
@@ -850,36 +850,64 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_lost_daemon_is_reported_and_reconnected() {
+    async fn a_lost_daemon_shows_why_and_is_reconnected() {
         let fake = FakeDaemon::new();
+        let mismatch = ClientError::ProtocolMismatch {
+            daemon: 3,
+            client: 2,
+            daemon_version: "2.1.0".into(),
+        }
+        .to_string();
         {
             let mut state = fake.state();
             state.connected = false;
             state.daemon_back = false;
+            state.attach_error = mismatch.clone();
         }
         let mut app = App::new(snapshot());
-        run_loop(&fake, &mut app, async |keys| keys.ticks(10).await).await;
-        let message = app.message.as_ref().unwrap();
+        let terminal = run_loop(&fake, &mut app, async |keys| keys.ticks(10).await).await;
+        // Not the broken connection, but why connecting again fails.
+        assert_eq!(app.lost.as_ref(), Some(&mismatch));
+        let shown = screen(&terminal);
+        let header: Vec<&str> = shown.lines().take(2).map(str::trim).collect();
         assert_eq!(
-            message.text,
-            "lost the daemon: the daemon closed the connection; reconnecting"
+            header.join(" "),
+            format!("lost the daemon: {mismatch}; reconnecting"),
+            "{shown}"
         );
-        assert!(message.error);
+        assert!(mismatch.ends_with("restart it with `kprtfwd daemon restart`"));
         // It tries again about once a second, not on every tick.
         let tries = fake.count("reconnect");
         assert!((2..=4).contains(&tries), "{:?}", fake.calls());
 
-        // Back, the daemon's state shows at once.
+        // Back, the daemon's state shows at once and the loss is over.
         {
             let mut state = fake.state();
             state.daemon_back = true;
             state.snapshot.paused = true;
         }
-        run_loop(&fake, &mut app, async |keys| keys.ticks(1).await).await;
+        let terminal = run_loop(&fake, &mut app, async |keys| keys.ticks(1).await).await;
         assert!(app.snapshot.paused);
+        assert!(app.lost.is_none());
+        assert!(app.message.is_none());
+        assert!(screen(&terminal).contains("PAUSED"));
         let calls = fake.calls();
         let back = calls.iter().rposition(|c| c == "reconnect").unwrap();
         assert_eq!(calls[back + 1], "snapshot", "{calls:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_old_connection_closes_after_the_new_one_attached() {
+        let fake = FakeDaemon::new();
+        fake.state().connected = false;
+        let mut app = App::new(snapshot());
+        run_loop(&fake, &mut app, async |keys| keys.ticks(1).await).await;
+        assert!(app.lost.is_none());
+        // So the daemon always counted this TUI and kept the forwards on.
+        assert_eq!(
+            fake.state().links,
+            ["open 1", "open 2", "close 1", "close 2"]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -904,7 +932,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_request_without_answer_loses_the_daemon() {
         let fake = FakeDaemon::new();
-        fake.state().stall = vec!["SetEnabled"];
+        fake.state().stall = vec!["SetEnabled", "reconnect"];
         let mut app = App::new(snapshot());
         run_loop(&fake, &mut app, async |keys| {
             keys.send(char_key(' ')).await;
@@ -917,20 +945,18 @@ mod tests {
         .await;
         assert_eq!(app.selected, Some(ForwardId::new("stg-db")));
         assert_eq!(fake.count("SetEnabled"), 1, "{:?}", fake.calls());
+        assert_eq!(
+            app.lost.as_deref(),
+            Some("the daemon did not answer within 5 s")
+        );
         let message = app.message.as_ref().unwrap();
         assert_eq!(
-            message.text,
-            "lost the daemon: the daemon did not answer within 5 s; reconnecting"
+            (message.text.as_str(), message.error),
+            ("not connected to the daemon", true)
         );
-        // Connected again; the old connection closed only after the new one
-        // was attached, so the daemon always counted this TUI.
-        let calls = fake.calls();
-        let back = calls.iter().rposition(|c| c == "reconnect").unwrap();
-        assert_eq!(calls[back + 1], "snapshot", "{calls:?}");
-        assert_eq!(
-            fake.state().links,
-            ["open 1", "open 2", "close 1", "close 2"]
-        );
+        // The reconnect still waits, and the old connection stays open.
+        assert_eq!(fake.count("reconnect"), 1);
+        assert_eq!(fake.state().links, ["open 1", "close 1"]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -951,6 +977,10 @@ mod tests {
         assert_eq!(app.selected, Some(ForwardId::new("stg-db")));
         // The first attempt gave up after its time limit; the next one waits.
         assert_eq!(fake.count("reconnect"), 2, "{:?}", fake.calls());
+        assert_eq!(
+            app.lost.as_deref(),
+            Some("the daemon did not answer within 15 s")
+        );
     }
 
     #[tokio::test(start_paused = true)]

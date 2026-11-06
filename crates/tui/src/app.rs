@@ -21,6 +21,8 @@ pub enum Msg {
     Contexts(Result<(Vec<String>, Option<String>), String>),
     Discovered(Result<Vec<DiscoveredPort>, String>),
     Events(Result<Vec<EventEntry>, String>),
+    /// The daemon is lost, or still cannot be reached; why.
+    Lost(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +51,9 @@ pub struct App {
     pub selected: Option<ForwardId>,
     pub mode: Mode,
     pub message: Option<Message>,
+    /// Why the daemon is lost; `None` while connected. The snapshot is then
+    /// the last one, not the current state.
+    pub lost: Option<String>,
     pub quit: bool,
     /// From the settings, for the help.
     pub keep_forwards_running: bool,
@@ -158,6 +163,7 @@ impl App {
             selected: None,
             mode: Mode::List,
             message: None,
+            lost: None,
             quit: false,
             keep_forwards_running: false,
             config_path: String::new(),
@@ -245,8 +251,16 @@ impl App {
     pub fn update(&mut self, msg: Msg) -> Vec<Cmd> {
         match msg {
             Msg::Snapshot(snapshot) => {
+                // Back: what was said about the loss is over.
+                if self.lost.take().is_some() {
+                    self.message = None;
+                }
                 self.snapshot = snapshot;
                 self.keep_selection();
+                Vec::new()
+            }
+            Msg::Lost(reason) => {
+                self.lost = Some(reason);
                 Vec::new()
             }
             Msg::Done(result) => {
@@ -1257,6 +1271,28 @@ pub(crate) mod tests {
         app.update(Msg::Done(Err("the daemon closed the connection".into())));
         assert_eq!(message(&app), ("the daemon closed the connection", true));
         assert!(matches!(app.mode, Mode::List));
+    }
+
+    #[test]
+    fn a_lost_daemon_is_kept_until_the_next_snapshot() {
+        let mut app = App::new(snapshot());
+        app.update(Msg::Lost("the daemon closed the connection".into()));
+        app.update(Msg::Done(Err("not connected to the daemon".into())));
+        app.update(Msg::Lost("the daemon is not running".into()));
+        assert_eq!(app.lost.as_deref(), Some("the daemon is not running"));
+        assert_eq!(message(&app), ("not connected to the daemon", true));
+
+        let mut back = snapshot();
+        back.paused = true;
+        app.update(Msg::Snapshot(back));
+        assert!(app.lost.is_none());
+        assert!(app.message.is_none(), "the loss is no longer news");
+        assert!(app.snapshot.paused);
+
+        // While connected, a snapshot leaves the message alone.
+        app.update(Msg::Done(Ok("paused".into())));
+        app.update(Msg::Snapshot(snapshot()));
+        assert_eq!(message(&app), ("paused", false));
     }
 
     #[test]

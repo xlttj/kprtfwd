@@ -20,8 +20,17 @@ const KEYS: &str =
 const RECENT_ERROR_SECS: u64 = 60;
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    // Without the daemon the header says why, on as many lines as it takes:
+    // the end of the reason often says what to do.
+    let lost = app.lost.as_ref().map(|reason| {
+        let text = format!("lost the daemon: {reason}; reconnecting");
+        wrap(&text, frame.area().width.saturating_sub(1))
+    });
+    let header_height = lost
+        .as_ref()
+        .map_or(1, |lines| u16::try_from(lines.len()).unwrap_or(u16::MAX));
     let [header, filter, list, message, keys] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(header_height),
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(1),
@@ -29,7 +38,19 @@ pub fn draw(frame: &mut Frame, app: &App) {
     ])
     .areas(frame.area());
 
-    frame.render_widget(header_line(&app.snapshot, header.width), header);
+    match lost {
+        Some(lines) => {
+            let lines: Vec<Line> = lines
+                .into_iter()
+                .map(|l| Line::raw(format!(" {l}")))
+                .collect();
+            frame.render_widget(
+                Paragraph::new(lines).style(Style::new().fg(Color::Red)),
+                header,
+            );
+        }
+        None => frame.render_widget(header_line(&app.snapshot, header.width), header),
+    }
     frame.render_widget(filter_line(app), filter);
     draw_list(frame, app, list);
     if let Some(msg) = &app.message {
@@ -170,6 +191,24 @@ fn header_line(snapshot: &Snapshot, width: u16) -> Line<'static> {
     Line::from(spans)
 }
 
+/// `text` in lines of at most `width` characters, broken between words.
+fn wrap(text: &str, width: u16) -> Vec<String> {
+    let width = usize::from(width.max(1));
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split(' ') {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    lines.push(line);
+    lines
+}
+
 fn filter_line(app: &App) -> Line<'static> {
     match (&app.mode, app.filter.is_empty()) {
         (Mode::Filter, _) => Line::raw(format!(" / {}_", app.filter)),
@@ -201,18 +240,26 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // Without the daemon the states are the last known ones: all grey.
+    let stale = app.lost.is_some();
     let rows: Vec<Row> = visible
         .iter()
         .map(|view| {
             let f = &view.forward;
             let context = app.snapshot.context_state(&f.context);
+            let state = if stale {
+                dim()
+            } else {
+                state_style(&view.state)
+            };
             Row::new(vec![
-                Span::styled(view.state.label(), state_style(&view.state)),
+                Span::styled(view.state.label(), state),
                 Span::raw(f.context.clone()),
                 Span::raw(format!("{}/{}:{}", f.namespace, f.service, f.remote_port)),
                 Span::raw(f.local_port.to_string()),
                 Span::raw(info(view, &context)),
             ])
+            .style(if stale { dim() } else { Style::new() })
         })
         .collect();
     let width = |values: Vec<usize>, title: &str| {
@@ -565,6 +612,60 @@ mod tests {
         let waiting = screen.iter().find(|line| line.contains("waiting")).unwrap();
         assert!(waiting.contains("API unreachable (DNS)"), "{waiting}");
         assert!(screen[7].contains("space on/off"), "{}", screen[7]);
+    }
+
+    #[test]
+    fn a_lost_daemon_greys_the_list_and_says_why() {
+        let mut app = App::new(snapshot());
+        let screen = render(&app, 100, 8);
+        let (x, y) = position(&screen, "ready");
+        assert_eq!(cell_fg(&app, x, y), Color::Green);
+
+        app.lost = Some("restart it with `kprtfwd daemon restart`".into());
+        let screen = render(&app, 100, 8);
+        assert_eq!(
+            screen[0],
+            " lost the daemon: restart it with `kprtfwd daemon restart`; reconnecting"
+        );
+        assert_eq!(cell_fg(&app, 1, 0), Color::Red);
+        // The forwards are still listed, with their last states in grey.
+        assert_eq!(position(&screen, "ready"), (x, y));
+        assert_eq!(cell_fg(&app, x, y), Color::DarkGray);
+        assert_eq!(cell_fg(&app, x + 10, y), Color::DarkGray, "the context too");
+
+        // A long reason takes more lines, so its end is not cut off.
+        app.lost = Some(
+            "a daemon is running that this kprtfwd cannot talk to (probably another version); restart it with `kprtfwd daemon restart`".into(),
+        );
+        let screen = render(&app, 100, 10);
+        assert_eq!(
+            screen[..2],
+            [
+                " lost the daemon: a daemon is running that this kprtfwd cannot talk to (probably another version);",
+                " restart it with `kprtfwd daemon restart`; reconnecting",
+            ]
+        );
+        assert_eq!(screen[2], " / filter");
+    }
+
+    #[test]
+    fn wrap_breaks_between_words() {
+        assert_eq!(wrap("one two three", 7), ["one two", "three"]);
+        assert_eq!(wrap("one two three", 20), ["one two three"]);
+        assert_eq!(wrap("a-very-long-word x", 4), ["a-very-long-word", "x"]);
+    }
+
+    /// Column and row of `text` on the screen.
+    fn position(screen: &[String], text: &str) -> (u16, u16) {
+        let y = screen.iter().position(|line| line.contains(text)).unwrap();
+        let x = screen[y].find(text).unwrap();
+        (x as u16, y as u16)
+    }
+
+    fn cell_fg(app: &App, x: u16, y: u16) -> Color {
+        let mut terminal = Terminal::new(TestBackend::new(100, 8)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal.backend().buffer()[(x, y)].fg
     }
 
     #[test]

@@ -706,6 +706,13 @@ Layout:
 
 - **Header line:** the state of every context with enabled forwards; idle contexts
   are listed last.
+- **A lost daemon** replaces the header with `lost the daemon: <reason>;
+  reconnecting` in red, on as many lines as the reason needs; for a daemon of
+  another version it ends with the hint `kprtfwd daemon restart`. The reason
+  is the latest one: why the connection broke, then why connecting again
+  failed. The list stays, all in grey, since its states are the last known
+  ones. The first snapshot after a reconnect ends this and clears the message
+  line.
 - **Order:** the list is sorted by context, namespace, service and port. The order
   stays fixed, so positions are predictable.
 - **STATE values:** `ready`, `waiting`, `error`, `paused`, `off`.
@@ -908,14 +915,14 @@ These are shown in the INFO column and by `kprtfwd status`.
   and `down` by words and with `--all`, `prune` against a fake API server
   (declined, confirmed, `-y`, the daemon's current context, a missing file in
   `KUBECONFIG`), and `logs` with and without `-f`.
-- **tui:** key-by-key tests of `App::update`, drawing tests with `TestBackend`,
-  tests of the event loop against a fake daemon on tokio's paused clock (a
-  lost daemon and the reconnect, keys and ctrl+c while the daemon does not
-  answer, the time limits of requests, reconnects and discovery, the new
-  connection attached before the old one closes, a request's result and the
-  fresh snapshot, a discovery answer after Esc, ctrl+l and resizes, the events
-  view), and
-  `expect` scripts for the whole flow (see section 10).
+- **tui:** key-by-key tests of `App::update`, drawing tests with `TestBackend`
+  (also of a lost daemon), tests of the event loop against a fake daemon on
+  tokio's paused clock (a lost daemon with its reason and the reconnect, keys
+  and ctrl+c while the daemon does not answer, the time limits of requests,
+  reconnects and discovery, the new connection attached before the old one
+  closes, a request's result and the fresh snapshot, a discovery answer after
+  Esc, ctrl+l and resizes, the events view), and `expect` scripts for the
+  whole flow (see section 10).
 - **Manual checklist, against every configured context:**
   - forward, auth (including an expired `oidc-login` token) and the health probe;
   - a real VPN drop and recovery;
