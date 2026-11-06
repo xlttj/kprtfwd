@@ -194,26 +194,32 @@ async fn serve(data_dir: &Path) -> Result<()> {
     let Some(listener) = bind_socket(&socket).await? else {
         return Ok(());
     };
-    if let Err(err) = adopt_legacy_dir(data_dir).await {
-        let _ = fs::remove_file(&socket);
-        return Err(err);
-    }
+    // Removes the socket and the PID file however `serve` ends.
+    let files = DaemonFiles {
+        socket,
+        pid: data_dir.join("daemon.pid"),
+    };
+    adopt_legacy_dir(data_dir).await?;
     // Lets `kprtfwd daemon stop` end a daemon of another version, which it
     // cannot talk to.
-    let pid_file = data_dir.join("daemon.pid");
-    fs::write(&pid_file, format!("{}\n", std::process::id()))
-        .with_context(|| format!("write {}", pid_file.display()))?;
+    fs::write(&files.pid, format!("{}\n", std::process::id()))
+        .with_context(|| format!("write {}", files.pid.display()))?;
     let config_path = data_dir.join("config.toml");
     match Config::write_template(&config_path) {
         Ok(true) => info!(path = %config_path.display(), "wrote the default settings"),
         Ok(false) => {}
         Err(err) => warn!(%err, path = %config_path.display(), "cannot write the default settings"),
     }
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    // The terminal that started the daemon may close; that must not stop it.
+    let mut hangup = signal(SignalKind::hangup())?;
     let store = Store::open(&data_dir.join("kprtfwd.db")).context("open the database")?;
     let daemon = Arc::new(Mutex::new(Daemon {
         store,
         engine: Engine::new(),
     }));
+    // Starts nothing if it fails.
     daemon.lock().await.apply().await?;
     info!(
         version = VERSION,
@@ -225,11 +231,8 @@ async fn serve(data_dir: &Path) -> Result<()> {
     let shutdown = Arc::new(Notify::new());
     let clients = Arc::new(AtomicUsize::new(0));
     let tuis = Arc::new(Tuis::default());
-    let mut terminate = signal(SignalKind::terminate())?;
-    let mut interrupt = signal(SignalKind::interrupt())?;
-    // The terminal that started the daemon may close; that must not stop it.
-    let mut hangup = signal(SignalKind::hangup())?;
-    let mut idle_check = tokio::time::interval(Duration::from_secs(30));
+    let idle_exit = idle_exit(std::env::var("KPRTFWD_IDLE_EXIT_MS").ok());
+    let mut idle_check = tokio::time::interval(idle_check(idle_exit));
     let mut idle_since: Option<Instant> = None;
 
     loop {
@@ -274,11 +277,15 @@ async fn serve(data_dir: &Path) -> Result<()> {
                 break;
             }
             _ = idle_check.tick() => {
+                // A failed read must not end a daemon that may run forwards.
                 let busy = clients.load(Ordering::Relaxed) > 0
-                    || daemon.lock().await.has_enabled()?;
+                    || daemon.lock().await.has_enabled().unwrap_or_else(|err| {
+                        warn!(%err, "cannot read the forwards, so not idle");
+                        true
+                    });
                 if busy {
                     idle_since = None;
-                } else if idle_since.get_or_insert_with(Instant::now).elapsed() >= IDLE_EXIT {
+                } else if idle_since.get_or_insert_with(Instant::now).elapsed() >= idle_exit {
                     info!("nothing to do, exiting");
                     break;
                 }
@@ -287,10 +294,37 @@ async fn serve(data_dir: &Path) -> Result<()> {
     }
 
     daemon.lock().await.engine.shutdown();
-    let _ = fs::remove_file(&socket);
-    let _ = fs::remove_file(&pid_file);
+    drop(files);
     info!("daemon stopped");
     Ok(())
+}
+
+/// The socket and the PID file of the daemon that holds the lock; removed
+/// when it ends, also on an error.
+struct DaemonFiles {
+    socket: PathBuf,
+    pid: PathBuf,
+}
+
+impl Drop for DaemonFiles {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.socket);
+        let _ = fs::remove_file(&self.pid);
+    }
+}
+
+/// How long the daemon stays without enabled forwards and clients:
+/// [`IDLE_EXIT`], or `KPRTFWD_IDLE_EXIT_MS` milliseconds, for tests.
+fn idle_exit(milliseconds: Option<String>) -> Duration {
+    milliseconds
+        .and_then(|ms| ms.trim().parse().ok())
+        .map_or(IDLE_EXIT, Duration::from_millis)
+}
+
+/// How often the daemon checks whether it is idle: four times per idle
+/// time, at most every 30 s.
+fn idle_check(idle_exit: Duration) -> Duration {
+    (idle_exit / 4).clamp(Duration::from_millis(10), Duration::from_secs(30))
 }
 
 /// Binds the socket. Returns `None` if another daemon already serves it: one
@@ -912,6 +946,20 @@ mod tests {
         assert_eq!(open_files_limit(Some(1_048_576), None), None);
         assert_eq!(open_files_limit(None, None), None);
         assert_eq!(open_files_limit(Some(4096), Some(4096)), None);
+    }
+
+    #[test]
+    fn the_idle_exit_can_be_shortened_for_tests() {
+        assert_eq!(idle_exit(None), IDLE_EXIT);
+        assert_eq!(idle_exit(Some("400".into())), Duration::from_millis(400));
+        assert_eq!(idle_exit(Some("soon".into())), IDLE_EXIT);
+        assert_eq!(idle_check(IDLE_EXIT), Duration::from_secs(30));
+        assert_eq!(
+            idle_check(Duration::from_millis(400)),
+            Duration::from_millis(100)
+        );
+        // tokio's interval refuses a period of 0.
+        assert_eq!(idle_check(Duration::ZERO), Duration::from_millis(10));
     }
 
     #[test]

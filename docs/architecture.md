@@ -144,6 +144,9 @@ Process model:
   `config.toml` keeps them running in the background instead.
 - **Idle exit.** The daemon exits on its own once no forward has been enabled and
   no client has been connected for 10 minutes. Paused forwards count as enabled.
+  A check that cannot read the database counts as busy, logs a warning and is
+  tried again 30 s later. `KPRTFWD_IDLE_EXIT_MS` shortens the 10 minutes, for
+  tests; the daemon then checks four times per idle time.
 - **Clients:** the TUI (`kprtfwd`) and the CLI (`kprtfwd <subcommand>`).
 - **The daemon is the only process that writes the database.**
 - **One binary.** Everything ships as `kprtfwd`.
@@ -248,7 +251,10 @@ Main dependencies:
   column only, never with the lines around the error.
 - **Stop.** `kprtfwd daemon stop`, SIGTERM, the idle exit, or the last TUI
   quitting: close listeners, close forwards, close the database. Only the last
-  one switches the forwards off first.
+  one switches the forwards off first. The socket and `daemon.pid` are removed
+  on every exit once the socket is bound, also when the start fails (a failed
+  take-over of `~/.kprtfwd`, a database that cannot be opened); the lock goes
+  last, with the process.
 - **Upgrade.** Clients compare versions in the handshake. A daemon of another
   version is reported with the hint `kprtfwd daemon restart`; the desired state
   is persisted, so forwards come back on their own. The daemon writes its PID to
@@ -866,15 +872,19 @@ These are shown in the INFO column and by `kprtfwd status`.
 - **daemon:** `kprtfwd/tests/daemon.rs` runs the real binary with `HOME` set to
   a temporary directory: quitting the last TUI switches the forwards off and
   lifts the pause, another client or `keep_forwards_running` keeps them, a
-  daemon still running in `~/.kprtfwd` is stopped and its database copied,
-  a stale socket is replaced, eight daemons started at once on a stale
-  socket leave exactly one, whose PID is in `daemon.pid`, while the others
-  exit with 0, and with a fake API server and exec plugin, `use-context`, `kubens` and a
-  rewrite of a user with env entries cause no reconnect and no login while a
-  moved cluster causes exactly one; `status` shows a context and its forward
-  `logging in` while the plugin waits; discovery does not propose a port that
-  another process holds on `::1` only; a daemon started with a soft limit of
-  256 open files raises it.
+  daemon still running in `~/.kprtfwd` is stopped and its database copied, and a
+  failed take-over leaves no socket and is tried again on the next start; a
+  stale socket is replaced, eight daemons started at once on a stale socket
+  leave exactly one, whose PID is in `daemon.pid`, while the others exit with 0;
+  with a 400 ms idle exit the daemon stays while a client is connected and exits
+  after it left, and a database it cannot read (a renamed table) keeps it
+  running until the table is back; SIGTERM and `daemon stop` (exit code 0)
+  remove the socket and `daemon.pid` and leave the forwards on; and with a fake
+  API server and exec plugin, `use-context`, `kubens` and a rewrite of a user
+  with env entries cause no reconnect and no login while a moved cluster causes
+  exactly one; `status` shows a context and its forward `logging in` while the
+  plugin waits; discovery does not propose a port that another process holds on
+  `::1` only; a daemon started with a soft limit of 256 open files raises it.
 - **cli:** unit tests for the exit code rules; `kprtfwd/tests/cli.rs` runs the
   binary the same way: exit code 2 without a daemon and for one that cannot
   start, 3 while an enabled forward is not ready and 0 once it is paused, `up`

@@ -1,6 +1,7 @@
 //! The daemon through the real binary: switching the forwards off when the
-//! last TUI quits, taking over `~/.kprtfwd`, watching the kubeconfig, a
-//! login that waits for the user, and discovery.
+//! last TUI quits, taking over `~/.kprtfwd`, one daemon per directory, every
+//! way it exits, watching the kubeconfig, a login that waits for the user,
+//! and discovery.
 //!
 //! Every command runs in a home directory of its own; see `common`.
 
@@ -8,6 +9,7 @@ mod common;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::process::Command;
 use std::time::Duration;
 
 use common::{
@@ -103,6 +105,8 @@ fn a_failed_take_over_is_tried_again() {
     assert!(!output.status.success(), "{output:?}");
     let db = home.data_dir().join("kprtfwd.db");
     assert!(!db.exists(), "a failed copy looks like a database");
+    assert!(!home.socket().exists(), "the failed daemon left its socket");
+    assert!(!home.pid_file().exists());
 
     std::fs::remove_file(&legacy_db).unwrap();
     database(&legacy_db);
@@ -149,6 +153,101 @@ async fn daemons_started_at_once_leave_one_running() {
     let output = home.run(&["daemon", "stop"]);
     assert!(output.status.success(), "{output:?}");
     assert!(daemons.exit_status(serving).await.success());
+}
+
+/// Shortens the daemon's idle exit, in milliseconds.
+const IDLE_EXIT: &str = "KPRTFWD_IDLE_EXIT_MS";
+
+fn start_daemon_idle_after(home: &Home, milliseconds: &str) {
+    let output = home
+        .command(&["daemon", "restart"])
+        .env(IDLE_EXIT, milliseconds)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
+fn gone(home: &Home) -> bool {
+    !home.socket().exists() && !home.pid_file().exists()
+}
+
+/// Whether the process `pid`, a daemon of this test, still runs.
+fn alive(pid: u32) -> bool {
+    let probe = Command::new("kill").args(["-0", &pid.to_string()]).output();
+    probe.unwrap().status.success()
+}
+
+/// Without enabled forwards and clients the daemon exits after a while,
+/// here 400 ms, and removes its socket and PID file.
+#[tokio::test]
+async fn an_idle_daemon_exits_once_no_client_is_connected() {
+    let home = Home::new();
+    start_daemon_idle_after(&home, "400");
+    let client = Client::connect(&home.socket()).await.expect("connect");
+
+    // Several idle times: a connected client keeps it.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(home.socket().exists(), "exited with a client connected");
+
+    drop(client);
+    wait_until("exited", || gone(&home)).await;
+    assert!(daemon_log(&home).contains("nothing to do, exiting"));
+}
+
+/// A store that cannot be read makes the idle check count the daemon as
+/// busy; the read failing must not end a daemon that may run forwards.
+#[tokio::test]
+async fn a_failed_read_does_not_end_an_idle_daemon() {
+    let home = Home::new();
+    write_database(&home.db(), &[forward("test", "shop", "api", false)], false);
+    start_daemon_idle_after(&home, "400");
+    // Busy while the table goes away, so the idle time starts afterwards.
+    let client = Client::connect(&home.socket()).await.expect("connect");
+    let sql = rusqlite::Connection::open(home.db()).unwrap();
+    sql.execute_batch("ALTER TABLE port_forwards RENAME TO moved")
+        .unwrap();
+    drop(client);
+
+    // Eight checks, 200 ms more than the idle time.
+    let failed = || {
+        daemon_log(&home)
+            .matches("cannot read the forwards")
+            .count()
+    };
+    wait_until("failed reads", || failed() >= 8).await;
+    assert!(!gone(&home), "a failed read ended the daemon");
+
+    sql.execute_batch("ALTER TABLE moved RENAME TO port_forwards")
+        .unwrap();
+    wait_until("exited", || gone(&home)).await;
+}
+
+/// SIGTERM and `daemon stop` end the daemon without switching the forwards
+/// off, and it removes its socket and PID file.
+#[tokio::test]
+async fn sigterm_and_daemon_stop_clean_up() {
+    let home = Home::new();
+    database(&home.db());
+    home.start_daemon();
+    let pid = Client::connect(&home.socket()).await.unwrap().daemon_pid;
+    let written = std::fs::read_to_string(home.pid_file()).unwrap();
+    assert_eq!(written.trim(), pid.to_string());
+
+    let kill = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status();
+    assert!(kill.unwrap().success());
+    wait_until("terminated", || gone(&home)).await;
+    wait_until("exited", || !alive(pid)).await;
+    assert!(daemon_log(&home).contains("terminated"));
+    assert!(enabled(&home.db()), "SIGTERM switched the forwards off");
+
+    home.start_daemon();
+    let output = home.run(&["daemon", "stop"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "daemon stopped\n");
+    wait_until("stopped", || gone(&home)).await;
+    assert!(enabled(&home.db()), "daemon stop switched the forwards off");
 }
 
 const VERSION: &str = r#"{"major":"1","minor":"33","gitVersion":"v1.33.0","gitCommit":"","gitTreeState":"","buildDate":"","goVersion":"","compiler":"","platform":""}"#;

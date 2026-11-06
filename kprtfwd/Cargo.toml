@@ -16,6 +16,7 @@ tokio.workspace = true
 [dev-dependencies]
 kprtfwd-core.workspace = true
 kprtfwd-proto.workspace = true
+rusqlite.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 
