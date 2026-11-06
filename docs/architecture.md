@@ -738,9 +738,21 @@ These are shown in the INFO column and by `kprtfwd status`.
 
 ## 14. Build and distribution
 
-- Release builds via GitHub Actions for macOS (arm64, x86_64) and Linux (x86_64,
-  arm64, musl, static).
-- rustls only, no OpenSSL, so the binaries are fully static.
+- Release builds via GitHub Actions (`release.yml`, on a `v*` tag) for macOS
+  (arm64, x86_64) and Linux (x86_64, arm64, musl, static).
+- rustls only, no OpenSSL, so the Linux binaries can be fully static. Each is
+  built on a runner of its architecture, with `musl-gcc` for the C parts
+  (bundled SQLite, ring); the workflow fails unless `file` and `ldd` show a
+  static binary, and runs it.
+- A release first checks that the tag is `v` plus the crate version (bump
+  `version` in `Cargo.toml` before tagging), then runs all of `ci.yml` on the
+  tagged commit; the binaries are built and released only if both pass.
+- Pull requests that change `release.yml`, `Cargo.lock` or a `Cargo.toml` build
+  all four targets without releasing.
+- Every action is pinned to a commit SHA; Dependabot proposes updates.
+- The macOS binaries are not signed or notarized; the install steps give the
+  `curl` download and the `xattr` command for browser downloads (decided
+  2026-11-06).
 - Release profile: `strip = true`, `lto = "thin"`.
 - The Homebrew tap formula `kprtfwd` switches to the v2 binaries with 2.0.0.
 
