@@ -17,6 +17,7 @@ hyper-util.workspace = true
 jiff.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -290,7 +290,11 @@ There is one actor per enabled forward.
 **Listeners.**
 
 - It binds `127.0.0.1` **and** `::1` on the local port. kubectl binds both, and
-  clients that resolve `localhost` may try `::1` first.
+  clients that resolve `localhost` may try `::1` first. So the port is busy if
+  either address is taken, e.g. by a dev server that listens on `::1` only;
+  otherwise `localhost` would reach that server while the forward shows
+  ready. Only where IPv6 is unavailable (`::1` not configured, or no IPv6 at
+  all) does the forward listen on `127.0.0.1` alone; its event says so.
 - The listeners stay bound while the forward is enabled, even when the context is
   unreachable. That keeps the port reserved.
 - A forward that starts again (an edit, a reconnect, a kubeconfig change)
@@ -331,9 +335,10 @@ of time for the next one, and kept for at most 60 s.
 
 There is no setting for this either.
 
-**Port busy.** If binding fails with `EADDRINUSE`, the state becomes `PortBusy`,
-with the owning process if it can be found. The actor retries the bind every 5 s.
-This is local and cheap, so there is no limit.
+**Port busy.** If binding either address fails with `EADDRINUSE`, the state
+becomes `PortBusy`, with the owning process if it can be found, and the forward
+holds neither address. The actor retries the bind every 5 s. This is local and
+cheap, so there is no limit.
 
 ### 6.4 Port-forward protocol
 
@@ -804,7 +809,7 @@ These are shown in the INFO column and by `kprtfwd status`.
     closed once the context is unreachable but not while it logs in, a refused
     port-forward and its check after an outage, the error channel, warm
     streams and when they are dropped or opened again after an outage, the
-    `::1` listener and a busy port;
+    `::1` listener, and a port busy on `127.0.0.1` or on `::1` only;
   - cluster tests in `crates/engine/tests/cluster.rs`, run in CI against kind
     (job `cluster`) and locally against any throwaway cluster. They only run
     when `KPRTFWD_TEST_CONTEXT` is set; each creates and deletes its own

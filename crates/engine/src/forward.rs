@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 use kprtfwd_core::Forward;
 use kprtfwd_core::state::{Bind, ContextState, Observed, Target};
 use kprtfwd_core::svctype::{ServiceType, classify as service_type};
+use rustix::io::Errno;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, JoinSet};
@@ -221,7 +222,7 @@ async fn keep_warm(
 struct Listeners {
     v4: TcpListener,
     /// `localhost` may resolve to ::1 first, as it does for kubectl's
-    /// listeners; best effort, as IPv6 may be off.
+    /// listeners. `None` only where IPv6 is unavailable.
     v6: Option<TcpListener>,
 }
 
@@ -341,16 +342,15 @@ fn close_connections(
 async fn bind(spec: &Forward, shared: &Shared) -> Listeners {
     let port = spec.local_port;
     loop {
-        match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
-            Ok(v4) => {
-                let v6 = TcpListener::bind((Ipv6Addr::LOCALHOST, port))
-                    .await
-                    .inspect_err(|err| debug!(id = %spec.id, %err, "no IPv6 listener"))
-                    .ok();
+        match listen(spec).await {
+            Ok(listeners) => {
                 *shared.bind.lock().unwrap() = Bind::Bound;
-                info!(id = %spec.id, port, "listening");
-                shared.events.push(format!("listening on port {port}"));
-                return Listeners { v4, v6 };
+                info!(id = %spec.id, port, ipv6 = listeners.v6.is_some(), "listening");
+                shared.events.push(match listeners.v6 {
+                    Some(_) => format!("listening on port {port}"),
+                    None => format!("listening on port {port}, 127.0.0.1 only: no IPv6"),
+                });
+                return listeners;
             }
             Err(err) => {
                 let holder = if err.kind() == std::io::ErrorKind::AddrInUse {
@@ -374,6 +374,33 @@ async fn bind(spec: &Forward, shared: &Shared) -> Listeners {
         }
         tokio::time::sleep(BIND_RETRY).await;
     }
+}
+
+/// Listens on the local port on 127.0.0.1 and ::1. A client may resolve
+/// `localhost` to either, so the port is busy if either address is taken:
+/// with ::1 left to another process, `localhost` could reach that one while
+/// the forward shows ready. The forward then holds neither address.
+async fn listen(spec: &Forward) -> std::io::Result<Listeners> {
+    let port = spec.local_port;
+    let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
+    let v6 = match TcpListener::bind((Ipv6Addr::LOCALHOST, port)).await {
+        Ok(v6) => Some(v6),
+        Err(err) if ipv6_unavailable(&err) => {
+            info!(id = %spec.id, %err, "no IPv6 listener");
+            None
+        }
+        Err(err) => return Err(err),
+    };
+    Ok(Listeners { v4, v6 })
+}
+
+/// Whether binding ::1 failed because this host has no IPv6: the address
+/// is not configured, or the address family is not supported at all.
+fn ipv6_unavailable(err: &std::io::Error) -> bool {
+    matches!(
+        Errno::from_io_error(err),
+        Some(Errno::ADDRNOTAVAIL | Errno::AFNOSUPPORT)
+    )
 }
 
 /// The process listening on `port`, as "name (pid N)", if `lsof` can tell.
@@ -752,6 +779,17 @@ mod tests {
             .await
             .expect("an answer or a close within 5 s");
         String::from_utf8(answer).unwrap()
+    }
+
+    #[test]
+    fn only_a_missing_ipv6_stack_lets_a_forward_skip_ipv6() {
+        let error = |errno: Errno| std::io::Error::from_raw_os_error(errno.raw_os_error());
+        assert!(ipv6_unavailable(&error(Errno::ADDRNOTAVAIL)));
+        assert!(ipv6_unavailable(&error(Errno::AFNOSUPPORT)));
+        for busy in [Errno::ADDRINUSE, Errno::ACCESS, Errno::MFILE] {
+            assert!(!ipv6_unavailable(&error(busy)), "{busy:?}");
+        }
+        assert!(!ipv6_unavailable(&std::io::Error::other("other")));
     }
 
     #[test]
@@ -1157,6 +1195,29 @@ mod tests {
     #[tokio::test]
     async fn a_busy_port_is_reported_and_taken_once_free() {
         let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        busy_until_free(holder).await;
+    }
+
+    /// `localhost` may resolve to ::1 first, so a port another process
+    /// holds there is busy, although 127.0.0.1 is free.
+    #[tokio::test]
+    async fn a_port_busy_on_ipv6_only_is_busy() {
+        for _ in 0..5 {
+            let Ok(holder) = std::net::TcpListener::bind("[::1]:0") else {
+                return; // no IPv6 here
+            };
+            let port = holder.local_addr().unwrap().port();
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                busy_until_free(holder).await;
+                return;
+            }
+        }
+        panic!("no port free on 127.0.0.1 in five attempts");
+    }
+
+    /// A forward on `holder`'s port reports it busy and takes it once
+    /// `holder` is gone. With ::1 taken, it leaves 127.0.0.1 free meanwhile.
+    async fn busy_until_free(holder: std::net::TcpListener) {
         let port = holder.local_addr().unwrap().port();
         let api = FakeApi::start(echo).await;
         let context = Context::fake(api.client(), healthy());
@@ -1164,16 +1225,16 @@ mod tests {
         let handle = ForwardHandle::start(spec("db", 5432, port), context.clone(), events.clone());
         let observe = || handle.observe(&context).bind;
         let started = Instant::now();
-        while observe() == Bind::Pending {
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "no bind attempt"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        assert_ne!(first_bind(&handle, &context).await, Bind::Bound);
         let Bind::Busy { holder: who } = observe() else {
             panic!("{:?}", observe());
         };
+        if holder.local_addr().unwrap().is_ipv6() {
+            assert!(
+                std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+                "127.0.0.1 held while busy"
+            );
+        }
         // lsof names this process, where it is installed.
         let busy = match &who {
             Some(who) => {

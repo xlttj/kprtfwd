@@ -1267,6 +1267,7 @@ dependencies = [
  "k8s-openapi",
  "kprtfwd-core",
  "kube",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",
