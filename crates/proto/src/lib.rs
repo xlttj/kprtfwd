@@ -20,12 +20,34 @@ pub use client::{Client, ClientError, connect_or_start, spawn_daemon, stop_daemo
 /// Bumped on every incompatible change to the messages.
 pub const PROTOCOL_VERSION: u32 = 7;
 
+/// The longest message, without its newline. A snapshot of thousands of
+/// forwards takes a few MB; the limit keeps a writer that sends no newline
+/// from filling the reader's memory.
+pub const MAX_FRAME: usize = 16 << 20;
+
 /// A request with its ID. The request is nested, not flattened, because
 /// requests have fields of their own named `id`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClientMessage {
     pub id: u64,
     pub request: Request,
+}
+
+impl ClientMessage {
+    /// Parses a line of a client, without its newline. For a line that is no
+    /// request, returns what to answer with in a [`ServerMessage::Error`]: the
+    /// line's `id` if it has one, else 0, and why.
+    pub fn parse(line: &[u8]) -> Result<Self, (u64, String)> {
+        /// What may be readable of a line that is no request.
+        #[derive(Deserialize)]
+        struct WithId {
+            id: u64,
+        }
+        serde_json::from_slice(line).map_err(|err| {
+            let id = serde_json::from_slice::<WithId>(line).map_or(0, |line| line.id);
+            (id, format!("cannot read the request: {err}"))
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -223,18 +245,72 @@ where
 }
 
 /// Reads one JSON line; `None` when the other side closed the connection.
+/// A line that is too long or no such message is an
+/// [`io::ErrorKind::InvalidData`] error, after which the next line can be
+/// read.
 pub async fn read_message<R, T>(reader: &mut R) -> io::Result<Option<T>>
 where
     R: AsyncBufRead + Unpin,
     T: DeserializeOwned,
 {
-    let mut line = String::new();
-    if reader.read_line(&mut line).await? == 0 {
+    let Some(line) = read_frame(reader).await? else {
         return Ok(None);
-    }
-    serde_json::from_str(&line)
+    };
+    serde_json::from_slice(&line)
         .map(Some)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+/// Reads one line, without its newline, of at most [`MAX_FRAME`] bytes;
+/// `None` when the other side closed the connection. A longer line is
+/// skipped up to its newline without keeping it and is an
+/// [`io::ErrorKind::InvalidData`] error, after which the next line can be
+/// read.
+pub async fn read_frame<R>(reader: &mut R) -> io::Result<Option<Vec<u8>>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    read_frame_within(reader, MAX_FRAME).await
+}
+
+async fn read_frame_within<R>(reader: &mut R, max: usize) -> io::Result<Option<Vec<u8>>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut line = Vec::new();
+    let mut too_long = false;
+    let mut read_any = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            break; // closed, maybe after a last line without newline
+        }
+        read_any = true;
+        let (chunk, complete) = match available.iter().position(|&b| b == b'\n') {
+            Some(at) => (&available[..at], true),
+            None => (available, false),
+        };
+        if !too_long {
+            if line.len() + chunk.len() > max {
+                too_long = true;
+                line = Vec::new();
+            } else {
+                line.extend_from_slice(chunk);
+            }
+        }
+        let used = chunk.len() + usize::from(complete);
+        reader.consume(used);
+        if complete {
+            break;
+        }
+    }
+    if too_long {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("a message longer than {max} bytes"),
+        ));
+    }
+    Ok(read_any.then_some(line))
 }
 
 #[cfg(test)]
@@ -330,6 +406,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_line_that_is_no_request_gets_an_error_with_its_id() {
+        let refusal = |line: &str| ClientMessage::parse(line.as_bytes()).unwrap_err();
+        let (id, message) = refusal(r#"{"id":4,"request":{"type":"fly"}}"#);
+        assert_eq!(id, 4);
+        assert!(
+            message.starts_with("cannot read the request: unknown variant `fly`"),
+            "{message}"
+        );
+        assert_eq!(refusal(r#"{"request":{"type":"snapshot"}}"#).0, 0);
+        assert_eq!(refusal("garbage").0, 0);
+        assert_eq!(refusal("").0, 0);
+        let parsed = ClientMessage::parse(br#"{"id":5,"request":{"type":"snapshot"}}"#);
+        assert_eq!(
+            parsed,
+            Ok(ClientMessage {
+                id: 5,
+                request: Request::Snapshot
+            })
+        );
+    }
+
     #[tokio::test]
     async fn round_trips_over_a_stream() {
         let (client, server) = tokio::io::duplex(1024);
@@ -351,5 +449,52 @@ mod tests {
         }
         let end: Option<ServerMessage> = read_message(&mut server_read).await.unwrap();
         assert_eq!(end, None);
+    }
+
+    #[tokio::test]
+    async fn a_line_too_long_is_skipped_up_to_its_newline() {
+        let input = b"0123456789\n01234567890123\n0123\n".as_slice();
+        let mut reader = tokio::io::BufReader::with_capacity(4, input);
+        let line = read_frame_within(&mut reader, 10).await.unwrap();
+        assert_eq!(line.as_deref(), Some(b"0123456789".as_slice()));
+        let err = read_frame_within(&mut reader, 10).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "a message longer than 10 bytes");
+        let line = read_frame_within(&mut reader, 10).await.unwrap();
+        assert_eq!(line.as_deref(), Some(b"0123".as_slice()));
+        assert_eq!(read_frame_within(&mut reader, 10).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_last_line_without_newline_is_read() {
+        let mut reader = tokio::io::BufReader::new(b"\nlast".as_slice());
+        let empty = read_frame(&mut reader).await.unwrap();
+        assert_eq!(empty.as_deref(), Some(b"".as_slice()));
+        let last = read_frame(&mut reader).await.unwrap();
+        assert_eq!(last.as_deref(), Some(b"last".as_slice()));
+        assert_eq!(read_frame(&mut reader).await.unwrap(), None);
+
+        let mut reader = tokio::io::BufReader::with_capacity(4, b"01234567890123".as_slice());
+        let err = read_frame_within(&mut reader, 10).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(read_frame_within(&mut reader, 10).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_line_that_is_no_message_leaves_the_next_readable() {
+        let input = b"garbage\n{\"type\":\"error\",\"id\":3,\"message\":\"no\"}\n";
+        let mut reader = tokio::io::BufReader::new(input.as_slice());
+        let err = read_message::<_, ServerMessage>(&mut reader)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let next: Option<ServerMessage> = read_message(&mut reader).await.unwrap();
+        assert_eq!(
+            next,
+            Some(ServerMessage::Error {
+                id: 3,
+                message: "no".into()
+            })
+        );
     }
 }

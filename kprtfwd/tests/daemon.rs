@@ -20,8 +20,8 @@ use common::{
 use kprtfwd_core::Store;
 use kprtfwd_core::config::TEMPLATE;
 use kprtfwd_proto::{
-    Client, ClientError, ClientMessage, PROTOCOL_VERSION, Request, Response, ServerMessage,
-    Snapshot,
+    Client, ClientError, ClientMessage, MAX_FRAME, PROTOCOL_VERSION, Request, Response,
+    ServerMessage, Snapshot,
 };
 
 #[tokio::test]
@@ -336,6 +336,61 @@ async fn a_daemon_that_fails_after_binding_is_reported_as_failed() {
     assert!(stderr.contains("log: "), "{stderr}");
     assert!(daemon_log(&home).contains("does not answer"));
     assert!(gone(&home));
+}
+
+/// Input that is no request is answered with an error, and the connection
+/// stays: closing a TUI's connection would switch the forwards off.
+#[tokio::test]
+async fn bad_input_is_answered_and_keeps_the_connection() {
+    let home = Home::new();
+    database(&home.db());
+    home.start_daemon();
+    let stream = UnixStream::connect(home.socket()).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut ask = |line: &[u8]| -> ServerMessage {
+        (&stream).write_all(line).unwrap();
+        (&stream).write_all(b"\n").unwrap();
+        let mut answer = String::new();
+        reader.read_line(&mut answer).unwrap();
+        serde_json::from_str(&answer).unwrap()
+    };
+    let hello = format!(
+        r#"{{"id":1,"request":{{"type":"hello","protocol":{PROTOCOL_VERSION},"client_version":"test"}}}}"#
+    );
+    assert!(matches!(
+        ask(hello.as_bytes()),
+        ServerMessage::Response { id: 1, .. }
+    ));
+    let attached = ask(br#"{"id":2,"request":{"type":"attach"}}"#);
+    assert!(matches!(attached, ServerMessage::Response { id: 2, .. }));
+
+    let refused = |answer: ServerMessage| match answer {
+        ServerMessage::Error { id, message } => (id, message),
+        other => panic!("{other:?}"),
+    };
+    let (id, message) = refused(ask(b"garbage"));
+    assert_eq!(id, 0);
+    assert!(message.starts_with("cannot read the request"), "{message}");
+    let (id, message) = refused(ask(br#"{"id":3,"request":{"type":"fly"}}"#));
+    assert_eq!(id, 3);
+    assert!(message.contains("unknown variant `fly`"), "{message}");
+    let (id, message) = refused(ask(&vec![b'x'; MAX_FRAME + 1]));
+    assert_eq!(id, 0);
+    assert!(
+        message.ends_with(&format!("longer than {MAX_FRAME} bytes")),
+        "{message}"
+    );
+
+    let snapshot = ask(br#"{"id":4,"request":{"type":"snapshot"}}"#);
+    assert!(matches!(snapshot, ServerMessage::Response { id: 4, .. }));
+    assert!(enabled(&home.db()), "the TUI counted as gone");
+    // Now the TUI quits.
+    stream.shutdown(std::net::Shutdown::Both).unwrap();
+    wait_until("stopped", || gone(&home)).await;
+    assert!(!enabled(&home.db()));
 }
 
 /// Shortens the daemon's idle exit, in milliseconds.

@@ -22,10 +22,11 @@ use kprtfwd_engine::{Engine, discovery, kubeconfig, port_is_free};
 use kprtfwd_proto::{
     Client, ClientError, ClientMessage, ContextView, DiscoveredPort, EventEntry, ForwardView,
     LastError, PROTOCOL_VERSION, ProjectView, Request, Response, ServerMessage, Snapshot,
-    read_message, stop_daemon, write_message,
+    read_frame, stop_daemon, write_message,
 };
 use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 use tokio::io::BufReader;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Mutex, Notify};
@@ -447,11 +448,11 @@ async fn serve_client(
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
-    match read_message::<_, ClientMessage>(&mut reader).await {
-        Ok(Some(ClientMessage {
+    match next_request(&mut reader, &mut writer).await {
+        Some(ClientMessage {
             id,
             request: Request::Hello { protocol, .. },
-        })) => {
+        }) => {
             let welcome = ServerMessage::Response {
                 id,
                 response: Response::Welcome {
@@ -464,7 +465,7 @@ async fn serve_client(
                 return;
             }
         }
-        Ok(Some(message)) => {
+        Some(message) => {
             let refusal = ServerMessage::Error {
                 id: message.id,
                 message: "send hello first".into(),
@@ -472,19 +473,14 @@ async fn serve_client(
             let _ = write_message(&mut writer, &refusal).await;
             return;
         }
-        Ok(None) | Err(_) => return,
+        None => return,
     }
 
     // Dropped when the connection ends, however it ends.
     let mut attached = None;
     loop {
-        let message = match read_message::<_, ClientMessage>(&mut reader).await {
-            Ok(Some(message)) => message,
-            Ok(None) => return,
-            Err(err) => {
-                debug!(%err, "client sent garbage");
-                return;
-            }
+        let Some(message) = next_request(&mut reader, &mut writer).await else {
+            return;
         };
         let id = message.id;
         let shutdown_requested = matches!(message.request, Request::Shutdown);
@@ -523,6 +519,36 @@ async fn serve_client(
         if written.is_err() {
             return;
         }
+    }
+}
+
+/// The client's next request; `None` once the connection is closed or
+/// broken. Input that is no request is answered with an error, and the
+/// client may go on: a line longer than [`kprtfwd_proto::MAX_FRAME`], which
+/// is skipped, and a line that does not parse. Closing the connection
+/// instead would count as the TUI quitting.
+async fn next_request(
+    reader: &mut BufReader<OwnedReadHalf>,
+    writer: &mut OwnedWriteHalf,
+) -> Option<ClientMessage> {
+    loop {
+        let refusal = match read_frame(reader).await {
+            Ok(Some(line)) => match ClientMessage::parse(&line) {
+                Ok(message) => return Some(message),
+                Err((id, message)) => ServerMessage::Error { id, message },
+            },
+            Ok(None) => return None,
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidData => ServerMessage::Error {
+                id: 0,
+                message: format!("cannot read the request: {err}"),
+            },
+            Err(err) => {
+                debug!(%err, "cannot read from a client");
+                return None;
+            }
+        };
+        debug!(?refusal, "client sent no request");
+        write_message(writer, &refusal).await.ok()?;
     }
 }
 

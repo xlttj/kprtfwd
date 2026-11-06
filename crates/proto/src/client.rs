@@ -148,10 +148,11 @@ impl Client {
                 id: answered,
                 response,
             }) if answered == id => Ok(response),
+            // 0: the daemon could not read the request, e.g. one too long.
             Some(ServerMessage::Error {
                 id: answered,
                 message,
-            }) if answered == id => Err(ClientError::Daemon(message)),
+            }) if answered == id || answered == 0 => Err(ClientError::Daemon(message)),
             Some(_) => Err(ClientError::Unexpected),
             None => Err(ClientError::Closed),
         }

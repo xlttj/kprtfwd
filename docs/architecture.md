@@ -568,7 +568,11 @@ them itself:
 
 - **Transport.** A Unix domain socket.
 - **Framing.** Newline-delimited JSON with serde-tagged enums. It is easy to debug:
-  `socat - UNIX-CONNECT:$HOME/.config/kprtfwd/daemon.sock`.
+  `socat - UNIX-CONNECT:$HOME/.config/kprtfwd/daemon.sock`. A message is at
+  most 16 MiB; a longer line is skipped up to its newline instead of being
+  kept in memory. The daemon answers a line it cannot read, too long or no
+  request, with an `Error` that carries the line's `id`, or 0 if it has
+  none, and keeps the connection: closing it would count as a TUI quitting.
 - **Handshake.** The client sends `Hello { protocol, client_version }`, the daemon
   answers `Welcome { protocol, daemon_version, pid }`. Different protocol numbers
   mean the client asks the user to restart the daemon; so does an answer that is
