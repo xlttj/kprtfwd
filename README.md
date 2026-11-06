@@ -103,6 +103,16 @@ Words select the forwards that contain every one of them, ignoring case, in
 their ID, context, `namespace/service:port` or local port, for example
 `kprtfwd up shop api`. The TUI filter works the same way.
 
+Exit codes, for scripts:
+
+| Code | |
+|---|---|
+| 0 | ok |
+| 1 | error |
+| 2 | wrong usage, e.g. an unknown flag |
+| 3 | `status` only: an enabled forward is not ready |
+| 4 | the daemon is not reachable: it could not be started, does not answer, or went away during the command |
+
 ## Settings
 
 kprtfwd keeps its files in `~/.config/kprtfwd`, or `$XDG_CONFIG_HOME/kprtfwd`

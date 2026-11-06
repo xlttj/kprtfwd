@@ -6,12 +6,14 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
 use std::process::{Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use common::{Home, NOT_FOUND, forward, forward_ids, write_database};
+use kprtfwd_proto::{PROTOCOL_VERSION, Response, ServerMessage, VERSION};
 
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
@@ -22,22 +24,38 @@ fn stderr(output: &Output) -> String {
 }
 
 #[test]
-fn daemon_status_without_a_daemon_exits_with_2() {
+fn daemon_status_without_a_daemon_exits_with_4() {
     let home = Home::new();
     let output = home.run(&["daemon", "status"]);
-    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
     assert_eq!(stdout(&output), "daemon not running\n");
 }
 
 #[test]
-fn a_daemon_that_cannot_start_exits_with_2() {
+fn wrong_usage_exits_with_2_without_starting_a_daemon() {
+    let home = Home::new();
+    let output = home.run(&["status", "--jsno"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(stderr(&output).contains("--jsno"), "{output:?}");
+    assert!(!home.socket().exists());
+
+    let output = home.run(&["--help"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        stdout(&output).contains("4  the daemon is not reachable"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn a_daemon_that_cannot_start_exits_with_4() {
     let home = Home::new();
     // The daemon cannot create its log directory, so it exits at once.
     std::fs::create_dir_all(home.data_dir()).unwrap();
     std::fs::write(home.data_dir().join("logs"), "").unwrap();
 
     let output = home.run(&["status"]);
-    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
     let err = stderr(&output);
     assert!(
         err.contains("the daemon exited right after starting"),
@@ -45,6 +63,45 @@ fn a_daemon_that_cannot_start_exits_with_2() {
     );
     let logs = home.data_dir().join("logs");
     assert!(err.contains(&format!("log: {}", logs.display())), "{err}");
+}
+
+/// A daemon that welcomes one client and closes the connection on its first
+/// request, as one that crashes does; its socket goes with it.
+fn daemon_that_dies(home: &Home) -> std::thread::JoinHandle<()> {
+    std::fs::create_dir_all(home.data_dir()).unwrap();
+    let socket = home.socket();
+    let listener = UnixListener::bind(&socket).unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        let welcome = ServerMessage::Response {
+            id: 1,
+            response: Response::Welcome {
+                protocol: PROTOCOL_VERSION,
+                daemon_version: VERSION.into(),
+                pid: std::process::id(),
+            },
+        };
+        writeln!(stream, "{}", serde_json::to_string(&welcome).unwrap()).unwrap();
+        let mut request = String::new();
+        reader.read_line(&mut request).unwrap();
+        std::fs::remove_file(&socket).unwrap();
+    })
+}
+
+#[test]
+fn a_daemon_that_goes_away_during_a_command_exits_with_4() {
+    let home = Home::new();
+    let daemon = daemon_that_dies(&home);
+    let output = home.run(&["status"]);
+    daemon.join().unwrap();
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    assert!(
+        stderr(&output).contains("the daemon closed the connection"),
+        "{output:?}"
+    );
 }
 
 #[test]

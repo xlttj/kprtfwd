@@ -354,7 +354,7 @@ async fn a_daemon_that_fails_after_binding_is_reported_as_failed() {
 
     let output = home.run(&["status"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
     assert!(stderr.contains("exited right after starting"), "{stderr}");
     assert!(stderr.contains("log: "), "{stderr}");
     assert!(daemon_log(&home).contains("does not answer"));

@@ -868,8 +868,12 @@ Exit codes:
 
 - 0: ok
 - 1: error
-- 2: daemon not reachable
+- 2: wrong usage (clap's code: an unknown flag, a missing argument)
 - 3: `status` only; some enabled forwards are not ready
+- 4: daemon not reachable: not running and it could not be started, it does
+  not answer, or the connection failed or closed during the command. A
+  daemon of another protocol answers and gets 1; its message says to
+  restart it.
 
 ## 12. Error messages
 
@@ -970,11 +974,13 @@ These are shown in the INFO column and by `kprtfwd status`.
   port that another process holds on `::1` only; a daemon started with a soft
   limit of 256 open files raises it.
 - **cli:** unit tests for the exit code rules; `kprtfwd/tests/cli.rs` runs the
-  binary the same way: exit code 2 without a daemon and for one that cannot
-  start, 3 while an enabled forward is not ready and 0 once it is paused, `up`
-  and `down` by words and with `--all`, `prune` against a fake API server
-  (declined, confirmed, `-y`, the daemon's current context, a missing file in
-  `KUBECONFIG`), and `logs` with and without `-f`.
+  binary the same way: exit code 2 for wrong usage, without starting a
+  daemon, 4 without a daemon, for one that cannot start and for one that
+  closes the connection during a command, 3 while an enabled forward is not
+  ready and 0 once it is paused, `up` and `down` by words and with `--all`,
+  `prune` against a fake API server (declined, confirmed, `-y`, the daemon's
+  current context, a missing file in `KUBECONFIG`), and `logs` with and
+  without `-f`.
 - **tui:** key-by-key tests of `App::update`, drawing tests with `TestBackend`
   (also of a lost daemon), tests of the event loop against a fake daemon on
   tokio's paused clock (a lost daemon with its reason and the reconnect, keys

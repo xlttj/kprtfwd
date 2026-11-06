@@ -7,13 +7,24 @@ use clap::Parser;
 use kprtfwd_cli::{Command, DaemonCommand};
 
 #[derive(Parser)]
-#[command(name = "kprtfwd", version, about = "Kubernetes port-forward manager")]
+#[command(
+    name = "kprtfwd",
+    version,
+    about = "Kubernetes port-forward manager",
+    after_help = "Exit codes:
+  0  ok
+  1  error
+  2  wrong usage
+  3  status: an enabled forward is not ready
+  4  the daemon is not reachable"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 fn main() -> ExitCode {
+    // Exits with 2 on wrong usage, 0 for --help and --version.
     let command = Cli::parse().command;
     if let Some(Command::Daemon(DaemonCommand::Run { foreground })) = command {
         return match kprtfwd_daemon::run(kprtfwd_daemon::Options { foreground }) {

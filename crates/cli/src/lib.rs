@@ -18,10 +18,12 @@ use kprtfwd_proto::{
 
 use crate::table::print_table;
 
-/// Exit code when the daemon is not reachable.
-const EXIT_NO_DAEMON: u8 = 2;
-/// Exit code of `status` when an enabled forward is not ready.
+/// Exit code of `status` when an enabled forward is not ready. 2 is clap's,
+/// for wrong usage.
 const EXIT_NOT_READY: u8 = 3;
+/// Exit code when the daemon is not reachable: not running and not
+/// startable, not answering, or gone during the command.
+const EXIT_NO_DAEMON: u8 = 4;
 /// How long `up` waits for forwards to leave "starting".
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Errors older than this are not shown next to a ready forward.
@@ -132,13 +134,20 @@ pub async fn run(command: Command) -> ExitCode {
     }
 }
 
-/// [`EXIT_NO_DAEMON`] if the daemon is not running and could not be
-/// started, 1 for any other error.
+/// [`EXIT_NO_DAEMON`] if the daemon could not be reached: it is not running
+/// and could not be started, it does not answer, or the connection failed or
+/// closed during the command. 1 for any other error, also for a daemon of
+/// another protocol: it answers, and a restart helps, not a start.
 fn exit_code(err: &anyhow::Error) -> u8 {
     let no_daemon = err.downcast_ref::<ClientError>().is_some_and(|err| {
         matches!(
             err,
-            ClientError::NotRunning(_) | ClientError::StartTimeout(_) | ClientError::StartFailed(_)
+            ClientError::NotRunning(_)
+                | ClientError::StartTimeout(_)
+                | ClientError::StartFailed(_)
+                | ClientError::NoAnswer(_)
+                | ClientError::Closed
+                | ClientError::Io(_)
         )
     });
     if no_daemon { EXIT_NO_DAEMON } else { 1 }
@@ -851,24 +860,40 @@ mod tests {
     }
 
     #[test]
-    fn only_a_missing_daemon_exits_with_2() {
+    fn only_an_unreachable_daemon_exits_with_4() {
+        use std::io::{Error, ErrorKind};
         use std::os::unix::process::ExitStatusExt;
-        let missing = || std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(EXIT_NO_DAEMON, 4);
         let no_daemon = [
-            ClientError::NotRunning(missing()),
+            ClientError::NotRunning(Error::from(ErrorKind::NotFound)),
             ClientError::StartTimeout(Duration::from_secs(10)),
             ClientError::StartFailed(std::process::ExitStatus::from_raw(256)),
+            ClientError::NoAnswer(Duration::from_secs(5)),
+            // The daemon went away during the command.
+            ClientError::Closed,
+            ClientError::Io(Error::from(ErrorKind::ConnectionReset)),
+            ClientError::Io(Error::from(ErrorKind::BrokenPipe)),
+            ClientError::Io(Error::from(ErrorKind::PermissionDenied)),
         ];
         for err in no_daemon {
-            let text = err.to_string();
+            let text = format!("{err:?}");
             assert_eq!(exit_code(&err.into()), EXIT_NO_DAEMON, "{text}");
         }
-        let wrapped = anyhow::Error::from(ClientError::NotRunning(missing())).context("connect");
+        let wrapped = anyhow::Error::from(ClientError::Closed).context("snapshot");
         assert_eq!(exit_code(&wrapped), EXIT_NO_DAEMON);
 
         let others = [
             anyhow::Error::from(ClientError::Daemon("unknown forward".into())),
+            anyhow::Error::from(ClientError::Incompatible),
+            anyhow::Error::from(ClientError::ProtocolMismatch {
+                daemon: 1,
+                client: 2,
+                daemon_version: "1.0.0".into(),
+                pid: 1,
+            }),
             anyhow::anyhow!("no project or forward matches \"redis\""),
+            // Not from talking to the daemon, e.g. reading its log.
+            anyhow::Error::from(Error::from(ErrorKind::PermissionDenied)),
         ];
         for err in others {
             assert_eq!(exit_code(&err), 1, "{err}");
