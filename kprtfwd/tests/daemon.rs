@@ -1,6 +1,6 @@
 //! The daemon through the real binary: switching the forwards off when the
-//! last TUI quits, taking over `~/.kprtfwd`, watching the kubeconfig, and a
-//! login that waits for the user.
+//! last TUI quits, taking over `~/.kprtfwd`, watching the kubeconfig, a
+//! login that waits for the user, and discovery.
 //!
 //! Every command runs in a home directory of its own; see `common`.
 
@@ -13,7 +13,7 @@ use std::time::Duration;
 use common::{Home, NOT_FOUND, database, enabled, fake_api, forward, wait_until, write_database};
 use kprtfwd_core::Store;
 use kprtfwd_core::config::TEMPLATE;
-use kprtfwd_proto::{Client, Snapshot};
+use kprtfwd_proto::{Client, Request, Response, Snapshot};
 
 #[tokio::test]
 async fn quitting_the_last_tui_switches_the_forwards_off() {
@@ -265,4 +265,62 @@ echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","s
 
     std::fs::write(plugin.with_extension("gate"), "").unwrap();
     wait_until("logged in", || status().starts_with("test ok")).await;
+}
+
+/// One service, shop/api with port 80, across the cluster.
+const SERVICES: &str = r#"{"kind":"ServiceList","apiVersion":"v1","metadata":{"resourceVersion":"1"},"items":[{"metadata":{"name":"api","namespace":"shop"},"spec":{"ports":[{"name":"http","port":80,"protocol":"TCP"}]}}]}"#;
+
+/// Discovery proposes 10000 + 80 for the service's port 80 unless that is in
+/// use, also when only ::1 is: `localhost` may resolve to ::1 first.
+#[tokio::test]
+async fn discovery_does_not_propose_a_port_in_use_on_ipv6() {
+    let Ok(holder) = std::net::TcpListener::bind("[::1]:10080") else {
+        return; // no IPv6 here, or the port is taken anyway
+    };
+    let mut home = Home::new();
+    let api = fake_api(|path| {
+        if path.starts_with("/api/v1/services") {
+            ("200 OK", SERVICES)
+        } else {
+            NOT_FOUND
+        }
+    });
+    home.set_kubeconfig(&format!(
+        r#"apiVersion: v1
+kind: Config
+clusters:
+- name: test
+  cluster:
+    server: http://127.0.0.1:{api}
+users:
+- name: test
+  user: {{}}
+contexts:
+- name: test
+  context:
+    cluster: test
+    user: test
+"#
+    ));
+    home.start_daemon();
+
+    let mut client = Client::connect(&home.socket()).await.expect("connect");
+    let discover = Request::Discover {
+        context: "test".into(),
+        namespace_filter: String::new(),
+    };
+    let Response::Discovered { ports } = client.request(discover.clone()).await.unwrap() else {
+        panic!("no discovery answer");
+    };
+    assert_eq!(ports.len(), 1, "{ports:?}");
+    assert_ne!(ports[0].local_port, 10080, "{ports:?}");
+    assert_ne!(ports[0].local_port, 0, "{ports:?}");
+
+    drop(holder);
+    if std::net::TcpListener::bind("127.0.0.1:10080").is_ok() {
+        let Response::Discovered { ports } = client.request(discover).await.unwrap() else {
+            panic!("no discovery answer");
+        };
+        assert_eq!(ports[0].local_port, 10080, "{ports:?}");
+    }
 }

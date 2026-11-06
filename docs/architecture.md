@@ -623,6 +623,9 @@ prompt waited is kept.
   2. otherwise the remote port, if it is 1024 or higher and free;
   3. otherwise `10000 + remote`, if that is valid and free;
   4. otherwise the next free port.
+
+  Free means that nothing listens on the port on `127.0.0.1` or on `::1`, as
+  a forward needs both (section 6.3).
 - **Conflicts** with existing forwards and with ports in use are marked.
 - **Service types.** The classification is ported from `pkg/svctype` (mysql, redis,
   http, ...). It decides when "open in browser" applies.
@@ -833,7 +836,8 @@ These are shown in the INFO column and by `kprtfwd status`.
   and with a fake API server and exec plugin, `use-context`, `kubens` and a
   rewrite of a user with env entries cause no reconnect and no login while a
   moved cluster causes exactly one; `status` shows a context and its forward
-  `logging in` while the plugin waits.
+  `logging in` while the plugin waits; discovery does not propose a port that
+  another process holds on `::1` only.
 - **cli:** unit tests for the exit code rules; `kprtfwd/tests/cli.rs` runs the
   binary the same way: exit code 2 without a daemon and for one that cannot
   start, 3 while an enabled forward is not ready and 0 once it is paused, `up`

@@ -403,6 +403,17 @@ fn ipv6_unavailable(err: &std::io::Error) -> bool {
     )
 }
 
+/// Whether a forward could listen on `port` now: nothing listens on it on
+/// 127.0.0.1, nor on ::1 unless this host has no IPv6.
+pub fn port_is_free(port: u16) -> bool {
+    let v4 = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port));
+    v4.is_ok()
+        && match std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, port)) {
+            Ok(_) => true,
+            Err(err) => ipv6_unavailable(&err),
+        }
+}
+
 /// The process listening on `port`, as "name (pid N)", if `lsof` can tell.
 async fn port_holder(port: u16) -> Option<String> {
     let output = tokio::time::timeout(
@@ -790,6 +801,23 @@ mod tests {
             assert!(!ipv6_unavailable(&error(busy)), "{busy:?}");
         }
         assert!(!ipv6_unavailable(&std::io::Error::other("other")));
+    }
+
+    #[test]
+    fn a_port_is_free_only_on_both_loopback_addresses() {
+        let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = v4.local_addr().unwrap().port();
+        assert!(!port_is_free(port));
+        drop(v4);
+        assert!(port_is_free(port));
+
+        let Ok(v6) = std::net::TcpListener::bind("[::1]:0") else {
+            return; // no IPv6 here
+        };
+        let port = v6.local_addr().unwrap().port();
+        assert!(!port_is_free(port));
+        drop(v6);
+        assert!(port_is_free(port));
     }
 
     #[test]

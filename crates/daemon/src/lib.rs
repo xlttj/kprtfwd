@@ -18,7 +18,7 @@ use kprtfwd_core::state::derive;
 use kprtfwd_core::svctype::classify;
 use kprtfwd_core::validate::validate_forward;
 use kprtfwd_core::{Config, ContextState, Forward, ForwardId, Project, Store, StoreError, paths};
-use kprtfwd_engine::{Engine, discovery, kubeconfig};
+use kprtfwd_engine::{Engine, discovery, kubeconfig, port_is_free};
 use kprtfwd_proto::{
     Client, ClientError, ClientMessage, ContextView, DiscoveredPort, EventEntry, ForwardView,
     LastError, PROTOCOL_VERSION, ProjectView, Request, Response, ServerMessage, Snapshot,
@@ -662,7 +662,6 @@ async fn discover(
 
     let mut taken_ids: HashSet<ForwardId> = forwards.iter().map(|f| f.id.clone()).collect();
     let mut taken_ports: HashSet<u16> = forwards.iter().map(|f| f.local_port).collect();
-    let is_free = |port: u16| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok();
 
     let mut ports = Vec::new();
     for service in services {
@@ -683,7 +682,9 @@ async fn discover(
                         port.port,
                         &taken_ids,
                     );
-                    let local = propose_local_port(port.port, &taken_ports, is_free).unwrap_or(0);
+                    // Free on both loopback addresses, as the forward needs it.
+                    let local =
+                        propose_local_port(port.port, &taken_ports, port_is_free).unwrap_or(0);
                     taken_ids.insert(id.clone());
                     taken_ports.insert(local);
                     (id, local)

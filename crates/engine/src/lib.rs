@@ -27,7 +27,7 @@ use crate::context::Context;
 pub use crate::events::Event;
 use crate::events::EventLog;
 use crate::forward::ForwardHandle;
-pub use crate::forward::LastError;
+pub use crate::forward::{LastError, port_is_free};
 
 #[derive(Default)]
 pub struct Engine {
