@@ -887,12 +887,15 @@ These are shown in the INFO column and by `kprtfwd status`.
   with a 400 ms idle exit the daemon stays while a client is connected and exits
   after it left, and a database it cannot read (a renamed table) keeps it
   running until the table is back; SIGTERM and `daemon stop` (exit code 0)
-  remove the socket and `daemon.pid` and leave the forwards on; and with a fake
-  API server and exec plugin, `use-context`, `kubens` and a rewrite of a user
-  with env entries cause no reconnect and no login while a moved cluster causes
-  exactly one; `status` shows a context and its forward `logging in` while the
-  plugin waits; discovery does not propose a port that another process holds on
-  `::1` only; a daemon started with a soft limit of 256 open files raises it.
+  remove the socket and `daemon.pid` and leave the forwards on; `daemon stop`
+  ends a daemon of another version by the PID in `daemon.pid` (a stand-in: the
+  test answers in another protocol, and a shell removes the socket and PID file
+  when terminated); and with a fake API server and exec plugin, `use-context`,
+  `kubens` and a rewrite of a user with env entries cause no reconnect and no
+  login while a moved cluster causes exactly one; `status` shows a context and
+  its forward `logging in` while the plugin waits; discovery does not propose a
+  port that another process holds on `::1` only; a daemon started with a soft
+  limit of 256 open files raises it.
 - **cli:** unit tests for the exit code rules; `kprtfwd/tests/cli.rs` runs the
   binary the same way: exit code 2 without a daemon and for one that cannot
   start, 3 while an enabled forward is not ready and 0 once it is paused, `up`

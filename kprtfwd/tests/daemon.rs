@@ -7,8 +7,10 @@
 
 mod common;
 
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -17,7 +19,10 @@ use common::{
 };
 use kprtfwd_core::Store;
 use kprtfwd_core::config::TEMPLATE;
-use kprtfwd_proto::{Client, ClientError, Request, Response, Snapshot};
+use kprtfwd_proto::{
+    Client, ClientError, ClientMessage, PROTOCOL_VERSION, Request, Response, ServerMessage,
+    Snapshot,
+};
 
 #[tokio::test]
 async fn quitting_the_last_tui_switches_the_forwards_off() {
@@ -184,6 +189,80 @@ async fn daemons_started_at_once_leave_one_running() {
     let output = home.run(&["daemon", "stop"]);
     assert!(output.status.success(), "{output:?}");
     assert!(daemons.exit_status(serving).await.success());
+}
+
+/// Answers a client's hello as a daemon `pid` of another protocol would.
+fn welcome_in_another_protocol(stream: UnixStream, pid: u32) {
+    let mut hello = String::new();
+    let mut reader = BufReader::new(&stream);
+    if reader.read_line(&mut hello).is_err() {
+        return;
+    }
+    let Ok(hello) = serde_json::from_str::<ClientMessage>(&hello) else {
+        return;
+    };
+    let welcome = ServerMessage::Response {
+        id: hello.id,
+        response: Response::Welcome {
+            protocol: PROTOCOL_VERSION + 1,
+            daemon_version: "9.9.9".into(),
+            pid,
+        },
+    };
+    let mut line = serde_json::to_vec(&welcome).unwrap();
+    line.push(b'\n');
+    let _ = (&stream).write_all(&line);
+}
+
+/// A process standing in for a daemon of another version. When the test
+/// ends, its PID file goes first, so that no later `daemon stop` kills that
+/// PID once it is free, and then the process is killed.
+struct StandIn {
+    pid_file: PathBuf,
+    process: Children,
+}
+
+impl Drop for StandIn {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.pid_file);
+    }
+}
+
+/// `daemon stop` cannot talk to a daemon of another version and ends it by
+/// the PID in `daemon.pid`. The stand-in: the test answers on the socket in
+/// another protocol, and the PID is a shell's that, like a daemon, removes
+/// the socket and the PID file when terminated.
+#[tokio::test]
+async fn stops_a_daemon_of_another_version_by_its_pid() {
+    let home = Home::new();
+    std::fs::create_dir_all(home.data_dir()).unwrap();
+    let listener = UnixListener::bind(home.socket()).unwrap();
+    let ready = home.path().join("ready");
+    let script = r#"trap 'rm -f "$0" "$1"; exit 0' TERM; : > "$2"; while :; do sleep 0.05; done"#;
+    let shell = Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .args([home.socket(), home.pid_file(), ready.clone()])
+        .spawn()
+        .unwrap();
+    let mut stand_in = StandIn {
+        pid_file: home.pid_file(),
+        process: Children(vec![shell]),
+    };
+    let pid = stand_in.process.0[0].id();
+    std::fs::write(home.pid_file(), format!("{pid}\n")).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            welcome_in_another_protocol(stream, pid);
+        }
+    });
+    wait_until("trap set", || ready.exists()).await;
+
+    let output = home.run(&["daemon", "stop"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "daemon stopped\n");
+    assert!(stand_in.process.exit_status(0).await.success());
+    assert!(gone(&home));
 }
 
 /// Shortens the daemon's idle exit, in milliseconds.
