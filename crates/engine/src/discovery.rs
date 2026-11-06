@@ -12,6 +12,7 @@ use kube::{Api, Client, ResourceExt};
 
 use crate::context::{answered, client_for, probe};
 use crate::errors::{Failure, classify};
+use crate::kubeconfig;
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -31,7 +32,7 @@ pub struct PortInfo {
 
 /// The context names in the kubeconfig, sorted, and the current context.
 pub fn contexts() -> Result<(Vec<String>, Option<String>), String> {
-    let config = Kubeconfig::read().map_err(|err| format!("cannot read kubeconfig: {err}"))?;
+    let config = Kubeconfig::read().map_err(|err| kubeconfig::describe(&err))?;
     let mut names: Vec<String> = config.contexts.iter().map(|c| c.name.clone()).collect();
     names.sort();
     Ok((names, config.current_context))

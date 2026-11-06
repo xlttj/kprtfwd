@@ -17,6 +17,7 @@ use crate::auth::Login;
 use crate::cache::NamespaceCache;
 use crate::errors::{Failure, classify};
 use crate::events::EventLog;
+use crate::kubeconfig;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const PROBE_INTERVAL_HEALTHY: Duration = Duration::from_secs(5);
@@ -46,7 +47,7 @@ async fn load(context: &str) -> Result<Config, String> {
     };
     Config::from_kubeconfig(&options)
         .await
-        .map_err(|err| err.to_string())
+        .map_err(|err| kubeconfig::describe(&err))
 }
 
 /// A client for a kubeconfig context, and its login if it logs in through an
