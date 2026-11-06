@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
-use kprtfwd_core::clock::local_time;
+use kprtfwd_core::clock::local_date_time;
 use kprtfwd_core::{ForwardId, ForwardState, Store, filter, paths};
 use kprtfwd_proto::{
     Client, ClientError, ForwardView, Request, Snapshot, connect_or_start, other_version,
@@ -612,7 +612,7 @@ async fn events(query: &[String], follow: bool) -> Result<ExitCode> {
             if printed.insert(key) {
                 lines.push_str(&format!(
                     "{}  {:<width$}  {}\n",
-                    local_time(entry.at),
+                    local_date_time(entry.at),
                     entry.source,
                     entry.message
                 ));

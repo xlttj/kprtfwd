@@ -440,10 +440,20 @@ fn logs_show_the_daemon_log_and_the_events_of_forwards() {
 
     // The daemon writes its log in the background.
     let started = Instant::now();
-    while !stdout(&home.run(&["logs"])).contains("daemon started") {
+    let log = loop {
+        let log = stdout(&home.run(&["logs"]));
+        if log.contains("daemon started") {
+            break log;
+        }
         assert!(started.elapsed() < Duration::from_secs(10), "no daemon log");
         std::thread::sleep(Duration::from_millis(100));
-    }
+    };
+    // In local time with its offset, like the times of events, not in UTC.
+    let line = log.lines().find(|l| l.contains("daemon started")).unwrap();
+    let time = line.split_whitespace().next().unwrap();
+    let here = kprtfwd_core::clock::log_timestamp();
+    assert_eq!(time.len(), here.len(), "{line}");
+    assert_eq!(time[time.len() - 6..], here[here.len() - 6..], "{line}");
 
     let output = home.run(&["logs", "api"]);
     assert!(output.status.success(), "{output:?}");
@@ -453,11 +463,17 @@ fn logs_show_the_daemon_log_and_the_events_of_forwards() {
             .any(|l| l.ends_with("  test.shop.api-80  started")),
         "{out}"
     );
-    // The context's events come along.
+    // Every line has the date and the time, and the context's events come
+    // along.
+    for line in out.lines() {
+        let date = line.split_whitespace().next().unwrap();
+        assert_eq!(date.len(), "YYYY-MM-DD".len(), "{line}");
+        assert_eq!(&date[4..5], "-", "{line}");
+    }
     assert!(
         out.lines().any(|l| {
             let words: Vec<&str> = l.split_whitespace().collect();
-            words.get(1) == Some(&"test") && words.get(2) == Some(&"kubeconfig:")
+            words.get(2) == Some(&"test") && words.get(3) == Some(&"kubeconfig:")
         }),
         "{out}"
     );

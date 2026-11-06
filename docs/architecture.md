@@ -581,7 +581,12 @@ them itself:
   with `-f`: the log file by the bytes read, in whole lines, and at the daily
   switch to a new file after the rest of the old one; a reader that goes
   away (`| head`) ends them quietly with 0, also while nothing new is
-  written. Times are local. Events include:
+  written. Times are local everywhere, so the views agree: the daemon's log
+  has RFC 3339 with the offset (`2026-11-07T09:15:02.123456+01:00`, in the
+  terminal with `--foreground` too), `kprtfwd logs <words>` the date and time
+  (`2026-11-07 09:15:02`), and the TUI's event view the time, with the date
+  for events not from today: events live as long as the daemon, which may
+  be days. Events include:
   - state changes,
   - refused connections and why,
   - pod switches,
@@ -906,8 +911,8 @@ These are shown in the INFO column and by `kprtfwd status`.
 ## 13. Testing
 
 - **core:** table tests for state derivation, ID generation, and service type
-  classification (the v1 tests are ported). Migration tests run on a v1 fixture
-  database.
+  classification (the v1 tests are ported), and of the time formats in fixed
+  time zones. Migration tests run on a v1 fixture database.
 - **engine:**
   - unit tests for the protocol framing (encode, decode, port header, error
     channel);
@@ -994,7 +999,8 @@ These are shown in the INFO column and by `kprtfwd status`.
   and without `--all`, `up` and `down` by words and with `--all`, `prune`
   against a fake API server (declined, confirmed, `-y`, the daemon's current
   context, a missing file in `KUBECONFIG`), and `logs` with and without `-f`,
-  across the daily switch and until the reader goes away. Unit tests follow
+  across the daily switch and until the reader goes away, with dates and the
+  daemon log's local offset. Unit tests follow
   a log file through split lines and characters, the switch and truncation.
 - **tui:** key-by-key tests of `App::update`, drawing tests with `TestBackend`
   (also of a lost daemon), tests of the event loop against a fake daemon on

@@ -185,6 +185,7 @@ fn init_logging(
     if options.foreground {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
+            .with_timer(LocalTime)
             .with_target(false)
             .init();
         return Ok(None);
@@ -199,11 +200,22 @@ fn init_logging(
     let (writer, guard) = tracing_appender::non_blocking(appender);
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_timer(LocalTime)
         .with_target(false)
         .with_ansi(false)
         .with_writer(writer)
         .init();
     Ok(Some(guard))
+}
+
+/// The log's times: local with the offset, so that they agree with the
+/// times the TUI and `kprtfwd logs` show; tracing's default is UTC.
+struct LocalTime;
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        w.write_str(&kprtfwd_core::clock::log_timestamp())
+    }
 }
 
 /// Logs panics, then runs the hook installed before, which prints them to
