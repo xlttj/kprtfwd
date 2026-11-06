@@ -27,9 +27,12 @@ const REFRESH_BEFORE: Duration = Duration::from_secs(60);
 /// The longest a login may take. A browser login waits for the user;
 /// kubelogin gives up after 3 minutes.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-/// Flags and variables whose name contains one of these words have their
-/// values kept out of messages.
-const SECRET_WORDS: [&str; 4] = ["secret", "password", "token", "key"];
+/// Values shorter than this stay in messages: replacing them would garble
+/// the text, and a secret is longer.
+const MIN_SECRET: usize = 4;
+/// Runs of token characters at least this long, with digits and both cases,
+/// count as tokens.
+const MIN_TOKEN: usize = 32;
 
 /// A context's exec plugin and the token it returned last.
 #[derive(Clone)]
@@ -151,20 +154,23 @@ impl Login {
         if !output.status.success() {
             let mut message = format!("{name} failed ({})", output.status);
             if let Some(line) = last_line(&output.stderr) {
-                message = format!("{message}: {line}");
+                message = format!("{message}: {}", self.redact(&line));
             }
-            return Err(self.redact(message));
+            return Err(message);
         }
         let token = parse(&output.stdout).map_err(|problem| format!("{name} {problem}"))?;
         *self.token.write().unwrap() = Some(token);
         Ok(())
     }
 
-    /// Replaces the values of secret-looking flags and variables in `text`.
-    fn redact(&self, text: String) -> String {
-        secrets(&self.exec)
+    /// Masks in the plugin's own text every value it was given and every
+    /// word that looks like a token. Which values are secret cannot be told
+    /// from their names, so none is kept.
+    fn redact(&self, text: &str) -> String {
+        let text = secrets(&self.exec)
             .iter()
-            .fold(text, |text, secret| text.replace(secret.as_str(), "***"))
+            .fold(text.to_owned(), |text, secret| replace_word(&text, secret));
+        mask_tokens(&text)
     }
 }
 
@@ -214,33 +220,113 @@ fn variables(exec: &ExecConfig) -> impl Iterator<Item = (&String, &String)> {
         .filter_map(|env| Some((env.get("name")?, env.get("value")?)))
 }
 
+/// Every value the plugin was given: its arguments except the first one when
+/// that names the plugin (see [`Login::name`]), the words inside combined
+/// arguments such as `sh -c "<plugin> --secret=…"`, and its variables'
+/// values. Flag names stay. Each value also in percent-encoded form, as
+/// plugins put values into URLs. Longest first, so that a value inside
+/// another one does not break it up.
 fn secrets(exec: &ExecConfig) -> Vec<String> {
-    let secret = |name: &str| {
-        let name = name.to_lowercase();
-        SECRET_WORDS.iter().any(|word| name.contains(word))
-    };
     let mut found = Vec::new();
     let args = exec.args.as_deref().unwrap_or_default();
-    for (i, arg) in args.iter().enumerate() {
-        let (flag, value) = match arg.split_once('=') {
-            Some((flag, value)) => (flag, Some(value)),
-            None => (arg.as_str(), None),
-        };
-        if !flag.starts_with('-') || !secret(flag) {
-            continue;
+    let shown = args.first().filter(|first| !first.starts_with('-'));
+    for arg in args.iter().skip(usize::from(shown.is_some())) {
+        let words: Vec<&str> = arg.split_whitespace().collect();
+        if words.len() > 1 {
+            found.push(arg.clone());
         }
-        if let Some(value) = value.or(args.get(i + 1).map(String::as_str)) {
-            found.push(value.to_owned());
+        for word in words {
+            let word = word.trim_matches(['\'', '"']);
+            match word.split_once('=') {
+                Some((flag, value)) if flag.starts_with('-') => {
+                    found.push(value.trim_matches(['\'', '"']).to_owned());
+                }
+                // A flag's name; its value is the next word or argument.
+                _ if word.starts_with('-') => {}
+                _ => found.push(word.to_owned()),
+            }
         }
     }
-    for (name, value) in variables(exec) {
-        if secret(name) {
-            found.push(value.clone());
-        }
-    }
-    // Replacing very short values would garble the message.
-    found.retain(|value| value.len() >= 4);
+    found.extend(variables(exec).map(|(_, value)| value.clone()));
+    let encoded: Vec<String> = found
+        .iter()
+        .map(|value| percent_encoded(value))
+        .filter(|encoded| !found.contains(encoded))
+        .collect();
+    found.extend(encoded);
+    found.retain(|value| value.len() >= MIN_SECRET);
+    found.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    found.dedup();
     found
+}
+
+/// `value` as a URL query would carry it.
+fn percent_encoded(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                char::from(byte).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+/// Characters that continue a word, so that a value is not masked inside a
+/// longer word: the client ID "kube" stays in "kubectl".
+fn word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-'
+}
+
+/// Replaces `value` with `***` wherever it stands as a word of its own.
+fn replace_word(text: &str, value: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(value) {
+        out.push_str(&rest[..at]);
+        let before = out.chars().next_back();
+        let after = rest[at + value.len()..].chars().next();
+        if before.is_some_and(word_char) || after.is_some_and(word_char) {
+            out.push_str(value);
+        } else {
+            out.push_str("***");
+        }
+        rest = &rest[at + value.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Masks words that look like credentials: the word after "Bearer", and
+/// runs of base64 characters of [`MIN_TOKEN`] or more that mix digits and
+/// both cases, which covers access tokens and each part of a JWT.
+fn mask_tokens(text: &str) -> String {
+    let token_char = |c: char| c.is_ascii_alphanumeric() || "-_+/=".contains(c);
+    let looks_like_token = |run: &str| {
+        run.len() >= MIN_TOKEN
+            && run.chars().any(|c| c.is_ascii_digit())
+            && run.chars().any(|c| c.is_ascii_lowercase())
+            && run.chars().any(|c| c.is_ascii_uppercase())
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut after_bearer = false;
+    let mut rest = text;
+    while let Some(start) = rest.find(token_char) {
+        out.push_str(&rest[..start]);
+        let run = &rest[start..];
+        let end = run.find(|c| !token_char(c)).unwrap_or(run.len());
+        let word = &run[..end];
+        if after_bearer || looks_like_token(word) {
+            out.push_str("***");
+        } else {
+            out.push_str(word);
+        }
+        after_bearer = word.eq_ignore_ascii_case("bearer") && run[end..].starts_with(' ');
+        rest = &run[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The plugin's last words on stderr, which usually say what went wrong.
@@ -394,22 +480,72 @@ mod tests {
     }
 
     #[test]
-    fn keeps_secrets_out_of_messages() {
+    fn keeps_every_value_out_of_messages() {
         let login = login(exec(
             "kubectl",
             &[
                 "oidc-login",
+                "get-token",
                 "--oidc-client-secret=s3cr3t",
-                "--password",
+                "--passwd",
                 "hunter22",
                 "--oidc-client-id=kube",
+                "--assertion='quoted-value'",
             ],
-            &[("API_KEY", "k3y-value"), ("REGION", "europe")],
+            &[("API_KEY", "k3y-value"), ("PROFILE", "staging-admin")],
         ));
         assert_eq!(
-            login.redact("s3cr3t hunter22 k3y-value kube europe".into()),
-            "*** *** *** kube europe"
+            login.redact(
+                "oidc-login get-token s3cr3t hunter22 kube quoted-value k3y-value staging-admin --passwd"
+            ),
+            "oidc-login *** *** *** *** *** *** *** --passwd"
         );
+        // A value is masked as a word of its own, not inside other words.
+        assert_eq!(
+            login.redact("kubectl kube, kube-system kube"),
+            "kubectl ***, kube-system ***"
+        );
+    }
+
+    #[test]
+    fn keeps_values_of_combined_arguments_out_of_messages() {
+        let login = login(exec(
+            "sh",
+            &["-c", "kubelogin get-token --client-secret=Sup3rS3cret"],
+            &[],
+        ));
+        assert_eq!(
+            login.redact("error: client Sup3rS3cret rejected"),
+            "error: client *** rejected"
+        );
+    }
+
+    #[test]
+    fn keeps_encoded_values_out_of_messages() {
+        let login = login(exec(
+            "plugin",
+            &["get-token", "--client-secret=a+b/c=d&e"],
+            &[],
+        ));
+        assert_eq!(
+            login.redact("POST /token?client_secret=a%2Bb%2Fc%3Dd%26e&grant_type=x failed"),
+            "POST /token?client_secret=***&grant_type=x failed"
+        );
+    }
+
+    #[test]
+    fn keeps_tokens_out_of_messages() {
+        let login = login(exec("plugin", &["get-token"], &[]));
+        assert_eq!(
+            login.redact(
+                "got eyJhbGciOiJSUzI1NiIsImtpZCI6IjEifQ.eyJzdWIiOiJ1c2VyQGV4YW1wbGUuY29tIiwiZXhwIjoxfQ.c2lnbmF0dXJlLXNpZ25hdHVyZS1zaWduYXR1cmU, Authorization: Bearer abc123"
+            ),
+            "got ***.***.***, Authorization: Bearer ***"
+        );
+        // Paths, hosts and hashes are not tokens.
+        let plain = "/usr/local/bin/kubectl-oidc_login https://login.example.com \
+                     3f9a1c0b7e2d4a6f8b9c0d1e2f3a4b5c6d7e8f90";
+        assert_eq!(login.redact(plain), plain);
     }
 
     #[test]
