@@ -316,8 +316,11 @@ contexts:
     assert_ne!(ports[0].local_port, 10080, "{ports:?}");
     assert_ne!(ports[0].local_port, 0, "{ports:?}");
 
+    // Once free, it is proposed. A process this test process started just
+    // as it bound the port may have inherited the socket and keep it.
     drop(holder);
-    if std::net::TcpListener::bind("127.0.0.1:10080").is_ok() {
+    let free = |address: &str| std::net::TcpListener::bind(address).is_ok();
+    if free("127.0.0.1:10080") && free("[::1]:10080") {
         let Response::Discovered { ports } = client.request(discover).await.unwrap() else {
             panic!("no discovery answer");
         };

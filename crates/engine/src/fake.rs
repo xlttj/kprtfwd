@@ -290,6 +290,32 @@ pub fn closed_port() -> u16 {
     panic!("no closed port from 20000 on");
 }
 
+/// Whether a process other than this one listens on `port`. macOS has no
+/// atomic close-on-exec for sockets, so a process that a test starts just
+/// as another test creates a socket inherits it and may hold that test's
+/// port for as long as it runs.
+pub async fn held_by_another_process(port: u16) -> bool {
+    let own = format!("(pid {})", std::process::id());
+    crate::forward::port_holder(port)
+        .await
+        .is_some_and(|holder| !holder.ends_with(&own))
+}
+
+/// Whether `port` is free within a second. A process that a test starts
+/// holds copies of the test process's sockets until it has started, so a
+/// listener just closed may keep its port a moment. Polls without yielding,
+/// so the tasks of a single-threaded test runtime do not run meanwhile.
+pub fn freed(port: u16, free: impl Fn(u16) -> bool) -> bool {
+    let started = std::time::Instant::now();
+    while !free(port) {
+        if started.elapsed() > std::time::Duration::from_secs(1) {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    true
+}
+
 /// A local port that was free a moment ago. Another socket, such as the
 /// local end of a connection of a test running in parallel, may take it
 /// before it is bound.

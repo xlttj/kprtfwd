@@ -343,7 +343,10 @@ There is no setting for this either.
 **Port busy.** If binding either address fails with `EADDRINUSE`, the state
 becomes `PortBusy`, with the owning process if it can be found, and the forward
 holds neither address. The actor retries the bind every 5 s. This is local and
-cheap, so there is no limit.
+cheap, so there is no limit. A port busy at the first attempt is tried again
+after 100 ms before it counts as busy: a process the daemon starts just then
+(`lsof`, an exec plugin) holds copies of the daemon's sockets until it has
+started, so a listener closed meanwhile keeps its port for a moment.
 
 **Out of file descriptors.** If accepting fails because the daemon or the system
 has no file descriptor left (`EMFILE`, `ENFILE`), the forward tries again every
@@ -813,7 +816,8 @@ These are shown in the INFO column and by `kprtfwd status`.
     requests and port-forwards and leaves a proxy to kube;
     `Engine::reconcile` and `reconnect` with a kubeconfig of their own, never
     `~/.kube/config`, and a forward they start again on its port, which
-    binds it at the first attempt; kubeconfig fingerprints (maps read in any order, the
+    binds it at the first attempt; a closed forward frees its port at once;
+    kubeconfig fingerprints (maps read in any order, the
     default namespace), merging with missing files, and the watcher on
     files in a temporary directory (a change read only once settled, a
     truncated or half-written file never used, a failed read tried again with
@@ -829,7 +833,11 @@ These are shown in the INFO column and by `kprtfwd status`.
     streams and when they are dropped or opened again after an outage, the
     `::1` listener, a port busy on `127.0.0.1` or on `::1` only, and failed
     accepts, where running out of file descriptors is reported once per
-    episode and slows the retries down;
+    episode and slows the retries down. Tests that close a port and bind it
+    again take one below the ephemeral range (`fake::closed_port`), and
+    accept a port that a process started by another test holds: macOS sets
+    close-on-exec only after creating a socket, so such a process may
+    inherit a socket of the test (`fake::held_by_another_process`);
   - cluster tests in `crates/engine/tests/cluster.rs`, run in CI against kind
     (job `cluster`) and locally against any throwaway cluster. They only run
     when `KPRTFWD_TEST_CONTEXT` is set; each creates and deletes its own

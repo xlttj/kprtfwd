@@ -22,6 +22,9 @@ use crate::events::EventLog;
 use crate::portforward::{self, KubeIo, PortForward, PortForwardError};
 
 const BIND_RETRY: Duration = Duration::from_secs(5);
+/// A port busy at the first attempt is tried again this soon before it
+/// counts as busy; see [`bind`].
+const BIND_FIRST_RETRY: Duration = Duration::from_millis(100);
 /// The pause after a failed accept, so that a lasting error does not spin.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 /// The pause while no file descriptor is left: accepting works again only
@@ -388,9 +391,14 @@ fn close_connections(
     ));
 }
 
-/// Binds the local port, retrying while it is busy.
+/// Binds the local port, retrying while it is busy. A port busy at the
+/// first attempt is tried again after 100 ms before it counts as busy: a
+/// process the daemon is starting just then, such as `lsof` or an exec
+/// plugin, holds a copy of every listener until it has started, so a
+/// listener closed meanwhile keeps its port for a moment.
 async fn bind(spec: &Forward, shared: &Shared) -> Listeners {
     let port = spec.local_port;
+    let mut first = true;
     loop {
         match listen(spec).await {
             Ok(listeners) => {
@@ -402,7 +410,14 @@ async fn bind(spec: &Forward, shared: &Shared) -> Listeners {
                 });
                 return listeners;
             }
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse && first => {
+                debug!(id = %spec.id, port, "port busy, trying again");
+                first = false;
+                tokio::time::sleep(BIND_FIRST_RETRY).await;
+                continue;
+            }
             Err(err) => {
+                first = false;
                 let holder = if err.kind() == std::io::ErrorKind::AddrInUse {
                     port_holder(port).await
                 } else {
@@ -465,7 +480,7 @@ pub fn port_is_free(port: u16) -> bool {
 }
 
 /// The process listening on `port`, as "name (pid N)", if `lsof` can tell.
-async fn port_holder(port: u16) -> Option<String> {
+pub(crate) async fn port_holder(port: u16) -> Option<String> {
     let output = tokio::time::timeout(
         Duration::from_secs(2),
         tokio::process::Command::new("lsof")
@@ -627,7 +642,7 @@ mod tests {
 
     use super::*;
     use crate::cache::NamespaceCache;
-    use crate::fake::{self, FakeApi, Kubelet, Reply, free_port, slice, status};
+    use crate::fake::{self, FakeApi, Kubelet, Reply, closed_port, free_port, slice, status};
 
     const CONTAINER_PORT: u16 = 8080;
 
@@ -856,18 +871,37 @@ mod tests {
     #[test]
     fn a_port_is_free_only_on_both_loopback_addresses() {
         let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = v4.local_addr().unwrap().port();
-        assert!(!port_is_free(port));
-        drop(v4);
-        assert!(port_is_free(port));
+        assert!(!port_is_free(v4.local_addr().unwrap().port()));
+        if let Ok(v6) = std::net::TcpListener::bind("[::1]:0") {
+            assert!(!port_is_free(v6.local_addr().unwrap().port()));
+        }
+        // Not a port just closed, which a process started by another test
+        // may still hold (see `fake::held_by_another_process`).
+        assert!(port_is_free(closed_port()));
+    }
 
-        let Ok(v6) = std::net::TcpListener::bind("[::1]:0") else {
-            return; // no IPv6 here
-        };
-        let port = v6.local_addr().unwrap().port();
-        assert!(!port_is_free(port));
-        drop(v6);
-        assert!(port_is_free(port));
+    /// Closing a forward frees its port at once, without the retry of a
+    /// forward bound next.
+    #[tokio::test]
+    async fn closing_a_forward_frees_its_port() {
+        let api = FakeApi::start(echo).await;
+        let context = Context::fake(api.client(), healthy());
+        for _ in 0..3 {
+            // Not one of port 0, which another socket may take once free.
+            let port = closed_port();
+            let spec = spec("db", 5432, port);
+            let handle = ForwardHandle::start(spec, context.clone(), EventLog::default());
+            assert_eq!(first_bind(&handle, &context).await, Bind::Bound);
+            handle.close().await;
+            if fake::freed(port, port_is_free) {
+                return;
+            }
+            assert!(
+                fake::held_by_another_process(port).await,
+                "port {port} still held"
+            );
+        }
+        panic!("ports held by other processes in three attempts");
     }
 
     #[test]
@@ -1312,7 +1346,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_busy_port_is_reported_and_taken_once_free() {
-        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // Not one of port 0: the forward is to take it once the holder is
+        // gone, before any other socket can.
+        let holder = std::net::TcpListener::bind(("127.0.0.1", closed_port())).unwrap();
         busy_until_free(holder).await;
     }
 
@@ -1320,17 +1356,10 @@ mod tests {
     /// holds there is busy, although 127.0.0.1 is free.
     #[tokio::test]
     async fn a_port_busy_on_ipv6_only_is_busy() {
-        for _ in 0..5 {
-            let Ok(holder) = std::net::TcpListener::bind("[::1]:0") else {
-                return; // no IPv6 here
-            };
-            let port = holder.local_addr().unwrap().port();
-            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-                busy_until_free(holder).await;
-                return;
-            }
-        }
-        panic!("no port free on 127.0.0.1 in five attempts");
+        let Ok(holder) = std::net::TcpListener::bind(("::1", closed_port())) else {
+            return; // no IPv6 here
+        };
+        busy_until_free(holder).await;
     }
 
     /// A forward on `holder`'s port reports it busy and takes it once
@@ -1348,10 +1377,8 @@ mod tests {
             panic!("{:?}", observe());
         };
         if holder.local_addr().unwrap().is_ipv6() {
-            assert!(
-                std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
-                "127.0.0.1 held while busy"
-            );
+            let v4_free = |port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok();
+            assert!(fake::freed(port, v4_free), "127.0.0.1 held while busy");
         }
         // lsof names this process, where it is installed.
         let busy = match &who {

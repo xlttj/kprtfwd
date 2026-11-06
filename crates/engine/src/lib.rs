@@ -473,41 +473,69 @@ contexts:
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_restarted_forward_binds_its_port_at_once() {
         tokio::spawn(async {
-            let mut engine = Engine::with_kubeconfig(kubeconfig());
-            // Another test's socket may take the free port first.
-            let mut api = forward("staging", "shop", "api");
-            for _ in 0..5 {
-                api.local_port = free_port();
-                engine.reconcile(std::slice::from_ref(&api)).await;
-                if first_bind(&engine, &api.id).await == Bind::Bound {
-                    break;
+            let own = format!("(pid {})", std::process::id());
+            for _ in 0..3 {
+                // Not one of port 0, which another socket may take while
+                // it is closed.
+                let port = closed_port();
+                match restarts_bind_at_once(port).await {
+                    Ok(()) => return,
+                    // A process another test started inherited the
+                    // listener (see `fake::held_by_another_process`), and
+                    // may have ended before lsof looked.
+                    Err(Bind::Busy { holder: None }) => {}
+                    Err(Bind::Busy {
+                        holder: Some(holder),
+                    }) if !holder.ends_with(&own) => {}
+                    Err(bind) => panic!("port {port}: {bind:?}"),
                 }
             }
-            assert_eq!(engine.observe(&api.id).unwrap().bind, Bind::Bound);
-
-            let edited = Forward {
-                namespace: "web".into(),
-                ..api.clone()
-            };
-            for round in 0..10 {
-                let wanted = if round % 2 == 0 { &edited } else { &api };
-                engine.reconcile(std::slice::from_ref(wanted)).await;
-                assert_eq!(first_bind(&engine, &api.id).await, Bind::Bound, "edit");
-                engine
-                    .reconnect("staging", std::slice::from_ref(wanted), None)
-                    .await;
-                assert_eq!(first_bind(&engine, &api.id).await, Bind::Bound, "reconnect");
-            }
-            let busy: Vec<String> = engine
-                .forward_events(&api.id)
-                .into_iter()
-                .map(|event| event.message)
-                .filter(|message| message.contains("busy"))
-                .collect();
-            assert!(busy.is_empty(), "{busy:?}");
+            panic!("ports held by other processes in three attempts");
         })
         .await
         .unwrap();
+    }
+
+    /// Starts a forward on `port` and restarts it there ten times through
+    /// an edit and ten times through a reconnect. Returns the first bind
+    /// that is not `Bound`.
+    async fn restarts_bind_at_once(port: u16) -> Result<(), Bind> {
+        let bound = |bind: Bind| {
+            if bind == Bind::Bound {
+                Ok(())
+            } else {
+                Err(bind)
+            }
+        };
+        let mut engine = Engine::with_kubeconfig(kubeconfig());
+        let api = Forward {
+            local_port: port,
+            ..forward("staging", "shop", "api")
+        };
+        engine.reconcile(std::slice::from_ref(&api)).await;
+        bound(first_bind(&engine, &api.id).await)?;
+
+        let edited = Forward {
+            namespace: "web".into(),
+            ..api.clone()
+        };
+        for round in 0..10 {
+            let wanted = if round % 2 == 0 { &edited } else { &api };
+            engine.reconcile(std::slice::from_ref(wanted)).await;
+            bound(first_bind(&engine, &api.id).await)?;
+            engine
+                .reconnect("staging", std::slice::from_ref(wanted), None)
+                .await;
+            bound(first_bind(&engine, &api.id).await)?;
+        }
+        let busy: Vec<String> = engine
+            .forward_events(&api.id)
+            .into_iter()
+            .map(|event| event.message)
+            .filter(|message| message.contains("busy"))
+            .collect();
+        assert!(busy.is_empty(), "{busy:?}");
+        Ok(())
     }
 
     #[tokio::test]
