@@ -578,7 +578,9 @@ them itself:
   event view (`l`) shows a forward's events merged with its context's;
   `kprtfwd logs <project or words>` does the same for any set of forwards, and
   `kprtfwd logs` without arguments shows the daemon's log file. Both follow
-  with `-f`; times are local. Events include:
+  with `-f`: the log file by the bytes read, in whole lines, and at the daily
+  switch to a new file after the rest of the old one; a reader that goes
+  away (`| head`) ends them quietly with 0. Times are local. Events include:
   - state changes,
   - refused connections and why,
   - pod switches,
@@ -990,7 +992,9 @@ These are shown in the INFO column and by `kprtfwd status`.
   enabled forward is not ready and 0 once it is paused, `status --json` with
   and without `--all`, `up` and `down` by words and with `--all`, `prune`
   against a fake API server (declined, confirmed, `-y`, the daemon's current
-  context, a missing file in `KUBECONFIG`), and `logs` with and without `-f`.
+  context, a missing file in `KUBECONFIG`), and `logs` with and without `-f`,
+  across the daily switch and until the reader goes away. Unit tests follow
+  a log file through split lines and characters, the switch and truncation.
 - **tui:** key-by-key tests of `App::update`, drawing tests with `TestBackend`
   (also of a lost daemon), tests of the event loop against a fake daemon on
   tokio's paused clock (a lost daemon with its reason and the reconnect, keys

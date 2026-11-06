@@ -6,9 +6,9 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixListener;
-use std::process::{Output, Stdio};
+use std::process::{Child, ExitStatus, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -484,4 +484,88 @@ fn logs_show_the_daemon_log_and_the_events_of_forwards() {
     wait_for_line(&lines, "stopped");
     follow.kill().unwrap();
     follow.wait().unwrap();
+
+    // A reader that goes away, as `| head` does, ends it quietly at the
+    // next event.
+    let mut follow = home
+        .command(&["logs", "-f", "api"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(follow.stdout.take());
+    assert!(home.run(&["up", "api"]).status.success());
+    let (status, err) = exit_of(follow);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert_eq!(err, "");
+}
+
+/// The exit status and stderr of `child`, which must exit within 10 s.
+fn exit_of(mut child: Child) -> (ExitStatus, String) {
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("still running after 10 s");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut err = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        stderr.read_to_string(&mut err).unwrap();
+    }
+    (status, err)
+}
+
+/// `logs -f` follows the daemon log by the bytes it read, so it needs no
+/// daemon; one is never started here.
+#[test]
+fn logs_follow_the_daemon_log_until_the_reader_goes_away() {
+    let home = Home::new();
+    let logs = home.data_dir().join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let append = |name: &str, text: &str| {
+        std::fs::File::options()
+            .create(true)
+            .append(true)
+            .open(logs.join(name))
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+    };
+    append("daemon.2026-11-06.log", "monday\n");
+
+    let mut follow = home
+        .command(&["logs", "-f"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = BufReader::new(follow.stdout.take().unwrap());
+    let mut line = String::new();
+    out.read_line(&mut line).unwrap();
+    assert_eq!(line, "monday\n");
+
+    // A line in two writes, the rest of the old file, then the new day's.
+    append("daemon.2026-11-06.log", "late mon");
+    std::thread::sleep(Duration::from_millis(700));
+    append("daemon.2026-11-06.log", "day\n");
+    append("daemon.2026-11-07.log", "tuesday\n");
+    for expected in ["late monday\n", "tuesday\n"] {
+        line.clear();
+        out.read_line(&mut line).unwrap();
+        assert_eq!(line, expected);
+    }
+
+    // The reader goes away, as with `| head`.
+    drop(out);
+    append("daemon.2026-11-07.log", "unread\n");
+    let (status, err) = exit_of(follow);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert_eq!(err, "");
+    assert!(!home.socket().exists(), "a daemon was started");
 }

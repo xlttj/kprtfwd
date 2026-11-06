@@ -1,6 +1,7 @@
 //! The kprtfwd command line: everything except the TUI and `daemon run`.
 
 mod json;
+mod log_file;
 mod table;
 
 use std::collections::{HashMap, HashSet};
@@ -131,6 +132,7 @@ pub enum DbCommand {
 pub async fn run(command: Command) -> ExitCode {
     match execute(command).await {
         Ok(code) => code,
+        Err(err) if err.is::<StdoutClosed>() => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("kprtfwd: {err:#}");
             let start_failed = err.downcast_ref::<ClientError>().is_some_and(|err| {
@@ -144,6 +146,29 @@ pub async fn run(command: Command) -> ExitCode {
             }
             ExitCode::from(exit_code(&err))
         }
+    }
+}
+
+/// Its reader closed stdout, e.g. `| head`: the command ends quietly.
+#[derive(Debug)]
+struct StdoutClosed;
+
+impl std::fmt::Display for StdoutClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stdout closed")
+    }
+}
+
+impl std::error::Error for StdoutClosed {}
+
+/// Writes `bytes` to stdout at once. A closed stdout is [`StdoutClosed`],
+/// not a panic as with `print!`.
+fn write_stdout(bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    match stdout.write_all(bytes).and_then(|()| stdout.flush()) {
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Err(StdoutClosed.into()),
+        result => Ok(result?),
     }
 }
 
@@ -235,10 +260,9 @@ async fn status(all: bool, json: bool) -> Result<ExitCode> {
         .filter(|view| all || view.forward.enabled)
         .collect();
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&status_json(&snapshot, &shown))?
-        );
+        let mut text = serde_json::to_string_pretty(&status_json(&snapshot, &shown))?;
+        text.push('\n');
+        write_stdout(text.as_bytes())?;
     } else {
         print_contexts(&snapshot);
         if shown.is_empty() {
@@ -562,17 +586,19 @@ async fn events(query: &[String], follow: bool) -> Result<ExitCode> {
             kprtfwd_proto::Response::Events { entries } => entries,
             _ => bail!("unexpected answer from the daemon"),
         };
+        let mut lines = String::new();
         for entry in entries {
             let key = (entry.at, entry.source.clone(), entry.message.clone());
             if printed.insert(key) {
-                println!(
-                    "{}  {:<width$}  {}",
+                lines.push_str(&format!(
+                    "{}  {:<width$}  {}\n",
                     local_time(entry.at),
                     entry.source,
                     entry.message
-                );
+                ));
             }
         }
+        write_stdout(lines.as_bytes())?;
         if !follow {
             return Ok(ExitCode::SUCCESS);
         }
@@ -581,51 +607,25 @@ async fn events(query: &[String], follow: bool) -> Result<ExitCode> {
 }
 
 /// Prints the end of the daemon's newest log file, and with `follow` what
-/// is appended, switching files at the daily rotation.
+/// is appended, across the daily switch to a new file.
 async fn daemon_log(follow: bool) -> Result<ExitCode> {
-    use std::io::{Read, Seek, SeekFrom};
     const TAIL: usize = 50;
     let dir = paths::log_dir().context("neither KPRTFWD_HOME nor HOME is set")?;
-    let newest = || -> Option<PathBuf> {
-        std::fs::read_dir(&dir)
-            .ok()?
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("daemon.") && name.ends_with(".log"))
-            })
-            .max()
-    };
-    let mut file = newest().with_context(|| format!("no daemon log in {}", dir.display()))?;
-    let text = std::fs::read_to_string(&file)?;
-    let lines: Vec<&str> = text.lines().collect();
-    for line in &lines[lines.len().saturating_sub(TAIL)..] {
-        println!("{line}");
+    let mut log = log_file::Follower::new(&dir)
+        .with_context(|| format!("no daemon log in {}", dir.display()))?;
+    let mut text = log.read()?;
+    if !follow {
+        text.append(&mut log.rest());
     }
+    write_stdout(log_file::last_lines(&text, TAIL))?;
     if !follow {
         return Ok(ExitCode::SUCCESS);
     }
-    let mut position = text.len() as u64;
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        if let Some(latest) = newest()
-            && latest != file
-        {
-            file = latest;
-            position = 0;
-        }
-        let length = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
-        if length < position {
-            position = 0;
-        }
-        if length > position {
-            let mut handle = std::fs::File::open(&file)?;
-            handle.seek(SeekFrom::Start(position))?;
-            let mut appended = String::new();
-            handle.read_to_string(&mut appended)?;
-            print!("{appended}");
-            position = length;
+        let lines = log.read()?;
+        if !lines.is_empty() {
+            write_stdout(&lines)?;
         }
     }
 }
