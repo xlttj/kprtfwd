@@ -1147,4 +1147,383 @@ pub(crate) mod tests {
             "existing ports are not added again"
         );
     }
+
+    fn message(app: &App) -> (&str, bool) {
+        let message = app.message.as_ref().expect("a message");
+        (message.text.as_str(), message.error)
+    }
+
+    fn port(service: &str) -> DiscoveredPort {
+        DiscoveredPort {
+            namespace: "shop".into(),
+            service: service.into(),
+            port: 80,
+            port_name: None,
+            service_type: ServiceType::Http,
+            existing: None,
+            id: ForwardId::new(format!("staging.shop.{service}-80")),
+            local_port: 10080,
+        }
+    }
+
+    #[test]
+    fn results_outside_their_step_change_nothing() {
+        let mut app = App::new(snapshot());
+        app.update(Msg::Contexts(Ok((vec!["staging".into()], None))));
+        app.update(Msg::Discovered(Ok(vec![port("api")])));
+        app.update(Msg::Events(Ok(vec![])));
+        app.update(Msg::Events(Err("late".into())));
+        assert!(matches!(app.mode, Mode::List));
+        assert!(app.message.is_none());
+
+        // Discovery closed with Esc while loading: its answer is dropped.
+        app.update(key(KeyCode::Char('d')));
+        app.update(key(KeyCode::Esc));
+        app.update(Msg::Contexts(Ok((vec!["staging".into()], None))));
+        assert!(matches!(app.mode, Mode::List));
+    }
+
+    #[test]
+    fn discovery_failures_are_shown_until_a_key() {
+        for (result, expected) in [
+            (Ok((vec![], None)), "the kubeconfig has no contexts"),
+            (
+                Err("cannot read the kubeconfig".to_owned()),
+                "cannot read the kubeconfig",
+            ),
+        ] {
+            let mut app = App::new(snapshot());
+            app.update(key(KeyCode::Char('d')));
+            app.update(Msg::Contexts(result));
+            let Mode::Discovery(Discovery::Failed(text)) = &app.mode else {
+                panic!("not failed");
+            };
+            assert_eq!(text, expected);
+            app.update(key(KeyCode::Char('x')));
+            assert!(matches!(app.mode, Mode::List));
+        }
+
+        let mut app = App::new(snapshot());
+        app.mode = Mode::Discovery(Discovery::Loading("staging".into()));
+        app.update(Msg::Discovered(Err("API server unreachable (DNS)".into())));
+        assert!(matches!(
+            &app.mode,
+            Mode::Discovery(Discovery::Failed(text)) if text == "API server unreachable (DNS)"
+        ));
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_form_open() {
+        let mut app = App::new(snapshot());
+        app.update(key(KeyCode::Char('a')));
+        type_text(&mut app, "api");
+        app.update(key(KeyCode::Tab));
+        type_text(&mut app, "80");
+        app.update(key(KeyCode::Tab));
+        type_text(&mut app, "18080");
+        assert_eq!(requested(&app.update(key(KeyCode::Enter))).len(), 1);
+
+        app.update(Msg::Done(Err("port 18080 is taken".into())));
+        let Mode::Form(form) = &app.mode else {
+            panic!("form closed")
+        };
+        assert_eq!(form.error.as_deref(), Some("port 18080 is taken"));
+        assert_eq!(form.fields[4], "18080", "the input stays");
+
+        app.update(Msg::Done(Ok("added production.shop.api-80".into())));
+        assert!(matches!(app.mode, Mode::List));
+        assert_eq!(message(&app), ("added production.shop.api-80", false));
+    }
+
+    #[test]
+    fn a_failed_discovery_save_keeps_the_services_open() {
+        let mut app = App::new(snapshot());
+        app.mode = Mode::Discovery(Discovery::Loading("staging".into()));
+        app.update(Msg::Discovered(Ok(vec![port("api")])));
+        app.update(key(KeyCode::Char(' ')));
+        assert_eq!(requested(&app.update(key(KeyCode::Enter))).len(), 1);
+        app.update(Msg::Done(Err("port 10080 is taken".into())));
+        assert!(matches!(app.mode, Mode::Discovery(Discovery::Services(_))));
+        assert_eq!(message(&app), ("port 10080 is taken", true));
+        app.update(Msg::Done(Ok("added 1 forwards".into())));
+        assert!(matches!(app.mode, Mode::List));
+    }
+
+    #[test]
+    fn done_in_the_list_reports_both_ways() {
+        let mut app = App::new(snapshot());
+        app.update(Msg::Done(Ok("paused".into())));
+        assert_eq!(message(&app), ("paused", false));
+        app.update(Msg::Done(Err("the daemon closed the connection".into())));
+        assert_eq!(message(&app), ("the daemon closed the connection", true));
+        assert!(matches!(app.mode, Mode::List));
+    }
+
+    #[test]
+    fn the_events_view_refreshes_until_it_is_closed() {
+        let mut app = App::new(snapshot());
+        let id = ForwardId::new("prd-web");
+        assert_eq!(
+            app.update(key(KeyCode::Char('l'))),
+            [Cmd::Events { id: id.clone() }]
+        );
+        assert_eq!(app.tick(), [Cmd::Events { id: id.clone() }]);
+        let entry = EventEntry {
+            at: std::time::SystemTime::UNIX_EPOCH,
+            source: "prd-web".into(),
+            message: "pod web-0".into(),
+        };
+        app.update(Msg::Events(Ok(vec![entry.clone()])));
+        app.update(key(KeyCode::Char('j')));
+        let Mode::Events { entries, .. } = &app.mode else {
+            panic!("events view closed")
+        };
+        assert_eq!(entries, &[entry]);
+
+        for close in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::Char('l')] {
+            app.mode = Mode::Events {
+                id: id.clone(),
+                entries: vec![],
+            };
+            app.update(key(close));
+            assert!(matches!(app.mode, Mode::List), "{close:?}");
+            assert!(!app.quit);
+            assert!(app.tick().is_empty());
+        }
+
+        app.update(key(KeyCode::Char('l')));
+        app.update(Msg::Events(Err("unknown forward".into())));
+        assert!(matches!(app.mode, Mode::List));
+        assert_eq!(message(&app), ("unknown forward", true));
+    }
+
+    #[test]
+    fn project_keys_act_on_the_selected_project() {
+        let mut app = App::new(snapshot());
+        app.update(key(KeyCode::Char('p')));
+        let mut press = |code| requested(&app.update(key(code)));
+        assert_eq!(
+            press(KeyCode::Enter),
+            [Request::SetProjectEnabled {
+                name: "web".into(),
+                enabled: true
+            }]
+        );
+        assert_eq!(
+            press(KeyCode::Char('-')),
+            [Request::SetProjectEnabled {
+                name: "web".into(),
+                enabled: false
+            }]
+        );
+        assert_eq!(
+            press(KeyCode::Char('s')),
+            [Request::SwitchProject { name: "web".into() }]
+        );
+        // There is one project only.
+        assert!(press(KeyCode::Char('j')).is_empty());
+        assert!(matches!(app.mode, Mode::Projects { selected: 0, .. }));
+
+        // u sets the members to the listed forwards.
+        app.filter = "staging".into();
+        assert_eq!(
+            requested(&app.update(key(KeyCode::Char('u')))),
+            [Request::UpsertProject {
+                project: Project {
+                    name: "web".into(),
+                    forwards: vec![ForwardId::new("stg-db"), ForwardId::new("stg-web")],
+                }
+            }]
+        );
+
+        // x asks first.
+        assert!(app.update(key(KeyCode::Char('x'))).is_empty());
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        assert_eq!(
+            requested(&app.update(key(KeyCode::Char('y')))),
+            [Request::DeleteProject { name: "web".into() }]
+        );
+
+        // f lists the members and leaves.
+        app.filter.clear();
+        app.update(key(KeyCode::Char('p')));
+        app.update(key(KeyCode::Char('f')));
+        assert_eq!(app.filter, "@web");
+        assert!(matches!(app.mode, Mode::List));
+        assert_eq!(ids(&app), ["prd-web", "stg-web"]);
+    }
+
+    #[test]
+    fn naming_a_project_can_be_corrected_and_cancelled() {
+        let mut app = App::new(snapshot());
+        app.update(key(KeyCode::Char('p')));
+        app.update(key(KeyCode::Char('n')));
+        type_text(&mut app, "apix");
+        app.update(key(KeyCode::Backspace));
+        assert!(matches!(&app.mode, Mode::Projects { naming: Some(name), .. } if name == "api"));
+        // A blank name is not saved.
+        let mut blank = App::new(snapshot());
+        blank.update(key(KeyCode::Char('p')));
+        blank.update(key(KeyCode::Char('n')));
+        type_text(&mut blank, "  ");
+        assert!(blank.update(key(KeyCode::Enter)).is_empty());
+
+        app.update(key(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Projects { naming: None, .. }));
+        app.update(key(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::List));
+    }
+
+    #[test]
+    fn the_edit_form_saves_the_forward_under_its_id() {
+        let mut app = App::new(snapshot());
+        app.update(key(KeyCode::Char('G')));
+        app.update(key(KeyCode::Char('e')));
+        let Mode::Form(form) = &app.mode else {
+            panic!("no form")
+        };
+        assert_eq!(form.fields, ["staging", "shop", "frontend", "80", "10080"]);
+        assert_eq!(form.focus, 4, "the local port is edited most");
+
+        for _ in 0..5 {
+            app.update(key(KeyCode::Backspace));
+        }
+        type_text(&mut app, "18081");
+        assert_eq!(
+            requested(&app.update(key(KeyCode::Enter))),
+            [Request::UpsertForwards {
+                forwards: vec![Forward {
+                    id: ForwardId::new("stg-web"),
+                    context: "staging".into(),
+                    namespace: "shop".into(),
+                    service: "frontend".into(),
+                    remote_port: 80,
+                    local_port: 18081,
+                    enabled: true,
+                }]
+            }]
+        );
+
+        // Focus wraps around; Esc closes without saving.
+        app.update(key(KeyCode::Tab));
+        assert!(matches!(&app.mode, Mode::Form(form) if form.focus == 0));
+        app.update(key(KeyCode::BackTab));
+        assert!(matches!(&app.mode, Mode::Form(form) if form.focus == 4));
+        assert!(app.update(key(KeyCode::Esc)).is_empty());
+        assert!(matches!(app.mode, Mode::List));
+    }
+
+    #[test]
+    fn paging_keys_move_by_a_page_and_stop_at_the_ends() {
+        let mut big = snapshot();
+        big.forwards = (0..30u16)
+            .map(|i| view(&format!("fwd-{i:02}"), "staging", "api", 8000 + i, false))
+            .collect();
+        let mut app = App::new(big);
+        app.page.set(10);
+        let mut at = |code| {
+            app.update(key(code));
+            app.selected_index().unwrap()
+        };
+        assert_eq!(at(KeyCode::PageDown), 10);
+        assert_eq!(at(KeyCode::PageDown), 20);
+        assert_eq!(at(KeyCode::PageDown), 29);
+        assert_eq!(at(KeyCode::PageUp), 19);
+        assert_eq!(at(KeyCode::Char('g')), 0);
+        assert_eq!(at(KeyCode::Up), 0);
+        assert_eq!(at(KeyCode::Char('G')), 29);
+        assert_eq!(at(KeyCode::Down), 29);
+        assert_eq!(at(KeyCode::Home), 0);
+        assert_eq!(at(KeyCode::End), 29);
+    }
+
+    #[test]
+    fn pause_reconnect_open_and_copy_keys() {
+        let mut app = App::new(snapshot());
+        assert_eq!(
+            requested(&app.update(key(KeyCode::Char('P')))),
+            [Request::SetPaused { paused: true }]
+        );
+        app.snapshot.paused = true;
+        assert_eq!(
+            requested(&app.update(key(KeyCode::Char('P')))),
+            [Request::SetPaused { paused: false }]
+        );
+        assert_eq!(
+            requested(&app.update(key(KeyCode::Char('r')))),
+            [Request::ReconnectContext {
+                name: "production".into()
+            }]
+        );
+        assert_eq!(
+            app.update(key(KeyCode::Char('o'))),
+            [Cmd::Open("http://localhost:10080".into())]
+        );
+        assert_eq!(
+            app.update(key(KeyCode::Char('y'))),
+            [Cmd::Copy("localhost:10080".into())]
+        );
+
+        // mysql is not opened in a browser.
+        app.update(key(KeyCode::Char('j')));
+        assert!(app.update(key(KeyCode::Char('o'))).is_empty());
+        assert_eq!(
+            message(&app),
+            ("not an HTTP service; y copies the address", true)
+        );
+    }
+
+    #[test]
+    fn help_closes_on_any_key() {
+        let mut app = App::new(snapshot());
+        app.update(key(KeyCode::Char('?')));
+        assert!(matches!(app.mode, Mode::Help));
+        app.update(key(KeyCode::Char('j')));
+        assert!(matches!(app.mode, Mode::List));
+        assert_eq!(
+            app.selected,
+            Some(ForwardId::new("prd-web")),
+            "the key is not acted on"
+        );
+    }
+
+    #[test]
+    fn the_selection_follows_its_forward_across_snapshots() {
+        let mut app = App::new(snapshot());
+        app.update(key(KeyCode::Char('G')));
+        assert_eq!(app.selected, Some(ForwardId::new("stg-web")));
+
+        let mut next = snapshot();
+        next.forwards.reverse();
+        next.forwards
+            .insert(0, view("dev-web", "development", "frontend", 80, false));
+        app.update(Msg::Snapshot(next));
+        assert_eq!(app.selected, Some(ForwardId::new("stg-web")));
+
+        // When it is gone, another listed forward is selected.
+        let mut gone = snapshot();
+        gone.forwards.retain(|v| v.forward.id.as_str() != "stg-web");
+        app.update(Msg::Snapshot(gone));
+        let selected = app.selected.clone().unwrap();
+        assert!(ids(&app).contains(&selected.to_string()), "{selected}");
+
+        let mut empty = snapshot();
+        empty.forwards.clear();
+        app.update(Msg::Snapshot(empty));
+        assert_eq!(app.selected, None);
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_every_mode() {
+        let ctrl_c = Msg::Key(KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        let mut app = App::new(snapshot());
+        app.update(key(KeyCode::Char('a')));
+        assert!(app.update(ctrl_c).is_empty());
+        assert!(app.quit);
+    }
 }

@@ -744,7 +744,10 @@ These are shown in the INFO column and by `kprtfwd status`.
   lifts the pause, another client or `keep_forwards_running` keeps them, and a
   daemon still running in `~/.kprtfwd` is stopped and its database copied.
 - **tui:** key-by-key tests of `App::update`, drawing tests with `TestBackend`,
-  and `expect` scripts for the whole flow (see section 10).
+  tests of the event loop against a fake daemon on tokio's paused clock (a
+  lost daemon and the reconnect, a request's result and the fresh snapshot, a
+  discovery answer after Esc, ctrl+l and resizes, the events view), and
+  `expect` scripts for the whole flow (see section 10).
 - **Manual checklist, against every configured context:**
   - forward, auth (including an expired `oidc-login` token) and the health probe;
   - a real VPN drop and recovery;

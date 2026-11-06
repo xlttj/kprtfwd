@@ -13,5 +13,9 @@ anyhow.workspace = true
 ratatui.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+# Paused time for the event loop tests.
+tokio = { workspace = true, features = ["test-util"] }
+
 [lints]
 workspace = true
