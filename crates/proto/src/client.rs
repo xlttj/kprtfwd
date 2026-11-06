@@ -1,10 +1,10 @@
 //! The client side of the daemon connection.
 
+use std::ffi::OsString;
 use std::fs::{DirBuilder, File};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -176,20 +176,57 @@ impl Client {
     }
 }
 
-/// Starts `<exe> daemon run` for `data_dir` in the background, in its own
-/// process group, so it outlives the terminal it was started from. Its
-/// stderr, where errors before its log is open and crashes end up, is
-/// appended to `logs/daemon.stderr` in `data_dir`, if that can be opened;
-/// the daemon reports its own problems with the directory.
+/// Starts `<exe> daemon run` for `data_dir` in the background. The daemon
+/// starts a session of its own, which it can only while it leads no process
+/// group, so it has no terminal and outlives the one it was started from.
+/// It runs in `data_dir`, not keeping the client's directory busy, so
+/// relative entries of `KUBECONFIG` and a relative `KPRTFWD_HOME` are passed
+/// as absolute paths. Its stderr, where errors before its log is open and
+/// crashes end up, is appended to `logs/daemon.stderr` in `data_dir`, if
+/// that can be opened; the daemon reports its own problems with the
+/// directory.
 pub fn spawn_daemon(exe: &Path, data_dir: &Path) -> io::Result<Child> {
     let stderr = stderr_file(&data_dir.join("logs")).map_or_else(|_| Stdio::null(), Stdio::from);
-    Command::new(exe)
+    let data_dir = std::path::absolute(data_dir)?;
+    let mut command = Command::new(exe);
+    command
         .args(["daemon", "run"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr)
-        .process_group(0)
-        .spawn()
+        .current_dir(if data_dir.is_dir() {
+            &data_dir
+        } else {
+            Path::new("/")
+        });
+    if let Some(home) =
+        std::env::var_os("KPRTFWD_HOME").filter(|home| Path::new(home).is_relative())
+    {
+        command.env("KPRTFWD_HOME", std::path::absolute(home)?);
+    }
+    if let Some(kubeconfig) = absolute_entries(std::env::var_os("KUBECONFIG")) {
+        command.env("KUBECONFIG", kubeconfig);
+    }
+    command.spawn()
+}
+
+/// A list of paths like `KUBECONFIG` with its relative entries made
+/// absolute against the current directory; `None` if none is relative, or
+/// if the result cannot be written as such a list. Empty entries stay.
+fn absolute_entries(list: Option<OsString>) -> Option<OsString> {
+    let entries: Vec<PathBuf> = std::env::split_paths(&list?).collect();
+    let relative = |entry: &PathBuf| !entry.as_os_str().is_empty() && entry.is_relative();
+    if !entries.iter().any(relative) {
+        return None;
+    }
+    let entries = entries.into_iter().map(|entry| {
+        if relative(&entry) {
+            std::path::absolute(&entry).unwrap_or(entry)
+        } else {
+            entry
+        }
+    });
+    std::env::join_paths(entries).ok()
 }
 
 /// `daemon.stderr` in `logs`, opened for appending; creates `logs` with
@@ -342,6 +379,30 @@ mod tests {
                 let _ = writer.write_all(answer.as_bytes()).await;
             }
         });
+    }
+
+    #[test]
+    fn relative_entries_of_kubeconfig_are_made_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+        let list = |entries: &[&Path]| std::env::join_paths(entries).unwrap();
+        let absolute = Path::new("/etc/kube/config");
+        assert_eq!(absolute_entries(None), None);
+        assert_eq!(absolute_entries(Some(list(&[absolute]))), None);
+        assert_eq!(absolute_entries(Some("".into())), None);
+
+        let given = list(&[
+            Path::new("kube/a"),
+            Path::new(""),
+            absolute,
+            Path::new("../b"),
+        ]);
+        let made = list(&[
+            &cwd.join("kube/a"),
+            Path::new(""),
+            absolute,
+            &cwd.join("../b"),
+        ]);
+        assert_eq!(absolute_entries(Some(given)), Some(made));
     }
 
     #[tokio::test]

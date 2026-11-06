@@ -461,6 +461,71 @@ async fn the_data_directory_and_socket_are_the_users_only() {
         .expect("serves its user");
 }
 
+/// The working directory of the process `pid`, a daemon of this test.
+fn cwd_of(pid: u32) -> PathBuf {
+    if cfg!(target_os = "linux") {
+        return std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap();
+    }
+    let lsof = Command::new("lsof")
+        .args(["-a", "-d", "cwd", "-Fn", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&lsof.stdout);
+    let name = text.lines().find_map(|line| line.strip_prefix('n'));
+    PathBuf::from(name.unwrap_or_else(|| panic!("{lsof:?}")))
+}
+
+/// A daemon started on demand runs in a session of its own, so it has no
+/// terminal (one that shares the terminal is stopped as soon as an exec
+/// plugin reads from it), and in the data directory, so it keeps no other
+/// busy. Relative entries of `KUBECONFIG` still name the files they named
+/// for the client.
+#[tokio::test]
+async fn a_daemon_started_on_demand_is_detached() {
+    let mut home = Home::new();
+    home.set_kubeconfig("apiVersion: v1\nkind: Config\n");
+    home.set_kubeconfig_files(&[PathBuf::from("kubeconfig")]);
+
+    let output = home
+        .command(&["status", "--json"])
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    let snapshot: Snapshot =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|err| panic!("{err}: {output:?}"));
+    let kubeconfig = home.kubeconfig_file().display().to_string();
+    assert_eq!(snapshot.kubeconfig_files, vec![kubeconfig]);
+
+    let pid = Client::connect(&home.socket()).await.unwrap().daemon_pid;
+    let raw = i32::try_from(pid).unwrap();
+    let session = rustix::process::getsid(rustix::process::Pid::from_raw(raw)).unwrap();
+    assert_eq!(session.as_raw_nonzero().get(), raw, "no session of its own");
+    let data_dir = home.data_dir().canonicalize().unwrap();
+    assert_eq!(cwd_of(pid).canonicalize().unwrap(), data_dir);
+}
+
+/// A relative `KPRTFWD_HOME` names the same directory for the daemon, which
+/// runs elsewhere, as for the client.
+#[tokio::test]
+async fn a_relative_kprtfwd_home_stays_where_it_was() {
+    let home = Home::new();
+    let run = |args: &[&str]| {
+        home.command(args)
+            .env("KPRTFWD_HOME", "kh")
+            .env(IDLE_EXIT, "5000")
+            .current_dir(home.path())
+            .output()
+            .unwrap()
+    };
+    let output = run(&["status"]);
+    assert!(output.status.success(), "{output:?}");
+    let data_dir = home.path().join("kh");
+    assert!(data_dir.join("daemon.sock").exists());
+    assert!(!data_dir.join("kh").exists());
+    let output = run(&["daemon", "stop"]);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "daemon stopped\n");
+}
+
 /// Shortens the daemon's idle exit, in milliseconds.
 const IDLE_EXIT: &str = "KPRTFWD_IDLE_EXIT_MS";
 

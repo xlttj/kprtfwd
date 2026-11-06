@@ -207,11 +207,19 @@ Main dependencies:
   behind and the next start tries again; while v1 writes its file, the copy
   waits up to 5 s. `~/.kprtfwd` stays as it is, so v1 keeps working on its own
   copy. With `KPRTFWD_HOME` set, this step is skipped.
-- **Start on demand.** A client that finds no daemon runs `kprtfwd daemon run`
-  in its own process group, with no terminal attached. If that process exits
-  right away, or fails after binding the socket, the client reports it and
-  names the log directory instead of waiting or blaming another version; the
-  daemon's stderr goes to `logs/daemon.stderr` there.
+- **Start on demand.** A client that finds no daemon runs `kprtfwd daemon run`,
+  which starts a session of its own (`setsid`), so no terminal is attached:
+  in the session of the terminal its client was started from, an exec plugin
+  that reads from `/dev/tty` stopped the whole daemon with SIGTTIN while that
+  client ran; now the plugin's read fails at once. The daemon runs in the
+  data directory, so it keeps no other directory busy; the client passes
+  relative entries of `KUBECONFIG` and a relative `KPRTFWD_HOME` as absolute
+  paths. `kprtfwd daemon run` typed into an interactive shell leads its
+  process group, cannot start a session and stays in the shell's, where
+  ctrl+c ends it. If the daemon exits right away, or fails after binding the
+  socket, the client reports it and names the log directory instead of
+  waiting or blaming another version; the daemon's stderr goes to
+  `logs/daemon.stderr` there.
 - **Single instance.** On start the daemon first takes an exclusive lock
   (`flock`) on `daemon.lock` in the directory and holds it until it has
   exited; the system releases it however the process ends. While another
@@ -233,7 +241,8 @@ Main dependencies:
   3. Load forwards and their desired state.
   4. Start a context actor for every context with an enabled forward.
 - **Kubeconfig.** The daemon inherits `KUBECONFIG` from the client that started
-  it; `kprtfwd status` shows which files are in use. The engine merges them in
+  it, with relative entries resolved against the client's directory;
+  `kprtfwd status` shows which files are in use. The engine merges them in
   one place, for clients, discovery and the hashes below, and skips files that
   do not exist, as kubectl does: a stale entry in `KUBECONFIG` breaks no
   context, and `status` marks it missing. Every 2 s the daemon checks the

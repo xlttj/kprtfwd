@@ -1210,6 +1210,7 @@ dependencies = [
  "kprtfwd-proto",
  "kprtfwd-tui",
  "rusqlite",
+ "rustix",
  "serde_json",
  "tempfile",
  "tokio",

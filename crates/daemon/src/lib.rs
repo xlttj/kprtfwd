@@ -25,7 +25,7 @@ use kprtfwd_proto::{
     read_frame, stop_daemon, write_message,
 };
 use rustix::fs::Mode;
-use rustix::process::{Resource, Rlimit, geteuid, getrlimit, setrlimit, umask};
+use rustix::process::{Resource, Rlimit, geteuid, getrlimit, setrlimit, setsid, umask};
 use tokio::io::BufReader;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
@@ -54,6 +54,13 @@ pub struct Options {
 }
 
 pub fn run(options: Options) -> Result<()> {
+    // A daemon in the session of the terminal its client was started from
+    // is stopped with SIGTTIN, as a whole process group, as soon as an exec
+    // plugin reads from that terminal (`/dev/tty`) while the client runs.
+    // In a session of its own it has no terminal, so such a read fails at
+    // once. A daemon typed into an interactive shell leads its process group
+    // and cannot leave the session; it stays, and ctrl+c ends it.
+    let detached = (!options.foreground).then(setsid);
     let data_dir = paths::data_dir().context("neither KPRTFWD_HOME nor HOME is set")?;
     DirBuilder::new()
         .recursive(true)
@@ -64,6 +71,11 @@ pub fn run(options: Options) -> Result<()> {
     let _log_guard = init_logging(&options, &data_dir)?;
     if !options.foreground {
         log_panics();
+    }
+    match detached {
+        Some(Ok(_)) => debug!("in a session of its own"),
+        Some(Err(err)) => debug!(%err, "stays in the session it was started in"),
+        None => {}
     }
     if let Some(mode) = narrowed {
         info!(dir = %data_dir.display(), from = format!("{mode:o}"), "data directory narrowed to 700");

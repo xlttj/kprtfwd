@@ -17,6 +17,7 @@ tokio.workspace = true
 kprtfwd-core.workspace = true
 kprtfwd-proto.workspace = true
 rusqlite.workspace = true
+rustix = { workspace = true, features = ["process"] }
 serde_json.workspace = true
 tempfile.workspace = true
 
