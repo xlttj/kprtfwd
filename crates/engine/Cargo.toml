@@ -24,6 +24,8 @@ tower.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# Only for its error types; the features match what kube already builds.
+rustls = { version = "0.23", default-features = false, features = ["std"] }
 tempfile.workspace = true
 
 [lints]

@@ -90,7 +90,11 @@ pub fn chain(err: &(dyn Error + 'static)) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::fake::{FakeApi, Reply, free_port, status};
+    use crate::portforward::PortForwardError;
 
     fn io(kind: std::io::ErrorKind, text: &str) -> std::io::Error {
         std::io::Error::new(kind, text.to_owned())
@@ -128,5 +132,117 @@ mod tests {
         assert_eq!(classify(&status(401)), Failure::Auth("nope".into()));
         assert_eq!(classify(&status(403)), Failure::Forbidden("nope".into()));
         assert_eq!(classify(&status(404)), Failure::NotFound("nope".into()));
+    }
+
+    fn client(url: &str) -> kube::Client {
+        kube::Client::try_from(kube::Config::new(url.parse().unwrap())).unwrap()
+    }
+
+    /// A server that answers anything with an HTTP 400, as a plain HTTP
+    /// server answers a TLS handshake.
+    async fn plain_http_server() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0; 1024];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+        addr
+    }
+
+    /// The errors as kube-rs, hyper-util and rustls really return them.
+    #[tokio::test]
+    async fn classifies_the_errors_a_client_returns() {
+        let port = free_port();
+        let refused = client(&format!("http://127.0.0.1:{port}"))
+            .apiserver_version()
+            .await
+            .unwrap_err();
+        assert!(chain(&refused).contains("tcp connect error"), "{refused}");
+        assert_eq!(classify(&refused), Failure::Net(NetCause::Refused));
+
+        // .invalid never resolves (RFC 6761).
+        let unknown = tokio::time::timeout(
+            Duration::from_secs(10),
+            client("http://kprtfwd-test.invalid").apiserver_version(),
+        )
+        .await
+        .expect("DNS answers")
+        .unwrap_err();
+        assert_eq!(classify(&unknown), Failure::Net(NetCause::Dns), "{unknown}");
+
+        // Closed without an answer: unreachable, for want of a better cause.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for socket in listener.incoming() {
+                drop(socket);
+            }
+        });
+        let closed = client(&format!("http://{addr}"))
+            .apiserver_version()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(classify(&closed), Failure::Other(text) if text.contains("connection closed")),
+            "{closed}"
+        );
+    }
+
+    /// TLS failures as rustls words them. A handshake with a server that does
+    /// not speak TLS is not recognised as TLS yet (it ends as Other).
+    #[tokio::test]
+    async fn classifies_tls_errors() {
+        use rustls::{CertificateError, Error as Tls};
+        for error in [
+            Tls::InvalidCertificate(CertificateError::UnknownIssuer),
+            Tls::InvalidCertificate(CertificateError::Expired),
+            Tls::InvalidCertificate(CertificateError::NotValidForName),
+        ] {
+            let text = error.to_string();
+            let err = std::io::Error::new(std::io::ErrorKind::InvalidData, error);
+            assert_eq!(classify(&err), Failure::Net(NetCause::Tls(text)));
+        }
+
+        let addr = plain_http_server().await;
+        let plain = client(&format!("https://{addr}"))
+            .apiserver_version()
+            .await
+            .unwrap_err();
+        assert!(chain(&plain).contains("corrupt message"), "{plain}");
+        assert!(matches!(classify(&plain), Failure::Other(_)), "{plain}");
+    }
+
+    /// `portforward::open` fails with kube's upgrade error, which carries
+    /// only the status line.
+    #[tokio::test]
+    async fn classifies_refused_upgrades() {
+        for (code, expected) in [
+            (401, "Unauthorized"),
+            (403, "Forbidden"),
+            (404, "Not Found"),
+        ] {
+            let api = FakeApi::start(move |_| Reply::Json(code, status(code, "nope"))).await;
+            let Err(PortForwardError::Connect(err)) =
+                crate::portforward::open(&api.client(), "shop", "web-0", 80).await
+            else {
+                panic!("{code}: the upgrade did not fail");
+            };
+            let text = format!(
+                "failed to upgrade to a WebSocket connection: failed to switch protocol: {code} {expected}"
+            );
+            let failure = match code {
+                401 => Failure::Auth(text),
+                403 => Failure::Forbidden(text),
+                _ => Failure::NotFound(text),
+            };
+            assert_eq!(classify(&err), failure);
+        }
     }
 }

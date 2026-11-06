@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use kprtfwd_core::state::{ContextState, NetCause};
 use kube::client::ClientBuilder;
-use kube::config::KubeConfigOptions;
+use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Client, Config};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -19,13 +19,31 @@ use crate::errors::{Failure, classify};
 use crate::events::EventLog;
 use crate::kubeconfig;
 
-const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const PROBE_INTERVAL_HEALTHY: Duration = Duration::from_secs(5);
 const PROBE_INTERVAL_UNHEALTHY: Duration = Duration::from_secs(2);
 /// A healthy context counts as unreachable only after this many probe
 /// timeouts in a row: one slow answer is not an outage. Definite failures
 /// (DNS, refused) count at once.
 const TIMEOUTS_UNTIL_UNREACHABLE: u32 = 2;
+
+/// How long a probe may take and how often it runs; shorter in tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Timing {
+    pub probe_timeout: Duration,
+    pub healthy_interval: Duration,
+    pub unhealthy_interval: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            probe_timeout: PROBE_TIMEOUT,
+            healthy_interval: PROBE_INTERVAL_HEALTHY,
+            unhealthy_interval: PROBE_INTERVAL_UNHEALTHY,
+        }
+    }
+}
 
 pub struct Context {
     name: String,
@@ -37,24 +55,28 @@ pub struct Context {
     namespaces: Mutex<HashMap<String, Arc<NamespaceCache>>>,
     health: Mutex<Option<JoinHandle<()>>>,
     events: EventLog,
+    timing: Timing,
 }
 
-/// The kubeconfig's settings for a context.
-async fn load(context: &str) -> Result<Config, String> {
+/// The settings for a context from `kubeconfig`, or from the kubeconfig
+/// files if that is `None`.
+async fn load(context: &str, kubeconfig: Option<&Kubeconfig>) -> Result<Config, String> {
     let options = KubeConfigOptions {
         context: Some(context.to_owned()),
         ..Default::default()
     };
-    Config::from_kubeconfig(&options)
-        .await
-        .map_err(|err| kubeconfig::describe(&err))
+    let config = match kubeconfig {
+        Some(kubeconfig) => Config::from_custom_kubeconfig(kubeconfig.clone(), &options).await,
+        None => Config::from_kubeconfig(&options).await,
+    };
+    config.map_err(|err| kubeconfig::describe(&err))
 }
 
 /// A client for a kubeconfig context, and its login if it logs in through an
 /// exec plugin. The client never runs the plugin: it sends the token of the
 /// last [`Login::run`], or no credentials.
 pub async fn client_for(context: &str) -> Result<(Client, Option<Login>), String> {
-    build(load(context).await?)
+    build(load(context, None).await?)
 }
 
 fn build(mut config: Config) -> Result<(Client, Option<Login>), String> {
@@ -68,12 +90,23 @@ fn build(mut config: Config) -> Result<(Client, Option<Login>), String> {
 }
 
 impl Context {
-    /// Builds the client from the kubeconfig and starts the health probe.
-    pub async fn start(name: &str, events: EventLog) -> Arc<Self> {
-        Self::from_config(name, load(name).await, events)
+    /// Builds the client from `kubeconfig`, or from the kubeconfig files if
+    /// that is `None`, and starts the health probe.
+    pub async fn start(name: &str, kubeconfig: Option<&Kubeconfig>, events: EventLog) -> Arc<Self> {
+        Self::from_config(
+            name,
+            load(name, kubeconfig).await,
+            events,
+            Timing::default(),
+        )
     }
 
-    fn from_config(name: &str, config: Result<Config, String>, events: EventLog) -> Arc<Self> {
+    fn from_config(
+        name: &str,
+        config: Result<Config, String>,
+        events: EventLog,
+        timing: Timing,
+    ) -> Arc<Self> {
         let (state, client, login) = match config.and_then(build) {
             Ok((client, login)) => (ContextState::Connecting, Some(client), login),
             Err(message) => {
@@ -90,6 +123,7 @@ impl Context {
             namespaces: Mutex::new(HashMap::new()),
             health: Mutex::new(None),
             events,
+            timing,
         });
         if context.client.is_some() {
             let task = tokio::spawn(probe_health(Arc::downgrade(&context)));
@@ -162,13 +196,13 @@ impl Context {
     /// and only while the API server answers.
     async fn check(&self, client: &Client, timeouts: &mut u32) -> ContextState {
         let previous = self.state();
-        let answer = probe(client).await;
+        let answer = probe(client, self.timing.probe_timeout).await;
         let Some(login) = &self.login else {
-            return next_state(&previous, answer, timeouts);
+            return next_state(&previous, answer, timeouts, SystemTime::now());
         };
         let rejected = matches!(answer, Err(Failure::Auth(_)));
         if !answered(&answer) || !(rejected || login.needed()) {
-            return next_state(&previous, answer, timeouts);
+            return next_state(&previous, answer, timeouts, SystemTime::now());
         }
 
         if rejected {
@@ -180,15 +214,15 @@ impl Context {
             self.set_state(ContextState::Connecting);
         }
         if let Err(message) = login.run().await {
-            return failed(&previous, Failure::Auth(message));
+            return failed(&previous, Failure::Auth(message), SystemTime::now());
         }
-        let answer = probe(client).await;
+        let answer = probe(client, self.timing.probe_timeout).await;
         if let Err(Failure::Auth(message)) = &answer {
             login.forget();
             let message = format!("the API server rejected the login: {message}");
-            return failed(&previous, Failure::Auth(message));
+            return failed(&previous, Failure::Auth(message), SystemTime::now());
         }
-        next_state(&previous, answer, timeouts)
+        next_state(&previous, answer, timeouts, SystemTime::now())
     }
 
     /// Logs a change of state, keeps it in the context's events and
@@ -198,15 +232,12 @@ impl Context {
         if next == previous {
             return;
         }
+        if restarts_watches(self.login.is_some(), &previous, &next) {
+            self.restart_watches();
+        }
         let event = match &next {
             ContextState::Healthy { server_version } => {
                 info!(context = %self.name, %server_version, "API server reachable");
-                // Watches of a context with a login start only now. After an
-                // outage a watch may be silently dead; start them fresh
-                // instead of waiting for their idle timeout.
-                if self.login.is_some() || !matches!(previous, ContextState::Connecting) {
-                    self.restart_watches();
-                }
                 format!("API server reachable ({server_version})")
             }
             ContextState::Connecting => {
@@ -249,18 +280,26 @@ async fn probe_health(context: Weak<Context>) {
         }
 
         let interval = if context.state().is_healthy() {
-            PROBE_INTERVAL_HEALTHY
+            context.timing.healthy_interval
         } else {
-            PROBE_INTERVAL_UNHEALTHY
+            context.timing.unhealthy_interval
         };
         drop(context);
         tokio::time::sleep(interval).await;
     }
 }
 
+/// Whether a change of state restarts the watches: watches of a context with
+/// a login start only once it is healthy, and after an outage a watch may be
+/// silently dead, so they start fresh instead of waiting for their idle
+/// timeout. Called only when the state changed.
+fn restarts_watches(has_login: bool, previous: &ContextState, next: &ContextState) -> bool {
+    next.is_healthy() && (has_login || !matches!(previous, ContextState::Connecting))
+}
+
 /// `GET /version`: the API server's version, or why there is none.
-pub(crate) async fn probe(client: &Client) -> Result<String, Failure> {
-    match tokio::time::timeout(PROBE_TIMEOUT, client.apiserver_version()).await {
+pub(crate) async fn probe(client: &Client, timeout: Duration) -> Result<String, Failure> {
+    match tokio::time::timeout(timeout, client.apiserver_version()).await {
         Ok(Ok(info)) => Ok(info.git_version),
         Ok(Err(err)) => Err(classify(&err)),
         Err(_) => Err(Failure::Net(NetCause::Timeout)),
@@ -272,11 +311,12 @@ pub(crate) fn answered(answer: &Result<String, Failure>) -> bool {
     !matches!(answer, Err(Failure::Net(_) | Failure::Other(_)))
 }
 
-/// The state after a probe.
+/// The state after a probe at `now`.
 fn next_state(
     previous: &ContextState,
     answer: Result<String, Failure>,
     timeouts: &mut u32,
+    now: SystemTime,
 ) -> ContextState {
     match answer {
         Ok(server_version) => {
@@ -288,21 +328,22 @@ fn next_state(
             if previous.is_healthy() && *timeouts < TIMEOUTS_UNTIL_UNREACHABLE {
                 previous.clone()
             } else {
-                failed(previous, Failure::Net(NetCause::Timeout))
+                failed(previous, Failure::Net(NetCause::Timeout), now)
             }
         }
         Err(failure) => {
             *timeouts = 0;
-            failed(previous, failure)
+            failed(previous, failure, now)
         }
     }
 }
 
-/// The state after a failed probe. Keeps the time the outage started.
-fn failed(previous: &ContextState, failure: Failure) -> ContextState {
+/// The state after a probe failed at `now`. Keeps the time the outage
+/// started.
+fn failed(previous: &ContextState, failure: Failure, now: SystemTime) -> ContextState {
     let since = match previous {
         ContextState::Unreachable { since, .. } | ContextState::AuthFailed { since, .. } => *since,
-        _ => SystemTime::now(),
+        _ => now,
     };
     match failure {
         Failure::Net(cause) => ContextState::Unreachable { since, cause },
@@ -325,50 +366,26 @@ mod tests {
     use std::time::Instant;
 
     use kube::config::Kubeconfig;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
 
     use super::*;
     use crate::auth::fake;
+    use crate::fake::{FakeApi, Reply, VERSION, free_port, status};
 
-    const VERSION: &str = r#"{"major":"1","minor":"33","gitVersion":"v1.33.0","gitCommit":"","gitTreeState":"","buildDate":"","goVersion":"","compiler":"","platform":""}"#;
-    const UNAUTHORIZED: &str = r#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"Unauthorized","reason":"Unauthorized","code":401}"#;
+    /// Probes ten times faster than in use.
+    const FAST: Timing = Timing {
+        probe_timeout: Duration::from_secs(1),
+        healthy_interval: Duration::from_millis(200),
+        unhealthy_interval: Duration::from_millis(100),
+    };
 
-    /// An API server that answers every request like `/version`: 200 for the
-    /// token "good", 401 otherwise.
-    async fn api_server(listener: TcpListener) {
-        while let Ok((mut socket, _)) = listener.accept().await {
-            tokio::spawn(async move {
-                let mut request = Vec::new();
-                let mut chunk = [0; 1024];
-                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                    match socket.read(&mut chunk).await {
-                        Ok(0) | Err(_) => return,
-                        Ok(n) => request.extend_from_slice(&chunk[..n]),
-                    }
-                }
-                let head = String::from_utf8_lossy(&request).to_lowercase();
-                let (status, body) = if head.contains("authorization: bearer good\r\n") {
-                    ("200 OK", VERSION)
-                } else {
-                    ("401 Unauthorized", UNAUTHORIZED)
-                };
-                let response = format!(
-                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
-                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-            });
+    /// Answers every request like `/version`: 200 for the token "good", 401
+    /// otherwise.
+    fn version_for_good_tokens(request: &crate::fake::Request) -> Reply {
+        if request.head.contains("authorization: bearer good\r\n") {
+            Reply::Json(200, VERSION.into())
+        } else {
+            Reply::Json(401, status(401, "Unauthorized"))
         }
-    }
-
-    fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
     }
 
     /// A context whose exec plugin is [`fake::plugin`] in `mode`.
@@ -408,7 +425,7 @@ current-context: test
         let config = Config::from_custom_kubeconfig(kubeconfig, &KubeConfigOptions::default())
             .await
             .map_err(|err| err.to_string());
-        Context::from_config("test", config, EventLog::default())
+        Context::from_config("test", config, EventLog::default(), FAST)
     }
 
     async fn wait_for(context: &Context, what: &str, done: impl Fn(&ContextState) -> bool) {
@@ -419,7 +436,7 @@ current-context: test
                 "not {what}: {:?}",
                 context.state()
             );
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -434,16 +451,16 @@ current-context: test
             matches!(state, ContextState::Unreachable { .. })
         })
         .await;
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        // Five probes.
+        tokio::time::sleep(FAST.unhealthy_interval * 5).await;
         assert!(fake::runs(&runs).is_empty(), "logged in while unreachable");
 
-        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
-        tokio::spawn(api_server(listener));
+        let _api = FakeApi::start_at(port, version_for_good_tokens).await;
         wait_for(&context, "healthy", ContextState::is_healthy).await;
         assert_eq!(fake::runs(&runs).len(), 1);
 
-        // The token lasts, so the next probes need no login.
-        tokio::time::sleep(Duration::from_secs(6)).await;
+        // The token lasts, so the next five probes need no login.
+        tokio::time::sleep(FAST.healthy_interval * 5).await;
         assert_eq!(fake::runs(&runs).len(), 1);
         context.stop();
     }
@@ -456,9 +473,8 @@ current-context: test
         ] {
             let dir = tempfile::tempdir().unwrap();
             let runs = dir.path().join("runs");
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            tokio::spawn(api_server(listener));
+            let api = FakeApi::start(version_for_good_tokens).await;
+            let port = api.url.rsplit(':').next().unwrap().parse().unwrap();
             let context = context(dir.path(), port, mode).await;
 
             wait_for(&context, "login needed", |state| {
@@ -471,9 +487,204 @@ current-context: test
             assert!(message.contains(expected), "{message}");
             assert!(!message.contains("s3cr3t"), "{message}");
 
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(FAST.unhealthy_interval * 5).await;
             assert_eq!(fake::runs(&runs).len(), 1, "{mode}: logged in again");
             context.stop();
+        }
+    }
+
+    fn at(seconds: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
+    }
+
+    fn healthy() -> ContextState {
+        ContextState::Healthy {
+            server_version: "v1.33.0".into(),
+        }
+    }
+
+    fn unreachable(since: u64, cause: NetCause) -> ContextState {
+        ContextState::Unreachable {
+            since: at(since),
+            cause,
+        }
+    }
+
+    fn timeout() -> Result<String, Failure> {
+        Err(Failure::Net(NetCause::Timeout))
+    }
+
+    #[test]
+    fn a_healthy_context_turns_unreachable_after_two_timeouts_in_a_row() {
+        let mut timeouts = 0;
+        let state = next_state(&healthy(), timeout(), &mut timeouts, at(10));
+        assert_eq!(state, healthy(), "one slow answer is no outage");
+        let state = next_state(&state, timeout(), &mut timeouts, at(15));
+        assert_eq!(state, unreachable(15, NetCause::Timeout));
+        assert_eq!(timeouts, 2);
+
+        // An answer in between starts the count again.
+        let mut timeouts = 0;
+        let state = next_state(&healthy(), timeout(), &mut timeouts, at(10));
+        let state = next_state(&state, Ok("v1.33.0".into()), &mut timeouts, at(15));
+        assert_eq!(timeouts, 0);
+        let state = next_state(&state, timeout(), &mut timeouts, at(20));
+        assert_eq!(state, healthy());
+        // So does a definite failure.
+        let state = next_state(
+            &state,
+            Err(Failure::Net(NetCause::Dns)),
+            &mut timeouts,
+            at(25),
+        );
+        assert_eq!(timeouts, 0);
+        assert_eq!(state, unreachable(25, NetCause::Dns));
+    }
+
+    #[test]
+    fn definite_failures_and_timeouts_of_an_unhealthy_context_count_at_once() {
+        for previous in [ContextState::Connecting, unreachable(1, NetCause::Dns)] {
+            let mut timeouts = 0;
+            let state = next_state(&previous, timeout(), &mut timeouts, at(10));
+            assert!(
+                matches!(
+                    state,
+                    ContextState::Unreachable {
+                        cause: NetCause::Timeout,
+                        ..
+                    }
+                ),
+                "{previous:?}: {state:?}"
+            );
+        }
+        for cause in [
+            NetCause::Dns,
+            NetCause::Refused,
+            NetCause::Tls("bad certificate".into()),
+        ] {
+            let mut timeouts = 0;
+            let state = next_state(
+                &healthy(),
+                Err(Failure::Net(cause.clone())),
+                &mut timeouts,
+                at(10),
+            );
+            assert_eq!(state, unreachable(10, cause));
+        }
+    }
+
+    #[test]
+    fn failures_map_to_states() {
+        let cases = [
+            (
+                Failure::Auth("token expired".into()),
+                ContextState::AuthFailed {
+                    since: at(10),
+                    message: "token expired".into(),
+                },
+            ),
+            (
+                Failure::Other("odd".into()),
+                unreachable(10, NetCause::Other("odd".into())),
+            ),
+            // The server answered, so it is reachable; /version is just not
+            // readable for this user.
+            (
+                Failure::Forbidden("no".into()),
+                ContextState::Healthy {
+                    server_version: "unknown".into(),
+                },
+            ),
+            (
+                Failure::NotFound("no".into()),
+                ContextState::Healthy {
+                    server_version: "unknown".into(),
+                },
+            ),
+        ];
+        for (failure, expected) in cases {
+            assert_eq!(failed(&ContextState::Connecting, failure, at(10)), expected);
+        }
+    }
+
+    #[test]
+    fn an_outage_keeps_the_time_it_started() {
+        let mut timeouts = 0;
+        let previous = unreachable(5, NetCause::Timeout);
+        let state = next_state(
+            &previous,
+            Err(Failure::Net(NetCause::Refused)),
+            &mut timeouts,
+            at(20),
+        );
+        assert_eq!(state, unreachable(5, NetCause::Refused));
+
+        let state = failed(&state, Failure::Auth("expired".into()), at(30));
+        assert_eq!(
+            state,
+            ContextState::AuthFailed {
+                since: at(5),
+                message: "expired".into(),
+            }
+        );
+        let state = failed(&state, Failure::Net(NetCause::Dns), at(40));
+        assert_eq!(state, unreachable(5, NetCause::Dns));
+
+        // A recovery ends it; the next outage has its own start.
+        let state = next_state(&state, Ok("v1.33.0".into()), &mut timeouts, at(50));
+        let state = next_state(
+            &state,
+            Err(Failure::Net(NetCause::Dns)),
+            &mut timeouts,
+            at(60),
+        );
+        assert_eq!(state, unreachable(60, NetCause::Dns));
+    }
+
+    #[test]
+    fn answered_means_the_server_said_something() {
+        assert!(answered(&Ok("v1".into())));
+        for failure in [
+            Failure::Auth("expired".into()),
+            Failure::Forbidden("no".into()),
+            Failure::NotFound("no".into()),
+        ] {
+            assert!(answered(&Err(failure.clone())), "{failure:?}");
+        }
+        for failure in [
+            Failure::Net(NetCause::Timeout),
+            Failure::Other("odd".into()),
+        ] {
+            assert!(!answered(&Err(failure.clone())), "{failure:?}");
+        }
+    }
+
+    #[test]
+    fn watches_restart_on_recovery_and_after_the_first_login() {
+        let down = unreachable(1, NetCause::Timeout);
+        let login_needed = ContextState::AuthFailed {
+            since: at(1),
+            message: "expired".into(),
+        };
+        // Without a login, the watches started with the context.
+        assert!(!restarts_watches(
+            false,
+            &ContextState::Connecting,
+            &healthy()
+        ));
+        assert!(restarts_watches(false, &down, &healthy()));
+        assert!(restarts_watches(false, &login_needed, &healthy()));
+        // With a login, they wait for it.
+        assert!(restarts_watches(
+            true,
+            &ContextState::Connecting,
+            &healthy()
+        ));
+        assert!(restarts_watches(true, &down, &healthy()));
+        // Nothing to start while the context is not usable.
+        for next in [ContextState::Connecting, down.clone(), login_needed.clone()] {
+            assert!(!restarts_watches(true, &healthy(), &next), "{next:?}");
+            assert!(!restarts_watches(false, &healthy(), &next), "{next:?}");
         }
     }
 }

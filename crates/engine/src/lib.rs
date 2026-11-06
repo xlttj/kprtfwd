@@ -9,6 +9,8 @@ mod context;
 pub mod discovery;
 pub mod errors;
 mod events;
+#[cfg(test)]
+mod fake;
 mod forward;
 pub mod kubeconfig;
 pub mod portforward;
@@ -18,6 +20,7 @@ use std::sync::Arc;
 
 use kprtfwd_core::state::{ContextState, Observed};
 use kprtfwd_core::{Forward, ForwardId};
+use kube::config::Kubeconfig;
 use tracing::info;
 
 use crate::context::Context;
@@ -33,11 +36,22 @@ pub struct Engine {
     /// Kept here, not in the actors, so they survive stopping and starting.
     context_events: HashMap<String, EventLog>,
     forward_events: HashMap<ForwardId, EventLog>,
+    /// Where contexts get their settings; `None` for the kubeconfig files.
+    /// Tests give their own, so they never read `~/.kube/config`.
+    kubeconfig: Option<Kubeconfig>,
 }
 
 impl Engine {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    fn with_kubeconfig(kubeconfig: Kubeconfig) -> Self {
+        Self {
+            kubeconfig: Some(kubeconfig),
+            ..Self::default()
+        }
     }
 
     /// Runs exactly `wanted`: starts what is missing, stops what is no longer
@@ -72,7 +86,7 @@ impl Engine {
                     .entry(name.to_owned())
                     .or_default()
                     .clone();
-                let context = Context::start(name, events).await;
+                let context = Context::start(name, self.kubeconfig.as_ref(), events).await;
                 self.contexts.insert(name.to_owned(), context);
             }
         }
@@ -171,4 +185,243 @@ fn same_settings(wanted: &Forward, running: &Forward) -> bool {
         && wanted.service == running.service
         && wanted.remote_port == running.remote_port
         && wanted.local_port == running.local_port
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::fake::free_port;
+
+    /// Two contexts whose API server refuses connections.
+    fn kubeconfig() -> Kubeconfig {
+        let port = free_port();
+        Kubeconfig::from_yaml(&format!(
+            r#"
+apiVersion: v1
+kind: Config
+clusters:
+- name: down
+  cluster:
+    server: http://127.0.0.1:{port}
+users:
+- name: anonymous
+  user: {{}}
+contexts:
+- name: staging
+  context:
+    cluster: down
+    user: anonymous
+- name: production
+  context:
+    cluster: down
+    user: anonymous
+"#
+        ))
+        .unwrap()
+    }
+
+    fn forward(context: &str, namespace: &str, service: &str) -> Forward {
+        Forward {
+            id: ForwardId::new(format!("{context}.{namespace}.{service}-80")),
+            context: context.into(),
+            namespace: namespace.into(),
+            service: service.into(),
+            remote_port: 80,
+            local_port: free_port(),
+            enabled: true,
+        }
+    }
+
+    /// The forward's "started" and "stopped" events.
+    fn starts_and_stops(engine: &Engine, id: &ForwardId) -> Vec<String> {
+        engine
+            .forward_events(id)
+            .into_iter()
+            .map(|event| event.message)
+            .filter(|message| message == "started" || message == "stopped")
+            .collect()
+    }
+
+    fn watched(engine: &Engine, context: &str, namespace: &str) -> bool {
+        engine.contexts[context].namespace(namespace).is_some()
+    }
+
+    fn sorted(mut names: Vec<String>) -> Vec<String> {
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn reconcile_runs_exactly_the_wanted_forwards() {
+        let mut engine = Engine::with_kubeconfig(kubeconfig());
+        let api = forward("staging", "shop", "api");
+        let web = forward("staging", "web", "frontend");
+        let prod = forward("production", "shop", "api");
+        engine
+            .reconcile(&[api.clone(), web.clone(), prod.clone()])
+            .await;
+
+        assert_eq!(sorted(engine.context_names()), ["production", "staging"]);
+        assert!(watched(&engine, "staging", "shop") && watched(&engine, "staging", "web"));
+        assert!(watched(&engine, "production", "shop") && !watched(&engine, "production", "web"));
+        for forward in [&api, &web, &prod] {
+            assert!(engine.observe(&forward.id).is_some(), "{}", forward.id);
+            assert_eq!(starts_and_stops(&engine, &forward.id), ["started"]);
+        }
+
+        // The same settings keep a forward running.
+        engine
+            .reconcile(&[api.clone(), web.clone(), prod.clone()])
+            .await;
+        assert_eq!(starts_and_stops(&engine, &api.id), ["started"]);
+
+        // Changed settings restart it, and its events go on.
+        let moved = Forward {
+            local_port: free_port(),
+            ..api.clone()
+        };
+        engine
+            .reconcile(&[moved.clone(), web.clone(), prod.clone()])
+            .await;
+        assert_eq!(
+            starts_and_stops(&engine, &api.id),
+            ["started", "stopped", "started"]
+        );
+        assert_eq!(engine.forwards[&api.id].spec, moved);
+        assert_eq!(starts_and_stops(&engine, &web.id), ["started"]);
+
+        // A namespace without forwards is no longer watched, and a context
+        // without forwards stops; the events of both stay.
+        engine.reconcile(std::slice::from_ref(&moved)).await;
+        assert_eq!(engine.context_names(), ["staging"]);
+        assert!(watched(&engine, "staging", "shop") && !watched(&engine, "staging", "web"));
+        assert_eq!(engine.context_state("production"), None);
+        assert!(engine.observe(&prod.id).is_none());
+        assert_eq!(starts_and_stops(&engine, &prod.id), ["started", "stopped"]);
+        assert_eq!(starts_and_stops(&engine, &web.id), ["started", "stopped"]);
+
+        engine.reconcile(&[]).await;
+        assert!(engine.context_names().is_empty());
+        assert_eq!(
+            starts_and_stops(&engine, &api.id),
+            ["started", "stopped", "started", "stopped"]
+        );
+    }
+
+    #[tokio::test]
+    async fn context_events_outlive_the_context() {
+        let mut engine = Engine::with_kubeconfig(kubeconfig());
+        let api = forward("staging", "shop", "api");
+        engine.reconcile(std::slice::from_ref(&api)).await;
+        let started = Instant::now();
+        while engine.context_events("staging").is_empty() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "no context event"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let events = engine.context_events("staging");
+        assert_eq!(events[0].message, "API server unreachable (refused)");
+
+        engine.reconcile(&[]).await;
+        assert_eq!(engine.context_events("staging"), events);
+        engine.reconcile(std::slice::from_ref(&api)).await;
+        assert_eq!(engine.context_events("staging")[0], events[0]);
+    }
+
+    #[tokio::test]
+    async fn a_context_missing_from_the_kubeconfig_is_a_config_error() {
+        let mut engine = Engine::with_kubeconfig(kubeconfig());
+        let api = forward("gone", "shop", "api");
+        engine.reconcile(std::slice::from_ref(&api)).await;
+        let Some(ContextState::ConfigError { message }) = engine.context_state("gone") else {
+            panic!("{:?}", engine.context_state("gone"));
+        };
+        assert!(message.contains("gone"), "{message}");
+        let events = engine.context_events("gone");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].message, format!("kubeconfig: {message}"));
+        assert!(matches!(
+            engine.observe(&api.id).map(|observed| observed.context),
+            Some(ContextState::ConfigError { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconnect_starts_one_context_and_its_forwards_afresh() {
+        let mut engine = Engine::with_kubeconfig(kubeconfig());
+        let api = forward("staging", "shop", "api");
+        let prod = forward("production", "shop", "api");
+        let wanted = [api.clone(), prod.clone()];
+        engine.reconcile(&wanted).await;
+        let staging = engine.contexts["staging"].clone();
+        let production = engine.contexts["production"].clone();
+
+        engine.reconnect("staging", &wanted).await;
+        assert!(!Arc::ptr_eq(&staging, &engine.contexts["staging"]));
+        assert!(Arc::ptr_eq(&production, &engine.contexts["production"]));
+        assert!(watched(&engine, "staging", "shop"));
+        assert_eq!(
+            starts_and_stops(&engine, &api.id),
+            ["started", "stopped", "started"]
+        );
+        assert_eq!(starts_and_stops(&engine, &prod.id), ["started"]);
+
+        // A context not in use is just reconciled.
+        engine.reconnect("idle", &wanted).await;
+        assert_eq!(sorted(engine.context_names()), ["production", "staging"]);
+        assert_eq!(starts_and_stops(&engine, &prod.id), ["started"]);
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_everything() {
+        let mut engine = Engine::with_kubeconfig(kubeconfig());
+        let api = forward("staging", "shop", "api");
+        engine.reconcile(std::slice::from_ref(&api)).await;
+        engine.shutdown();
+        assert!(engine.context_names().is_empty());
+        assert!(engine.observe(&api.id).is_none());
+        assert_eq!(starts_and_stops(&engine, &api.id), ["started", "stopped"]);
+    }
+
+    #[test]
+    fn only_the_forwards_own_settings_matter() {
+        let api = forward("staging", "shop", "api");
+        assert!(same_settings(&api, &api));
+        assert!(same_settings(
+            &Forward {
+                enabled: false,
+                ..api.clone()
+            },
+            &api
+        ));
+        let changes = [
+            Forward {
+                context: "production".into(),
+                ..api.clone()
+            },
+            Forward {
+                namespace: "web".into(),
+                ..api.clone()
+            },
+            Forward {
+                service: "frontend".into(),
+                ..api.clone()
+            },
+            Forward {
+                remote_port: 8080,
+                ..api.clone()
+            },
+            Forward {
+                local_port: api.local_port.wrapping_add(1),
+                ..api.clone()
+            },
+        ];
+        for changed in changes {
+            assert!(!same_settings(&changed, &api), "{changed:?}");
+        }
+    }
 }

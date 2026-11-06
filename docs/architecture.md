@@ -712,7 +712,14 @@ These are shown in the INFO column and by `kprtfwd status`.
     channel);
   - login tests with a fake exec plugin and API server: no login while the API
     server is unreachable, one login once it answers, none after a failed or
-    rejected login, and no secrets in the error;
+    rejected login, and no secrets in the error. They probe ten times faster
+    than in use;
+  - unit tests with a fake API server on a local port (`fake.rs`): the probe's
+    state machine with a given time and the rule for restarting watches;
+    `Engine::reconcile` and `reconnect` with a kubeconfig of their own, never
+    `~/.kube/config`; kubeconfig fingerprints; discovery and its
+    per-namespace fallback; the error classification with the errors kube-rs,
+    hyper-util and rustls really return;
   - cluster tests in `crates/engine/tests/cluster.rs`, run in CI against kind
     (job `cluster`) and locally against any throwaway cluster. They only run
     when `KPRTFWD_TEST_CONTEXT` is set; each creates and deletes its own
