@@ -90,7 +90,7 @@ by which process), and so on.
 |---|---|
 | `kprtfwd status [--all] [--json]` | contexts and enabled forwards |
 | `kprtfwd up <project or words>` | switch forwards on |
-| `kprtfwd down <project or words>` | switch forwards off |
+| `kprtfwd down <project or words>` / `down --all` | switch forwards off |
 | `kprtfwd switch <project>` | switch a project's forwards on and all others off |
 | `kprtfwd pause` / `resume` | close all listeners / bring them back |
 | `kprtfwd reconnect <context>` | reconnect a context from scratch |

@@ -145,6 +145,18 @@ fn up_and_down_switch_the_forwards_that_match() {
     assert!(home.run(&["down", "api"]).status.success());
     assert_eq!(enabled(), ["test.shop.web-80"]);
 
+    // No words, or only empty ones as from an unset variable, are wrong
+    // usage, not every forward.
+    for args in [&["down"][..], &["down", ""], &["up", " "]] {
+        let output = home.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert_eq!(enabled(), ["test.shop.web-80"], "{args:?}");
+    }
+    assert!(
+        stderr(&home.run(&["down"])).contains("--all"),
+        "the usage names --all"
+    );
+
     let output = home.run(&["down", "--all"]);
     assert!(output.status.success(), "{output:?}");
     assert_eq!(stdout(&output), "Switched 1 forwards off.\n");

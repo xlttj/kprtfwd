@@ -854,7 +854,7 @@ Internal structure:
 |---|---|
 | `kprtfwd` | TUI; starts the daemon if needed |
 | `kprtfwd status [--json]` | contexts and forwards with their state |
-| `kprtfwd up <project or words>...` / `down ...` | enable or disable a project, or every forward the words match (as in the TUI filter); `down --all` |
+| `kprtfwd up <project or words>...` / `down ...` | enable or disable a project, or every forward the words match (as in the TUI filter); `down --all` disables all. Both need words, and an empty word, as an unset variable in a script gives, is wrong usage: it would match every forward |
 | `kprtfwd switch <project>` | enable the project, disable everything else |
 | `kprtfwd pause` / `resume` | global pause |
 | `kprtfwd prune [--context C] [--namespace 'app-*'] [-y]` | as in v1: lists forwards whose service is gone and deletes them after asking; only the listed forwards are deleted, and nothing if the cluster cannot be listed. Forwards in namespaces whose services the user may not list are left alone, and those namespaces are named. The list names the context, which defaults to the daemon's current context (its kubeconfig may differ from the shell's) |

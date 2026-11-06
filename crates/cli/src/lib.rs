@@ -42,14 +42,16 @@ pub enum Command {
     },
     /// Switch forwards on: a project name, or words that must all match
     Up {
-        #[arg(required = true)]
+        #[arg(required = true, value_parser = word)]
         query: Vec<String>,
     },
     /// Switch forwards off: a project name, or words that must all match
+    #[command(group = clap::ArgGroup::new("forwards").required(true).args(["all", "query"]))]
     Down {
         /// Switch every forward off
-        #[arg(long, conflicts_with = "query")]
+        #[arg(long)]
         all: bool,
+        #[arg(value_parser = word)]
         query: Vec<String>,
     },
     /// Switch a project's forwards on and all others off
@@ -69,6 +71,7 @@ pub enum Command {
         /// Keep printing new entries
         #[arg(short, long)]
         follow: bool,
+        #[arg(value_parser = word)]
         query: Vec<String>,
     },
     /// Delete forwards whose service no longer exists in the cluster
@@ -89,6 +92,15 @@ pub enum Command {
     /// Inspect the database directly, without the daemon
     #[command(subcommand)]
     Db(DbCommand),
+}
+
+/// A word of a query. An empty one, as an unset variable in a script gives,
+/// would match every forward, so it is wrong usage.
+fn word(text: &str) -> Result<String, String> {
+    if text.trim().is_empty() {
+        return Err("a word must not be empty".into());
+    }
+    Ok(text.to_owned())
 }
 
 #[derive(Subcommand)]
@@ -259,7 +271,12 @@ enum Selection {
     Forwards(Vec<ForwardId>),
 }
 
+/// The project or forwards that `query` names. An empty query, which would
+/// match every forward, selects nothing.
 fn select(snapshot: &Snapshot, query: &[String]) -> Result<Selection> {
+    if query.iter().all(|word| word.trim().is_empty()) {
+        bail!("no project or words given");
+    }
     if let [name] = query
         && snapshot.projects.iter().any(|p| &p.name == name)
     {
@@ -811,6 +828,50 @@ mod tests {
     #[test]
     fn no_match_is_an_error() {
         assert!(select(&snapshot(), &["redis".into()]).is_err());
+    }
+
+    #[test]
+    fn an_empty_query_selects_nothing() {
+        for query in [vec![], vec![String::new()], vec![" ".into(), "\t".into()]] {
+            let err = select(&snapshot(), &query).err().expect("an error");
+            assert_eq!(err.to_string(), "no project or words given", "{query:?}");
+        }
+        assert!(word("").is_err());
+        assert!(word("  ").is_err());
+        assert_eq!(word("api").unwrap(), "api");
+    }
+
+    #[test]
+    fn down_needs_words_or_all() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            command: Command,
+        }
+        let parse = |args: &[&str]| {
+            use clap::Parser;
+            Cli::try_parse_from([&["kprtfwd"], args].concat()).map(|cli| cli.command)
+        };
+        for usage in [
+            &["down"][..],
+            &["down", ""],
+            &["down", "--all", "api"],
+            &["up"],
+            &["up", " "],
+            &["logs", ""],
+        ] {
+            let err = parse(usage).err().expect("wrong usage");
+            assert_eq!(err.exit_code(), 2, "{usage:?}: {err}");
+        }
+        assert!(matches!(
+            parse(&["down", "--all"]),
+            Ok(Command::Down { all: true, .. })
+        ));
+        assert!(matches!(
+            parse(&["down", "shop", "api"]),
+            Ok(Command::Down { all: false, query }) if query == ["shop", "api"]
+        ));
+        assert!(matches!(parse(&["logs"]), Ok(Command::Logs { query, .. }) if query.is_empty()));
     }
 
     #[test]
