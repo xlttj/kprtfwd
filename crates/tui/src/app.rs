@@ -19,12 +19,19 @@ pub enum Msg {
     /// A request finished: what to report, or the daemon's error.
     Done(Result<String, String>),
     Contexts(Result<(Vec<String>, Option<String>), String>),
-    Discovered(Result<Vec<DiscoveredPort>, String>),
+    Discovered(Result<Found, String>),
     Events(Result<Vec<EventEntry>, String>),
     /// The daemon is lost, or still cannot be reached; why.
     Lost(String),
     /// A signal asks the TUI to end.
     Quit,
+}
+
+/// What a discovery found.
+pub struct Found {
+    pub ports: Vec<DiscoveredPort>,
+    /// Namespaces whose services the user may not list.
+    pub skipped: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -118,6 +125,8 @@ pub enum Discovery {
 pub struct Services {
     pub context: String,
     pub ports: Vec<Candidate>,
+    /// Namespaces whose services the user may not list.
+    pub skipped: Vec<String>,
     pub filter: String,
     pub filtering: bool,
     pub selected: usize,
@@ -295,15 +304,17 @@ impl App {
                         _ => unreachable!(),
                     };
                     *step = match result {
-                        Ok(ports) => Discovery::Services(Services {
+                        Ok(found) => Discovery::Services(Services {
                             context,
-                            ports: ports
+                            ports: found
+                                .ports
                                 .into_iter()
                                 .map(|port| Candidate {
                                     port,
                                     marked: false,
                                 })
                                 .collect(),
+                            skipped: found.skipped,
                             filter: String::new(),
                             filtering: false,
                             selected: 0,
@@ -1150,10 +1161,10 @@ pub(crate) mod tests {
             id: ForwardId::new(format!("staging.shop.{service}-80")),
             local_port: 10080,
         };
-        app.update(Msg::Discovered(Ok(vec![
-            port("api", false),
-            port("frontend", true),
-        ])));
+        app.update(Msg::Discovered(Ok(Found {
+            ports: vec![port("api", false), port("frontend", true)],
+            skipped: Vec::new(),
+        })));
         app.update(key(KeyCode::Char('+')));
         let cmds = app.update(key(KeyCode::Enter));
         let requests = requested(&cmds);
@@ -1173,7 +1184,14 @@ pub(crate) mod tests {
         (message.text.as_str(), message.error)
     }
 
-    fn port(service: &str) -> DiscoveredPort {
+    pub fn found(ports: Vec<DiscoveredPort>) -> Found {
+        Found {
+            ports,
+            skipped: Vec::new(),
+        }
+    }
+
+    pub fn port(service: &str) -> DiscoveredPort {
         DiscoveredPort {
             namespace: "shop".into(),
             service: service.into(),
@@ -1190,7 +1208,7 @@ pub(crate) mod tests {
     fn results_outside_their_step_change_nothing() {
         let mut app = App::new(snapshot());
         app.update(Msg::Contexts(Ok((vec!["staging".into()], None))));
-        app.update(Msg::Discovered(Ok(vec![port("api")])));
+        app.update(Msg::Discovered(Ok(found(vec![port("api")]))));
         app.update(Msg::Events(Ok(vec![])));
         app.update(Msg::Events(Err("late".into())));
         assert!(matches!(app.mode, Mode::List));
@@ -1259,7 +1277,7 @@ pub(crate) mod tests {
     fn a_failed_discovery_save_keeps_the_services_open() {
         let mut app = App::new(snapshot());
         app.mode = Mode::Discovery(Discovery::Loading("staging".into()));
-        app.update(Msg::Discovered(Ok(vec![port("api")])));
+        app.update(Msg::Discovered(Ok(found(vec![port("api")]))));
         app.update(key(KeyCode::Char(' ')));
         assert_eq!(requested(&app.update(key(KeyCode::Enter))).len(), 1);
         app.update(Msg::Done(Err("port 10080 is taken".into())));

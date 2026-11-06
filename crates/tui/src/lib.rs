@@ -23,7 +23,7 @@ use ratatui::widgets::Clear;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior, timeout};
 
-use crate::app::{App, Cmd, Msg};
+use crate::app::{App, Cmd, Found, Msg};
 
 const REFRESH: Duration = Duration::from_millis(300);
 /// How long the daemon may take to answer a snapshot or a request. It needs
@@ -496,7 +496,7 @@ fn run_cmd<D: Daemon>(
             let tx = tx.clone();
             tokio::spawn(async move {
                 let result = match answer.await {
-                    Ok(Ok(Response::Discovered { ports })) => Ok(ports),
+                    Ok(Ok(Response::Discovered { ports, skipped })) => Ok(Found { ports, skipped }),
                     Ok(Ok(_)) => Err(UNEXPECTED.to_owned()),
                     Ok(Err(err)) => Err(err),
                     Err(_) => Err(no_answer(DISCOVER_WITHIN)),
@@ -705,6 +705,7 @@ mod tests {
                         id: ForwardId::new(format!("staging.{namespace_filter}.api-80")),
                         local_port: 10080,
                     }],
+                    skipped: Vec::new(),
                 })
             }
         }

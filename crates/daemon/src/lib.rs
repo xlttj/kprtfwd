@@ -810,7 +810,7 @@ async fn discover(
     context: &str,
     namespace_filter: &str,
 ) -> Result<Response, String> {
-    let services = discovery::services(context, namespace_filter).await?;
+    let listing = discovery::services(context, namespace_filter).await?;
     let forwards = daemon
         .lock()
         .await
@@ -822,7 +822,7 @@ async fn discover(
     let mut taken_ports: HashSet<u16> = forwards.iter().map(|f| f.local_port).collect();
 
     let mut ports = Vec::new();
-    for service in services {
+    for service in listing.services {
         for port in service.ports {
             let existing = forwards.iter().find(|f| {
                 f.context == context
@@ -860,28 +860,40 @@ async fn discover(
             });
         }
     }
-    Ok(Response::Discovered { ports })
+    Ok(Response::Discovered {
+        ports,
+        skipped: listing.skipped,
+    })
 }
 
 /// Lists the forwards in `context` whose service no longer exists. With
 /// `delete`, deletes those of these IDs that are still gone and returns them:
 /// a forward the user was not shown, or whose service is back, stays. If the
-/// cluster cannot be listed, nothing is deleted.
+/// cluster cannot be listed, nothing is deleted; forwards in namespaces whose
+/// services the user may not list are neither listed nor deleted.
 async fn prune(
     daemon: &Mutex<Daemon>,
     context: &str,
     namespace_filter: &str,
     delete: Option<&[ForwardId]>,
 ) -> Result<Response, String> {
-    let services = discovery::services(context, namespace_filter).await?;
-    let existing: HashSet<(String, String)> = services
+    let listing = discovery::services(context, namespace_filter).await?;
+    let existing: HashSet<(String, String)> = listing
+        .services
         .into_iter()
         .map(|s| (s.namespace, s.name))
         .collect();
 
     let mut daemon = daemon.lock().await;
     let forwards = daemon.store.forwards().map_err(|err| err.to_string())?;
-    let gone = gone_forwards(forwards, context, namespace_filter, &existing, delete);
+    let gone = gone_forwards(
+        forwards,
+        context,
+        namespace_filter,
+        &existing,
+        &listing.skipped,
+        delete,
+    );
     if delete.is_some() && !gone.is_empty() {
         for forward in &gone {
             daemon
@@ -892,17 +904,22 @@ async fn prune(
         daemon.apply().await.map_err(|err| err.to_string())?;
         info!(context, count = gone.len(), "pruned forwards");
     }
-    Ok(Response::Pruned { forwards: gone })
+    Ok(Response::Pruned {
+        forwards: gone,
+        skipped: listing.skipped,
+    })
 }
 
 /// The forwards in `context` and in a namespace matching `namespace_filter`
 /// whose service is not among `existing` (namespace, name); with `only`, just
-/// those of these IDs.
+/// those of these IDs. Forwards in a `skipped` namespace are unknown, not
+/// gone.
 fn gone_forwards(
     forwards: Vec<Forward>,
     context: &str,
     namespace_filter: &str,
     existing: &HashSet<(String, String)>,
+    skipped: &[String],
     only: Option<&[ForwardId]>,
 ) -> Vec<Forward> {
     let filter = namespace_filter.trim();
@@ -911,6 +928,7 @@ fn gone_forwards(
         .into_iter()
         .filter(|f| f.context == context)
         .filter(|f| all || wildcard(filter, &f.namespace))
+        .filter(|f| !skipped.contains(&f.namespace))
         .filter(|f| !existing.contains(&(f.namespace.clone(), f.service.clone())))
         .filter(|f| only.is_none_or(|ids| ids.contains(&f.id)))
         .collect()
@@ -990,12 +1008,32 @@ mod tests {
     #[test]
     fn lists_the_gone_forwards_of_the_context_and_filter() {
         let services = existing(&[("shop", "api")]);
-        let gone = gone_forwards(forwards(), "staging", "*", &services, None);
+        let gone = gone_forwards(forwards(), "staging", "*", &services, &[], None);
         assert_eq!(ids(&gone), ["web", "db"]);
-        let gone = gone_forwards(forwards(), "staging", "shop", &services, None);
+        let gone = gone_forwards(forwards(), "staging", "shop", &services, &[], None);
         assert_eq!(ids(&gone), ["web"]);
-        let gone = gone_forwards(forwards(), "staging", "shop-*", &services, None);
+        let gone = gone_forwards(forwards(), "staging", "shop-*", &services, &[], None);
         assert_eq!(ids(&gone), ["db"]);
+    }
+
+    #[test]
+    fn forwards_in_skipped_namespaces_are_never_gone() {
+        // The user may not list the services in shop-data: whether mysql is
+        // still there is unknown, so "db" is neither listed nor deleted.
+        let skipped = ["shop-data".to_owned()];
+        let services = existing(&[("shop", "api")]);
+        let gone = gone_forwards(forwards(), "staging", "*", &services, &skipped, None);
+        assert_eq!(ids(&gone), ["web"]);
+        let confirmed = [ForwardId::new("web"), ForwardId::new("db")];
+        let gone = gone_forwards(
+            forwards(),
+            "staging",
+            "*",
+            &services,
+            &skipped,
+            Some(&confirmed),
+        );
+        assert_eq!(ids(&gone), ["web"]);
     }
 
     #[test]
@@ -1004,7 +1042,7 @@ mod tests {
         // service and "db" got its service back.
         let confirmed = [ForwardId::new("web"), ForwardId::new("db")];
         let services = existing(&[("shop-data", "mysql")]);
-        let gone = gone_forwards(forwards(), "staging", "*", &services, Some(&confirmed));
+        let gone = gone_forwards(forwards(), "staging", "*", &services, &[], Some(&confirmed));
         assert_eq!(ids(&gone), ["web"]);
     }
 
@@ -1016,10 +1054,11 @@ mod tests {
             "staging",
             "shop",
             &existing(&[]),
+            &[],
             Some(&confirmed),
         );
         assert!(gone.is_empty(), "{:?}", ids(&gone));
-        let gone = gone_forwards(forwards(), "staging", "*", &existing(&[]), Some(&[]));
+        let gone = gone_forwards(forwards(), "staging", "*", &existing(&[]), &[], Some(&[]));
         assert!(gone.is_empty(), "{:?}", ids(&gone));
     }
 }

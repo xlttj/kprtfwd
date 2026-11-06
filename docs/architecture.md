@@ -607,8 +607,8 @@ enum Response {
     Snapshot(Snapshot),   // contexts, forwards with state, projects, paused
     Done,
     Contexts { names: Vec<String>, current: Option<String> },
-    Discovered { ports: Vec<DiscoveredPort> },   // with proposed ID and local port
-    Pruned { forwards: Vec<Forward> },
+    Discovered { ports: Vec<DiscoveredPort>, skipped: Vec<String> },   // with proposed ID and local port
+    Pruned { forwards: Vec<Forward>, skipped: Vec<String> },
     Events { entries: Vec<EventEntry> },
 }
 ```
@@ -620,7 +620,8 @@ on or off with one request (`+` / `-`).
 confirmed call sends the IDs the user was shown, and the daemon deletes those
 of them that are still gone after listing the cluster again: a forward that
 was not shown is never deleted, and one whose service came back while the
-prompt waited is kept.
+prompt waited is kept. `skipped` in both answers names the namespaces whose
+services the user may not list (section 9).
 
 ## 8. Persistence and migration
 
@@ -660,6 +661,11 @@ prompt waited is kept.
   listing namespaces is forbidden too, the user is asked for an exact namespace
   name. Every list is read in pages of 500 objects, each page with a time limit
   of 30 s, so a large cluster does not run into one limit for everything.
+- **Namespaces the user may not read.** Rights are often granted per
+  namespace. In the fallback, a namespace whose services the user may not list
+  (403) is skipped and named in the answer; the TUI and `kprtfwd prune` show
+  these names. Any other failure in a namespace fails the whole listing, and a
+  forbidden namespace asked for by its exact name is an error.
 - **Proposed local port.** v1 proposes the remote port; 53 of the 63 local ports in
   use are 10000 or higher, so they were changed by hand. v2 proposes, in order:
   1. the existing local port, if the forward already exists;
@@ -673,6 +679,8 @@ prompt waited is kept.
 - **Service types.** The classification is ported from `pkg/svctype` (mysql, redis,
   http, ...). It decides when "open in browser" applies.
 - **Prune** uses the same listing to remove forwards whose service no longer exists.
+  A forward in a skipped namespace is unknown, not gone: prune neither lists
+  nor deletes it.
 
 ## 10. TUI
 
@@ -767,7 +775,8 @@ to save and `esc` to cancel. They are:
   2. enter a namespace filter (`*` wildcards, empty for all);
   3. a service list with a filter; `space` marks, `+`/`-` mark all listed, `e`
      edits the proposed local port, `enter` adds the marked services (switched
-     off). Ports that already have a forward show as `added`.
+     off). Ports that already have a forward show as `added`. Namespaces
+     skipped because their services may not be listed are named below the list.
 
   Discovery runs in the background; the list stays usable meanwhile.
 
@@ -803,7 +812,7 @@ Internal structure:
 | `kprtfwd up <project or words>...` / `down ...` | enable or disable a project, or every forward the words match (as in the TUI filter); `down --all` |
 | `kprtfwd switch <project>` | enable the project, disable everything else |
 | `kprtfwd pause` / `resume` | global pause |
-| `kprtfwd prune [--context C] [--namespace 'app-*'] [-y]` | as in v1: lists forwards whose service is gone and deletes them after asking; only the listed forwards are deleted, and nothing if the cluster cannot be listed. The list names the context, which defaults to the daemon's current context (its kubeconfig may differ from the shell's) |
+| `kprtfwd prune [--context C] [--namespace 'app-*'] [-y]` | as in v1: lists forwards whose service is gone and deletes them after asking; only the listed forwards are deleted, and nothing if the cluster cannot be listed. Forwards in namespaces whose services the user may not list are left alone, and those namespaces are named. The list names the context, which defaults to the daemon's current context (its kubeconfig may differ from the shell's) |
 | `kprtfwd logs [-f] [project or words]` | events of the matching forwards and their contexts; without arguments the daemon log |
 | `kprtfwd discover ...` | not built; the TUI's `d` covers it |
 | `kprtfwd reconnect <context>` | rebuild a context's client, watches and forwards |

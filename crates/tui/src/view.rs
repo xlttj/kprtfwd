@@ -420,9 +420,10 @@ fn draw_services(frame: &mut Frame, s: &Services) {
     let block = Block::bordered().title(format!(" discover: {} ", s.context));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let [filter, list, keys] = Layout::vertical([
+    let [filter, list, skipped, keys] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(u16::from(!s.skipped.is_empty())),
         Constraint::Length(1),
     ])
     .areas(inner);
@@ -484,11 +485,30 @@ fn draw_services(frame: &mut Frame, s: &Services) {
         TableState::default().with_selected((!visible.is_empty()).then_some(s.selected));
     frame.render_stateful_widget(table, list, &mut state);
 
+    if let Some(note) = skipped_note(&s.skipped) {
+        frame.render_widget(Line::styled(note, Style::new().fg(Color::Yellow)), skipped);
+    }
     let marked = s.ports.iter().filter(|c| c.marked).count();
     frame.render_widget(
         Line::styled(format!("{marked} marked · space mark · +/- all listed · e local port · / filter · enter add · esc cancel"), dim()),
         keys,
     );
+}
+
+/// Names the namespaces discovery skipped; the count comes first, so it
+/// shows even when the names are cut off.
+fn skipped_note(skipped: &[String]) -> Option<String> {
+    match skipped {
+        [] => None,
+        [namespace] => Some(format!(
+            "namespace {namespace} skipped: you may not list its services"
+        )),
+        _ => Some(format!(
+            "{} namespaces skipped, you may not list their services: {}",
+            skipped.len(),
+            skipped.join(", ")
+        )),
+    }
 }
 
 fn help_lines(app: &App) -> Vec<Line<'static>> {
@@ -552,7 +572,8 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tests::snapshot;
+    use crate::app::Candidate;
+    use crate::app::tests::{port, snapshot};
     use kprtfwd_proto::ContextView;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -686,6 +707,47 @@ mod tests {
         app.keep_forwards_running = true;
         let screen = render(&app, 100, 24).join("\n");
         assert!(screen.contains("quit; forwards keep running"), "{screen}");
+    }
+
+    #[test]
+    fn discovery_names_the_namespaces_it_skipped() {
+        let services = |skipped: &[&str]| Services {
+            context: "staging".into(),
+            ports: vec![Candidate {
+                port: port("api"),
+                marked: false,
+            }],
+            skipped: skipped.iter().map(|ns| (*ns).to_owned()).collect(),
+            filter: String::new(),
+            filtering: false,
+            selected: 0,
+            editing: None,
+        };
+        let mut app = App::new(snapshot());
+        app.mode = Mode::Discovery(Discovery::Services(services(&[])));
+        let screen = render(&app, 120, 12).join("\n");
+        assert!(screen.contains("shop/api:80"), "{screen}");
+        assert!(!screen.contains("skipped"), "{screen}");
+
+        app.mode = Mode::Discovery(Discovery::Services(services(&["kube-system", "web"])));
+        let screen = render(&app, 120, 12);
+        let note = screen
+            .iter()
+            .position(|line| {
+                line.contains(
+                    "2 namespaces skipped, you may not list their services: kube-system, web",
+                )
+            })
+            .expect("no note");
+        assert!(screen[note + 1].contains("space mark"), "{screen:?}");
+        assert!(screen.iter().any(|line| line.contains("shop/api:80")));
+
+        app.mode = Mode::Discovery(Discovery::Services(services(&["web"])));
+        let screen = render(&app, 120, 12).join("\n");
+        assert!(
+            screen.contains("namespace web skipped: you may not list its services"),
+            "{screen}"
+        );
     }
 
     #[test]

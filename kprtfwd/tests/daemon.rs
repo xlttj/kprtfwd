@@ -560,7 +560,7 @@ contexts:
         context: "test".into(),
         namespace_filter: String::new(),
     };
-    let Response::Discovered { ports } = client.request(discover.clone()).await.unwrap() else {
+    let Response::Discovered { ports, .. } = client.request(discover.clone()).await.unwrap() else {
         panic!("no discovery answer");
     };
     assert_eq!(ports.len(), 1, "{ports:?}");
@@ -572,7 +572,7 @@ contexts:
     drop(holder);
     let free = |address: &str| std::net::TcpListener::bind(address).is_ok();
     if free("127.0.0.1:10080") && free("[::1]:10080") {
-        let Response::Discovered { ports } = client.request(discover).await.unwrap() else {
+        let Response::Discovered { ports, .. } = client.request(discover).await.unwrap() else {
             panic!("no discovery answer");
         };
         assert_eq!(ports[0].local_port, 10080, "{ports:?}");

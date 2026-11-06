@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 pub use client::{Client, ClientError, connect_or_start, spawn_daemon, stop_daemon};
 
 /// Bumped on every incompatible change to the messages.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// A request with its ID. The request is nested, not flattened, because
 /// requests have fields of their own named `id`.
@@ -119,10 +119,16 @@ pub enum Response {
     },
     Discovered {
         ports: Vec<DiscoveredPort>,
+        /// Namespaces that match the filter but whose services the user may
+        /// not list.
+        skipped: Vec<String>,
     },
     /// The forwards whose service is gone, or with `delete` those deleted.
+    /// Forwards in `skipped` namespaces are never among them: the user may
+    /// not list those namespaces' services, so whether they exist is unknown.
     Pruned {
         forwards: Vec<Forward>,
+        skipped: Vec<String>,
     },
     Events {
         entries: Vec<EventEntry>,

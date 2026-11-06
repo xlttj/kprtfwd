@@ -114,6 +114,27 @@ fn fake_api() -> u16 {
     })
 }
 
+const NAMESPACES: &str = r#"{"kind":"NamespaceList","apiVersion":"v1","metadata":{"resourceVersion":"1"},"items":[{"metadata":{"name":"shop"}},{"metadata":{"name":"web"}}]}"#;
+const FORBIDDEN: &str = r#"{"kind":"Status","apiVersion":"v1","status":"Failure","message":"services is forbidden","reason":"Forbidden","code":403}"#;
+
+/// An API server where the user may list the namespaces, shop and web, but
+/// services only in shop.
+fn fake_api_with_rights_in_shop() -> u16 {
+    common::fake_api(|path| {
+        if path.starts_with("/api/v1/namespaces?") {
+            ("200 OK", NAMESPACES)
+        } else if path.starts_with("/api/v1/namespaces/shop/services?") {
+            ("200 OK", SERVICES)
+        } else if path.starts_with("/api/v1/services?")
+            || path.starts_with("/api/v1/namespaces/web/services?")
+        {
+            ("403 Forbidden", FORBIDDEN)
+        } else {
+            NOT_FOUND
+        }
+    })
+}
+
 fn kubeconfig(port: u16) -> String {
     format!(
         r#"apiVersion: v1
@@ -197,6 +218,45 @@ fn prune_deletes_only_what_the_user_confirmed() {
     assert_eq!(
         stdout(&output),
         "Nothing to prune in context test (the daemon's current context).\n"
+    );
+}
+
+/// Whether the services of a namespace the user may not read still exist is
+/// unknown, so its forwards are left alone and the namespace is named.
+#[test]
+fn prune_leaves_namespaces_alone_whose_services_are_forbidden() {
+    let mut home = Home::new();
+    home.set_kubeconfig(&kubeconfig(fake_api_with_rights_in_shop()));
+    write_database(
+        &home.db(),
+        &[
+            forward("test", "shop", "api", false),
+            forward("test", "shop", "old", false),
+            forward("test", "web", "legacy", false),
+        ],
+        false,
+    );
+
+    let output = home.run_with_input(&["prune", "--context", "test"], "y\n");
+    assert!(output.status.success(), "{output:?}");
+    let out = stdout(&output);
+    assert!(out.contains("test.shop.old-80"), "{out}");
+    assert!(!out.contains("test.web.legacy-80"), "{out}");
+    assert!(
+        out.contains("Not checked: namespace web, whose services you may not list."),
+        "{out}"
+    );
+    assert!(out.contains("Deleted test.shop.old-80"), "{out}");
+    assert_eq!(
+        forward_ids(&home.db()).0,
+        ["test.shop.api-80", "test.web.legacy-80"]
+    );
+
+    let output = home.run(&["prune", "-y", "--context", "test"]);
+    assert_eq!(
+        stdout(&output),
+        "Nothing to prune in context test.\n\
+         Not checked: namespace web, whose services you may not list.\n"
     );
 }
 

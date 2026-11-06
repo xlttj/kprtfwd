@@ -375,12 +375,15 @@ async fn prune(context: Option<String>, namespace: &str, yes: bool) -> Result<Ex
         namespace_filter: namespace.to_owned(),
         delete,
     };
-    let gone = match client.request(request(None)).await? {
-        kprtfwd_proto::Response::Pruned { forwards } => forwards,
+    let (gone, skipped) = match client.request(request(None)).await? {
+        kprtfwd_proto::Response::Pruned { forwards, skipped } => (forwards, skipped),
         _ => bail!("unexpected answer from the daemon"),
     };
     if gone.is_empty() {
         println!("Nothing to prune in {scope}.");
+        if let Some(note) = skipped_note(&skipped) {
+            println!("{note}");
+        }
         return Ok(ExitCode::SUCCESS);
     }
     println!("Forwards whose service is gone, in {scope}:\n");
@@ -395,6 +398,9 @@ async fn prune(context: Option<String>, namespace: &str, yes: bool) -> Result<Ex
         })
         .collect();
     print_table(&["SERVICE", "LOCAL", "ID"], &rows);
+    if let Some(note) = skipped_note(&skipped) {
+        println!("\n{note}");
+    }
     let question = match gone.len() {
         1 => format!("\nDelete this forward of context {context}? [y/N] "),
         n => format!("\nDelete these {n} forwards of context {context}? [y/N] "),
@@ -404,7 +410,7 @@ async fn prune(context: Option<String>, namespace: &str, yes: bool) -> Result<Ex
     }
     let confirmed: Vec<ForwardId> = gone.into_iter().map(|f| f.id).collect();
     let deleted = match client.request(request(Some(confirmed.clone()))).await? {
-        kprtfwd_proto::Response::Pruned { forwards } => forwards,
+        kprtfwd_proto::Response::Pruned { forwards, .. } => forwards,
         _ => bail!("unexpected answer from the daemon"),
     };
     for forward in &deleted {
@@ -414,9 +420,27 @@ async fn prune(context: Option<String>, namespace: &str, yes: bool) -> Result<Ex
         .iter()
         .filter(|id| !deleted.iter().any(|f| &f.id == *id))
     {
-        println!("Not deleted: {id} (its service is back, or the forward changed)");
+        println!(
+            "Not deleted: {id} (its service is back or cannot be checked, or the forward changed)"
+        );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Names the namespaces prune left alone because the user may not list
+/// their services; `None` if there are none.
+fn skipped_note(skipped: &[String]) -> Option<String> {
+    match skipped {
+        [] => None,
+        [namespace] => Some(format!(
+            "Not checked: namespace {namespace}, whose services you may not list."
+        )),
+        _ => Some(format!(
+            "Not checked: {} namespaces whose services you may not list: {}.",
+            skipped.len(),
+            skipped.join(", ")
+        )),
+    }
 }
 
 /// Names what `prune` works on: the context, whether it is the default, and
@@ -766,6 +790,19 @@ mod tests {
     #[test]
     fn no_match_is_an_error() {
         assert!(select(&snapshot(), &["redis".into()]).is_err());
+    }
+
+    #[test]
+    fn prune_names_the_namespaces_it_could_not_check() {
+        assert_eq!(skipped_note(&[]), None);
+        assert_eq!(
+            skipped_note(&["web".into()]).unwrap(),
+            "Not checked: namespace web, whose services you may not list."
+        );
+        assert_eq!(
+            skipped_note(&["kube-system".into(), "web".into()]).unwrap(),
+            "Not checked: 2 namespaces whose services you may not list: kube-system, web."
+        );
     }
 
     #[test]

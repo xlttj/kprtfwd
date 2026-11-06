@@ -22,6 +22,17 @@ const PAGE: u32 = 500;
 /// Namespaces the fallback lists at the same time.
 const PARALLEL: usize = 8;
 
+/// What listing a context found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Listing {
+    /// Sorted by namespace and name.
+    pub services: Vec<ServiceInfo>,
+    /// Namespaces that match the filter but whose services the user may not
+    /// list, sorted. What they hold is unknown: prune must not take their
+    /// forwards for gone.
+    pub skipped: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceInfo {
     pub namespace: String,
@@ -45,8 +56,9 @@ pub fn contexts() -> Result<(Vec<String>, Option<String>), String> {
 }
 
 /// The services in `context` whose namespace matches `namespace_filter` (`*`
-/// wildcards, empty for all), sorted by namespace and name.
-pub async fn services(context: &str, namespace_filter: &str) -> Result<Vec<ServiceInfo>, String> {
+/// wildcards, empty for all), and the namespaces skipped because the user may
+/// not list their services.
+pub async fn services(context: &str, namespace_filter: &str) -> Result<Listing, String> {
     let (client, login) = client_for(context).await?;
     if let Some(login) = login {
         // Log in only if the API server answers: a login may open the browser.
@@ -71,10 +83,11 @@ async fn list_services(
     client: &Client,
     context: &str,
     namespace_filter: &str,
-) -> Result<Vec<ServiceInfo>, String> {
+) -> Result<Listing, String> {
     let filter = namespace_filter.trim();
     let all = filter.is_empty() || filter == "*";
 
+    let mut skipped = Vec::new();
     let services = if exact(filter) {
         // One namespace is listed alone, not picked out of the whole cluster.
         list(Api::<Service>::namespaced(client.clone(), filter))
@@ -84,7 +97,11 @@ async fn list_services(
         match list(Api::<Service>::all(client.clone())).await {
             Ok(services) => services,
             // Many developers may only list services per namespace.
-            Err(Failure::Forbidden(_)) => per_namespace(client, context, filter).await?,
+            Err(Failure::Forbidden(_)) => {
+                let (services, forbidden) = per_namespace(client, context, filter).await?;
+                skipped = forbidden;
+                services
+            }
             Err(failure) => return Err(describe(&failure, context)),
         }
     };
@@ -118,7 +135,10 @@ async fn list_services(
         })
         .collect();
     found.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
-    Ok(found)
+    Ok(Listing {
+        services: found,
+        skipped,
+    })
 }
 
 /// Whether `filter` names one namespace, without wildcards.
@@ -128,12 +148,13 @@ fn exact(filter: &str) -> bool {
 
 /// Lists the services of the namespaces that match `filter` (wildcards or
 /// empty), a few namespaces at a time, for users who may not list them
-/// across the cluster.
+/// across the cluster. Returns them with the namespaces whose services the
+/// user may not list either, sorted; any other failure fails the listing.
 async fn per_namespace(
     client: &Client,
     context: &str,
     filter: &str,
-) -> Result<Vec<Service>, String> {
+) -> Result<(Vec<Service>, Vec<String>), String> {
     let namespaces: Vec<String> = match list(Api::<Namespace>::all(client.clone())).await {
         Ok(namespaces) => namespaces
             .into_iter()
@@ -155,12 +176,19 @@ async fn per_namespace(
         })
         .buffer_unordered(PARALLEL);
     let mut services = Vec::new();
+    let mut skipped = Vec::new();
     while let Some((namespace, listed)) = lists.next().await {
-        services.extend(
-            listed.map_err(|failure| format!("{namespace}: {}", describe(&failure, context)))?,
-        );
+        match listed {
+            Ok(listed) => services.extend(listed),
+            // Rights are often granted per namespace: the others are named.
+            Err(Failure::Forbidden(_)) => skipped.push(namespace),
+            Err(failure) => {
+                return Err(format!("{namespace}: {}", describe(&failure, context)));
+            }
+        }
     }
-    Ok(services)
+    skipped.sort();
+    Ok((services, skipped))
 }
 
 /// Lists every object, a page at a time; the time limit applies per page.
@@ -220,8 +248,9 @@ mod tests {
     }
 
     /// `namespace/name:port` of every port found.
-    fn found(services: &[ServiceInfo]) -> Vec<String> {
-        services
+    fn found(listing: &Listing) -> Vec<String> {
+        listing
+            .services
             .iter()
             .flat_map(|s| {
                 s.ports
@@ -283,7 +312,8 @@ mod tests {
             found(&all),
             ["shop-a/api:80", "shop-b/db:3306", "web/frontend:80"]
         );
-        assert_eq!(all[0].ports[0].name.as_deref(), Some("http"));
+        assert_eq!(all.services[0].ports[0].name.as_deref(), Some("http"));
+        assert!(all.skipped.is_empty());
         assert_eq!(
             found(&list_services(&client, "staging", "").await.unwrap()).len(),
             3
@@ -404,19 +434,55 @@ mod tests {
         );
     }
 
-    /// Prune deletes what is not listed, so a listing that misses a
-    /// namespace must not look complete.
+    /// Rights are often granted per namespace: a user who may list the
+    /// namespaces but read services only in some of them gets those, and the
+    /// others are named, so prune can tell them from gone.
     #[tokio::test]
-    async fn a_namespace_that_cannot_be_listed_fails_the_whole_listing() {
+    async fn namespaces_whose_services_are_forbidden_are_skipped_and_named() {
         let api = FakeApi::start(|request| match request.path.as_str() {
-            "/api/v1/namespaces/shop-b/services" => forbidden(),
+            "/api/v1/namespaces/shop-b/services" | "/api/v1/namespaces/web/services" => forbidden(),
             _ => namespaced_only(false)(request),
         })
         .await;
-        let err = list_services(&api.client(), "staging", "shop-*")
-            .await
-            .unwrap_err();
-        assert_eq!(err, "shop-b: forbidden: services is forbidden");
+        let client = api.client();
+        let listing = list_services(&client, "staging", "*").await.unwrap();
+        assert_eq!(found(&listing), ["shop-a/api:80"]);
+        assert_eq!(listing.skipped, ["shop-b", "web"]);
+        let listing = list_services(&client, "staging", "shop-*").await.unwrap();
+        assert_eq!(found(&listing), ["shop-a/api:80"]);
+        assert_eq!(listing.skipped, ["shop-b"]);
+
+        // Asked for by name, a forbidden namespace is an error.
+        let err = list_services(&client, "staging", "web").await.unwrap_err();
+        assert_eq!(err, "forbidden: services is forbidden");
+    }
+
+    /// Only a 403 is skipped: a listing that missed a namespace for any
+    /// other reason must not look complete, or prune would take its
+    /// forwards for gone.
+    #[tokio::test]
+    async fn any_other_failure_in_a_namespace_fails_the_whole_listing() {
+        for (reply, expected) in [
+            (
+                Reply::Json(401, status(401, "Unauthorized")),
+                "shop-b: login needed: kubectl --context staging get ns",
+            ),
+            (
+                Reply::Json(500, status(500, "etcdserver: leader changed")),
+                "shop-b: ApiError: etcdserver: leader changed",
+            ),
+        ] {
+            let reply = Arc::new(std::sync::Mutex::new(Some(reply)));
+            let api = FakeApi::start(move |request| match request.path.as_str() {
+                "/api/v1/namespaces/shop-b/services" => reply.lock().unwrap().take().unwrap(),
+                _ => namespaced_only(false)(request),
+            })
+            .await;
+            let err = list_services(&api.client(), "staging", "shop-*")
+                .await
+                .unwrap_err();
+            assert!(err.starts_with(expected), "{err}");
+        }
     }
 
     #[tokio::test]
