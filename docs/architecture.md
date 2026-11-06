@@ -518,14 +518,17 @@ on or off with one request (`+` / `-`).
   additive:
   - **v2:** `port_forwards` gains `enabled INTEGER NOT NULL DEFAULT 0`. A new
     table `settings (key TEXT PRIMARY KEY, value TEXT)` holds `paused`.
+    Project memberships whose forward or project is gone are deleted: v1
+    never enables foreign keys, so its files can hold them.
 - **Backup.** The first migration copies the database to `kprtfwd.db.v1-backup`,
   through a temporary file like the take-over. If the copy fails, the database
   is not migrated, and the next start tries both again.
 - **Rollback.** v1 keeps its own file in `~/.kprtfwd`, which v2 no longer
   changes; that is the rollback path, without the changes made in v2. v1 also
   works on a migrated database, because it always reads and writes explicit
-  column lists and the changes are additive. v1 and v2 should not run at the
-  same time, because they would compete for local ports.
+  column lists and the schema changes are additive; a project member it writes
+  for a deleted forward is ignored by v2. v1 and v2 should not run at the same
+  time, because they would compete for local ports.
 - **IDs.** IDs are opaque and kept as they are. The current database holds two
   historic shapes: 21 IDs with three parts and 42 with four. New IDs are
   `<context>.<namespace>.<service>-<port>`, sanitized as in v1, with a numeric

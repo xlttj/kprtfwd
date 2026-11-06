@@ -1,7 +1,7 @@
 //! SQLite storage for forwards, projects and settings.
 //!
-//! The schema extends v1's (`~/.kprtfwd/kprtfwd.db`). Changes are additive,
-//! so the v1 binary keeps working on a migrated file.
+//! The schema extends v1's (`~/.kprtfwd/kprtfwd.db`). Schema changes are
+//! additive, so the v1 binary keeps working on a migrated file.
 
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io;
@@ -72,10 +72,15 @@ CREATE INDEX IF NOT EXISTS idx_port_forwards_namespace ON port_forwards(namespac
 CREATE INDEX IF NOT EXISTS idx_port_forwards_service ON port_forwards(service);
 ";
 
-/// v2: desired state per forward and a key/value table for settings.
+/// v2: desired state per forward and a key/value table for settings. v1 never
+/// enabled foreign keys, so its files can hold memberships whose forward or
+/// project is gone; they are dropped.
 const V2_MIGRATION: &str = "
 ALTER TABLE port_forwards ADD COLUMN enabled INTEGER NOT NULL DEFAULT 0;
 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+DELETE FROM project_port_forwards
+WHERE NOT EXISTS (SELECT 1 FROM port_forwards f WHERE f.id = project_port_forwards.port_forward_id)
+   OR NOT EXISTS (SELECT 1 FROM projects p WHERE p.id = project_port_forwards.project_id);
 ";
 
 const SELECT_FORWARD: &str =
@@ -253,12 +258,15 @@ impl Store {
         Ok(())
     }
 
-    /// All projects with their forward IDs, sorted by name.
+    /// All projects with their forward IDs, sorted by name. Members whose
+    /// forward is gone are left out: v1 can write them into a migrated file,
+    /// as it never enables foreign keys.
     pub fn projects(&self) -> Result<Vec<Project>> {
         let mut stmt = self.conn.prepare(
             "SELECT p.name, m.port_forward_id
              FROM projects p
              LEFT JOIN project_port_forwards m ON m.project_id = p.id
+                 AND EXISTS (SELECT 1 FROM port_forwards f WHERE f.id = m.port_forward_id)
              ORDER BY p.name, m.port_forward_id",
         )?;
         let mut rows = stmt.query([])?;

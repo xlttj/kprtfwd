@@ -250,6 +250,31 @@ fn writes_backup_before_migrating_and_only_once() {
     assert!(!backup.exists());
 }
 
+/// The fixture holds memberships v1 left behind; the migration drops them, so
+/// switching or saving the project does not fail on an unknown forward.
+#[test]
+fn migration_drops_memberships_without_forward_or_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = v1_database(dir.path());
+    let memberships = || -> i64 {
+        Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM project_port_forwards", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(memberships(), 4);
+
+    let mut store = Store::open(&path).unwrap();
+
+    assert_eq!(memberships(), 2);
+    let shop = store.projects().unwrap().pop().unwrap();
+    assert_eq!(shop, fixture_projects().pop().unwrap());
+    store.set_enabled_exactly(&shop.forwards).unwrap();
+    store.upsert_project(&shop).unwrap();
+}
+
 /// A backup that cannot be written stops the migration, and the next open
 /// writes it and migrates.
 #[test]
@@ -299,17 +324,31 @@ fn v1_statements_work_after_migration() {
     v1_delete_project(&v1, "shop");
     v1_create_project(&mut v1, "shop", &["staging.mysql.shop"]);
     v1_delete_forward(&mut v1, "orbstack.cache.redis.redis-6379");
+    // v1 saves a project from the list it holds in memory, which can still
+    // contain a forward deleted meanwhile.
+    v1_delete_project(&v1, "api");
+    v1_create_project(
+        &mut v1,
+        "api",
+        &["staging.shop.api.api-80", "orbstack.cache.redis.redis-6379"],
+    );
     assert_eq!(
         v1_projects(&v1),
         [
-            ("api".to_owned(), vec!["staging.shop.api.api-80".to_owned()]),
+            (
+                "api".to_owned(),
+                vec![
+                    "orbstack.cache.redis.redis-6379".to_owned(),
+                    "staging.shop.api.api-80".to_owned()
+                ]
+            ),
             ("empty".to_owned(), vec![]),
             ("shop".to_owned(), vec!["staging.mysql.shop".to_owned()]),
         ]
     );
     drop(v1);
 
-    let store = Store::open(&path).unwrap();
+    let mut store = Store::open(&path).unwrap();
     let stored = store.forward(&api.id).unwrap().unwrap();
     assert_eq!(stored.local_port, 18092);
     assert!(!stored.enabled, "rows inserted by v1 get the default");
@@ -331,6 +370,9 @@ fn v1_statements_work_after_migration() {
             },
         ]
     );
+    // The file is already at the current schema, so this is not the
+    // migration's work: the member v1 wrote without its forward is ignored.
+    store.set_enabled_exactly(&[api.id.clone()]).unwrap();
 }
 
 #[test]

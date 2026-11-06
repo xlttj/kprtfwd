@@ -38,3 +38,12 @@ INSERT INTO projects (name) VALUES ('shop'), ('empty');
 INSERT INTO project_port_forwards (project_id, port_forward_id) VALUES
 	(1, 'staging.mysql.shop'),
 	(1, 'staging.shop.frontend.frontend-80');
+
+-- v1 never enables foreign keys, so its history leaves memberships behind:
+-- 'shop' was saved again from a list that still held a forward deleted
+-- meanwhile, and the deleted project 'old' kept its member.
+INSERT INTO projects (name) VALUES ('old');
+INSERT INTO project_port_forwards (project_id, port_forward_id) VALUES
+	(1, 'staging.shop.legacy.legacy-80'),
+	(3, 'staging.mysql.shop');
+DELETE FROM projects WHERE name = 'old';
