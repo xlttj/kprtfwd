@@ -93,7 +93,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::fake::{FakeApi, Reply, free_port, status};
+    use crate::fake::{FakeApi, Reply, closed_port, status};
     use crate::portforward::PortForwardError;
 
     fn io(kind: std::io::ErrorKind, text: &str) -> std::io::Error {
@@ -159,7 +159,7 @@ mod tests {
     /// The errors as kube-rs, hyper-util and rustls really return them.
     #[tokio::test]
     async fn classifies_the_errors_a_client_returns() {
-        let port = free_port();
+        let port = closed_port();
         let refused = client(&format!("http://127.0.0.1:{port}"))
             .apiserver_version()
             .await

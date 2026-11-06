@@ -209,11 +209,17 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::fake::free_port;
+    use crate::fake::{closed_port, free_port};
 
-    /// Two contexts whose API server refuses connections.
+    /// Two contexts whose API server cannot be reached. The port is not
+    /// reserved, so a test that checks why takes [`kubeconfig_at`] with a
+    /// [`closed_port`].
     fn kubeconfig() -> Kubeconfig {
-        let port = free_port();
+        kubeconfig_at(free_port())
+    }
+
+    /// Two contexts whose API server is on `port`.
+    fn kubeconfig_at(port: u16) -> Kubeconfig {
         Kubeconfig::from_yaml(&format!(
             r#"
 apiVersion: v1
@@ -329,7 +335,7 @@ contexts:
 
     #[tokio::test]
     async fn context_events_outlive_the_context() {
-        let mut engine = Engine::with_kubeconfig(kubeconfig());
+        let mut engine = Engine::with_kubeconfig(kubeconfig_at(closed_port()));
         let api = forward("staging", "shop", "api");
         engine.reconcile(std::slice::from_ref(&api)).await;
         let started = Instant::now();

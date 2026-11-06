@@ -528,24 +528,30 @@ mod tests {
                 pods(service, ready),
             );
             context.put_namespace("shop", cache.clone());
-            let port = free_port();
-            let events = EventLog::default();
-            let handle = ForwardHandle::start(
-                spec(service, remote_port, port),
-                context.clone(),
-                events.clone(),
-            );
-            let test = Self {
-                api,
-                context,
-                cache,
-                events,
-                handle,
-                port,
-            };
-            test.wait("listening", |t| t.observe().bind == Bind::Bound)
-                .await;
-            test
+            // Another test's socket may take a free port before the forward
+            // binds it. Then the forward starts again on another port, so
+            // its events show one clean start.
+            for _ in 0..5 {
+                let port = free_port();
+                let events = EventLog::default();
+                let handle = ForwardHandle::start(
+                    spec(service, remote_port, port),
+                    context.clone(),
+                    events.clone(),
+                );
+                if first_bind(&handle, &context).await == Bind::Bound {
+                    return Self {
+                        api,
+                        context,
+                        cache,
+                        events,
+                        handle,
+                        port,
+                    };
+                }
+                handle.stop();
+            }
+            panic!("no free port in five attempts");
         }
 
         fn observe(&self) -> Observed {
@@ -597,6 +603,22 @@ mod tests {
             let mut socket = TcpStream::connect((host, self.port)).await.unwrap();
             let _ = socket.write_all(text.as_bytes()).await;
             read_answer(&mut socket, text).await
+        }
+    }
+
+    /// The outcome of the forward's first attempt to bind its port.
+    async fn first_bind(handle: &ForwardHandle, context: &Context) -> Bind {
+        let started = Instant::now();
+        loop {
+            let bind = handle.observe(context).bind;
+            if bind != Bind::Pending {
+                return bind;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "no bind attempt"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 

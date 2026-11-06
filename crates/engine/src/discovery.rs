@@ -326,7 +326,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, "login needed: kubectl --context staging get ns");
 
-        let port = crate::fake::free_port();
+        let port = crate::fake::closed_port();
         let client = Client::try_from(kube::Config::new(
             format!("http://127.0.0.1:{port}").parse().unwrap(),
         ))

@@ -400,7 +400,7 @@ mod tests {
 
     use super::*;
     use crate::auth::fake;
-    use crate::fake::{FakeApi, Reply, VERSION, free_port, status};
+    use crate::fake::{FakeApi, Reply, VERSION, closed_port, status};
 
     /// Probes ten times faster than in use.
     const FAST: Timing = Timing {
@@ -475,7 +475,7 @@ current-context: test
     async fn logs_in_only_while_the_api_server_answers() {
         let dir = tempfile::tempdir().unwrap();
         let runs = dir.path().join("runs");
-        let port = free_port();
+        let port = closed_port();
         let context = context(dir.path(), port, "ok").await;
 
         wait_for(&context, "unreachable", |state| {

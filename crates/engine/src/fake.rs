@@ -262,7 +262,33 @@ async fn kubelet_stream(
     }
 }
 
-/// A local port that was free a moment ago.
+/// A local port that refuses connections. It lies below the ports the
+/// system hands out to sockets bound to port 0 and to outgoing connections
+/// (from 32768 on Linux, 49152 on macOS), so unlike one of [`free_port`] no
+/// other socket of the tests can take it. It is checked to refuse.
+pub fn closed_port() -> u16 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    // Test processes running at the same time start at different ports.
+    let seed = std::process::id() % 1000 * 11;
+    for _ in 0..100 {
+        let offset = (seed + NEXT.fetch_add(1, Ordering::Relaxed)) % 12_000;
+        let port = 20_000 + u16::try_from(offset).unwrap();
+        let refused = std::net::TcpStream::connect_timeout(
+            &([127, 0, 0, 1], port).into(),
+            std::time::Duration::from_secs(1),
+        )
+        .is_err_and(|err| err.kind() == std::io::ErrorKind::ConnectionRefused);
+        if refused {
+            return port;
+        }
+    }
+    panic!("no closed port from 20000 on");
+}
+
+/// A local port that was free a moment ago. Another socket, such as the
+/// local end of a connection of a test running in parallel, may take it
+/// before it is bound.
 pub fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
