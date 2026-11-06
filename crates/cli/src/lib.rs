@@ -1,5 +1,6 @@
 //! The kprtfwd command line: everything except the TUI and `daemon run`.
 
+mod json;
 mod table;
 
 use std::collections::{HashMap, HashSet};
@@ -36,7 +37,7 @@ pub enum Command {
         /// Include forwards that are off
         #[arg(long)]
         all: bool,
-        /// Print the full state as JSON
+        /// Print the contexts and forwards as JSON, in the format of the README
         #[arg(long)]
         json: bool,
     },
@@ -228,15 +229,18 @@ fn warn_of_other_version(client: &Client) {
 
 async fn status(all: bool, json: bool) -> Result<ExitCode> {
     let snapshot = connect().await?.snapshot().await?;
+    let shown: Vec<&ForwardView> = snapshot
+        .forwards
+        .iter()
+        .filter(|view| all || view.forward.enabled)
+        .collect();
     if json {
-        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status_json(&snapshot, &shown))?
+        );
     } else {
         print_contexts(&snapshot);
-        let shown: Vec<&ForwardView> = snapshot
-            .forwards
-            .iter()
-            .filter(|view| all || view.forward.enabled)
-            .collect();
         if shown.is_empty() {
             println!("No forward is on. `kprtfwd up <project or words>` switches some on.");
         } else {
@@ -252,6 +256,40 @@ async fn status(all: bool, json: bool) -> Result<ExitCode> {
     } else {
         ExitCode::from(EXIT_NOT_READY)
     })
+}
+
+/// What `status --json` prints: the contexts and `shown`, with the texts of
+/// the table.
+fn status_json<'a>(snapshot: &'a Snapshot, shown: &[&'a ForwardView]) -> json::Status<'a> {
+    json::Status {
+        version: json::VERSION,
+        paused: snapshot.paused,
+        contexts: snapshot
+            .contexts
+            .iter()
+            .map(|context| json::Context {
+                name: &context.name,
+                state: context.state.summary(),
+            })
+            .collect(),
+        forwards: shown
+            .iter()
+            .map(|view| {
+                let forward = &view.forward;
+                json::Forward {
+                    id: forward.id.as_str(),
+                    context: &forward.context,
+                    namespace: &forward.namespace,
+                    service: &forward.service,
+                    remote_port: forward.remote_port,
+                    local_port: forward.local_port,
+                    enabled: forward.enabled,
+                    state: view.state.label(),
+                    info: info(view, &snapshot.context_state(&forward.context)),
+                }
+            })
+            .collect(),
+    }
 }
 
 /// Whether every enabled forward is ready; a paused one counts as ready.
@@ -897,6 +935,60 @@ mod tests {
         assert_eq!(
             prune_scope("staging", false, " shop-* "),
             "context staging, namespaces shop-*"
+        );
+    }
+
+    /// The format scripts rely on; a change here needs a new version.
+    #[test]
+    fn status_json_has_a_fixed_format() {
+        let mut snapshot = snapshot();
+        snapshot.contexts = vec![kprtfwd_proto::ContextView {
+            name: "staging".into(),
+            state: ContextState::Unreachable {
+                since: SystemTime::UNIX_EPOCH,
+                cause: kprtfwd_core::state::NetCause::Dns,
+            },
+        }];
+        snapshot.forwards[0].forward.enabled = true;
+        snapshot.forwards[0].state = ForwardState::WaitingForContext;
+        let shown: Vec<&ForwardView> = snapshot.forwards[..2].iter().collect();
+        let text = serde_json::to_string_pretty(&status_json(&snapshot, &shown)).unwrap();
+        assert_eq!(
+            text,
+            r#"{
+  "version": 1,
+  "paused": false,
+  "contexts": [
+    {
+      "name": "staging",
+      "state": "unreachable (DNS)"
+    }
+  ],
+  "forwards": [
+    {
+      "id": "stg-api",
+      "context": "staging",
+      "namespace": "shop",
+      "service": "api",
+      "remote_port": 80,
+      "local_port": 18080,
+      "enabled": true,
+      "state": "waiting",
+      "info": "API unreachable (DNS)"
+    },
+    {
+      "id": "stg-db",
+      "context": "staging",
+      "namespace": "shop",
+      "service": "mysql",
+      "remote_port": 80,
+      "local_port": 18080,
+      "enabled": false,
+      "state": "off",
+      "info": ""
+    }
+  ]
+}"#
         );
     }
 

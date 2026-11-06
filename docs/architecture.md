@@ -853,7 +853,7 @@ Internal structure:
 | Command | Purpose |
 |---|---|
 | `kprtfwd` | TUI; starts the daemon if needed |
-| `kprtfwd status [--json]` | contexts and forwards with their state |
+| `kprtfwd status [--all] [--json]` | contexts and enabled forwards (with `--all` every forward) with their state; `--json` in the format below |
 | `kprtfwd up <project or words>...` / `down ...` | enable or disable a project, or every forward the words match (as in the TUI filter); `down --all` disables all. Both need words, and an empty word, as an unset variable in a script gives, is wrong usage: it would match every forward |
 | `kprtfwd switch <project>` | enable the project, disable everything else |
 | `kprtfwd pause` / `resume` | global pause |
@@ -863,6 +863,15 @@ Internal structure:
 | `kprtfwd reconnect <context>` | rebuild a context's client, watches and forwards |
 | `kprtfwd daemon status/stop/restart` | daemon control (`daemon run [--foreground]` is internal, or for debugging) |
 | `kprtfwd db list [--db PATH]` | read the database without the daemon; the file is not changed |
+
+`status --json` is the CLI's interface for scripts and is documented in the
+README. It is not the IPC snapshot, whose shape changes with the protocol: an
+object with `version` (1; bumped when a field is removed or changes its
+meaning, not for a new field), `paused`, `contexts` (`name`, and `state` as
+in the header line) and `forwards`, the rows of the table (`id`, `context`,
+`namespace`, `service`, `remote_port`, `local_port`, `enabled`, and `state`
+and `info` as in the STATE and INFO columns). It holds no times. A golden
+test pins it.
 
 Exit codes:
 
@@ -973,14 +982,15 @@ These are shown in the INFO column and by `kprtfwd status`.
   its forward `logging in` while the plugin waits; discovery does not propose a
   port that another process holds on `::1` only; a daemon started with a soft
   limit of 256 open files raises it.
-- **cli:** unit tests for the exit code rules; `kprtfwd/tests/cli.rs` runs the
-  binary the same way: exit code 2 for wrong usage, without starting a
-  daemon, 4 without a daemon, for one that cannot start and for one that
-  closes the connection during a command, 3 while an enabled forward is not
-  ready and 0 once it is paused, `up` and `down` by words and with `--all`,
-  `prune` against a fake API server (declined, confirmed, `-y`, the daemon's
-  current context, a missing file in `KUBECONFIG`), and `logs` with and
-  without `-f`.
+- **cli:** unit tests for the exit code rules, the parsing of `up` and
+  `down` and a golden test of the `status --json` format;
+  `kprtfwd/tests/cli.rs` runs the binary the same way: exit code 2 for wrong
+  usage, without starting a daemon, 4 without a daemon, for one that cannot
+  start and for one that closes the connection during a command, 3 while an
+  enabled forward is not ready and 0 once it is paused, `status --json` with
+  and without `--all`, `up` and `down` by words and with `--all`, `prune`
+  against a fake API server (declined, confirmed, `-y`, the daemon's current
+  context, a missing file in `KUBECONFIG`), and `logs` with and without `-f`.
 - **tui:** key-by-key tests of `App::update`, drawing tests with `TestBackend`
   (also of a lost daemon), tests of the event loop against a fake daemon on
   tokio's paused clock (a lost daemon with its reason and the reconnect, keys

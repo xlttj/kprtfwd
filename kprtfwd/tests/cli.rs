@@ -122,6 +122,65 @@ fn status_exits_with_3_until_every_enabled_forward_is_ready() {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
 }
 
+/// The documented format: the forwards the table shows, with its texts.
+#[test]
+fn status_json_shows_what_the_table_shows() {
+    let home = Home::new();
+    let api = forward("test", "shop", "api", true);
+    let local_port = api.local_port;
+    write_database(
+        &home.db(),
+        &[api, forward("test", "shop", "web", false)],
+        false,
+    );
+    let json = |args: &[&str]| -> serde_json::Value {
+        let output = home.run(args);
+        assert_eq!(output.status.code(), Some(3), "{output:?}");
+        serde_json::from_slice(&output.stdout).expect("JSON")
+    };
+
+    let status = json(&["status", "--json"]);
+    assert_eq!(status["version"], 1);
+    assert_eq!(status["paused"], false);
+    assert_eq!(status["contexts"][0]["name"], "test");
+    assert!(status["contexts"][0]["state"].is_string(), "{status}");
+    let forwards = status["forwards"].as_array().unwrap();
+    assert_eq!(forwards.len(), 1, "{status}");
+    let api = forwards[0].as_object().unwrap();
+    let mut keys: Vec<&str> = api.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "context",
+            "enabled",
+            "id",
+            "info",
+            "local_port",
+            "namespace",
+            "remote_port",
+            "service",
+            "state"
+        ]
+    );
+    assert_eq!(api["id"], "test.shop.api-80");
+    assert_eq!(api["local_port"], local_port);
+    assert_eq!(api["enabled"], true);
+    // Its context is in no kubeconfig.
+    assert_eq!(api["state"], "waiting");
+    assert!(!api["info"].as_str().unwrap().is_empty(), "{status}");
+
+    let status = json(&["status", "--json", "--all"]);
+    let ids: Vec<&str> = status["forwards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["test.shop.api-80", "test.shop.web-80"]);
+    assert_eq!(status["forwards"][1]["state"], "off");
+}
+
 #[test]
 fn up_and_down_switch_the_forwards_that_match() {
     let home = Home::new();

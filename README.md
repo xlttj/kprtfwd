@@ -103,6 +103,38 @@ Words select the forwards that contain every one of them, ignoring case, in
 their ID, context, `namespace/service:port` or local port, for example
 `kprtfwd up shop api`. The TUI filter works the same way.
 
+`kprtfwd status --json` prints the forwards the table shows (with `--all`
+also those that are off) in a format for scripts:
+
+```json
+{
+  "version": 1,
+  "paused": false,
+  "contexts": [
+    { "name": "staging", "state": "ok" }
+  ],
+  "forwards": [
+    {
+      "id": "staging.shop.api-80",
+      "context": "staging",
+      "namespace": "shop",
+      "service": "api",
+      "remote_port": 80,
+      "local_port": 18080,
+      "enabled": true,
+      "state": "waiting",
+      "info": "0/2 pods ready"
+    }
+  ]
+}
+```
+
+`state` and `info` are the STATE and INFO columns; a forward's `state` is
+`ready`, `waiting`, `error`, `paused` or `off`, a context's is the text of the
+header line, e.g. `ok`, `unreachable (DNS)` or `login needed`. `version`
+changes when a field is removed or changes its meaning; new fields may be
+added without it.
+
 Exit codes, for scripts:
 
 | Code | |
