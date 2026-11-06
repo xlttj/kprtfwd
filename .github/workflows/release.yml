@@ -144,11 +144,20 @@ jobs:
 
             ## Installation
 
-            Download the binary for your system, make it executable and put it on your `PATH`:
+            Download the binary for your system (`kprtfwd-darwin-arm64`, `kprtfwd-darwin-amd64`, `kprtfwd-linux-amd64` or `kprtfwd-linux-arm64`), make it executable and put it on your `PATH`, for example:
 
             ```bash
+            curl -fLO https://github.com/xlttj/kprtfwd/releases/download/${{ github.ref_name }}/kprtfwd-darwin-arm64
             chmod +x kprtfwd-darwin-arm64
             mv kprtfwd-darwin-arm64 /usr/local/bin/kprtfwd
+            ```
+
+            The Linux binaries are static and run on any distribution.
+
+            The macOS binaries are not signed. macOS blocks a binary downloaded with a browser when it first starts; a download with `curl` is not affected. After a browser download, remove the quarantine flag before the first start:
+
+            ```bash
+            xattr -d com.apple.quarantine kprtfwd-darwin-arm64
             ```
 
             `checksums.txt` lists the SHA-256 checksum of every binary.

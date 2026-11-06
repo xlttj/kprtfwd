@@ -20,12 +20,27 @@ the git history.
 
 **Release binaries** for macOS (arm64, x86_64) and Linux (x86_64, arm64) are
 attached to the [GitHub releases](https://github.com/xlttj/kprtfwd/releases)
-from version 2.0.0 on; earlier releases contain version 1:
+from version 2.0.0 on; earlier releases contain version 1. Download the one
+for your system (`kprtfwd-darwin-arm64`, `kprtfwd-darwin-amd64`,
+`kprtfwd-linux-amd64` or `kprtfwd-linux-arm64`), for example:
 
 ```bash
+curl -fLO https://github.com/xlttj/kprtfwd/releases/latest/download/kprtfwd-darwin-arm64
 chmod +x kprtfwd-darwin-arm64
 mv kprtfwd-darwin-arm64 /usr/local/bin/kprtfwd
 ```
+
+The Linux binaries are static and run on any distribution.
+
+The macOS binaries are not signed. macOS blocks a binary downloaded with a
+browser when it first starts; a download with `curl` is not affected. After a
+browser download, remove the quarantine flag before the first start:
+
+```bash
+xattr -d com.apple.quarantine kprtfwd-darwin-arm64
+```
+
+`checksums.txt` in each release lists the SHA-256 checksum of every binary.
 
 **From source**, with a stable Rust toolchain:
 
