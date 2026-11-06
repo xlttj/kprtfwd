@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use kprtfwd_core::Forward;
-use kprtfwd_core::state::{Bind, Observed, Target};
+use kprtfwd_core::state::{Bind, ContextState, Observed, Target};
 use kprtfwd_core::svctype::{ServiceType, classify as service_type};
 use kube::Client;
 use tokio::net::{TcpListener, TcpStream};
@@ -254,14 +254,43 @@ async fn run(spec: Forward, context: Arc<Context>, shared: Arc<Shared>) {
                 }
             },
             Ok(()) = context_state.changed() => {
-                if !context_state.borrow().is_healthy() {
+                let state = context_state.borrow_and_update().clone();
+                if !state.is_healthy() {
                     // Opened before the outage, so most likely dead.
                     shared.warm.lock().unwrap().take();
+                }
+                if matches!(state, ContextState::Unreachable { .. }) {
+                    close_connections(&spec, &shared, &mut connections, &state);
                 }
             }
             Some(_) = connections.join_next() => {}
         }
     }
+}
+
+/// Ends the open connections once the context is declared unreachable. They
+/// go over the API server's connection, which is most likely dead and might
+/// not fail for minutes, or ever while neither side sends; closed, clients
+/// such as database pools notice and connect again. A login state does not
+/// close them: a stream that is open stays authorized.
+fn close_connections(
+    spec: &Forward,
+    shared: &Shared,
+    connections: &mut JoinSet<()>,
+    state: &ContextState,
+) {
+    while connections.try_join_next().is_some() {}
+    let open = connections.len();
+    if open == 0 {
+        return;
+    }
+    connections.abort_all();
+    info!(id = %spec.id, open, "connections closed: context unreachable");
+    let plural = if open == 1 { "" } else { "s" };
+    shared.events.push(format!(
+        "{open} connection{plural} closed: API server {}",
+        state.summary()
+    ));
 }
 
 /// Binds the local port, retrying while it is busy.
@@ -443,7 +472,7 @@ mod tests {
 
     use k8s_openapi::api::discovery::v1::EndpointSlice;
     use kprtfwd_core::ForwardId;
-    use kprtfwd_core::state::{ContextState, NetCause};
+    use kprtfwd_core::state::NetCause;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
@@ -756,6 +785,50 @@ mod tests {
                 "connection closed: API server unreachable (refused)",
             ]
         );
+    }
+
+    /// Open connections go over a connection to the API server that is most
+    /// likely dead once the context is declared unreachable, so they are
+    /// closed then. A login state leaves them open.
+    #[tokio::test]
+    async fn open_connections_close_when_the_context_turns_unreachable() {
+        let test = Test::start("db", 5432, &[("db-0", true)], echo).await;
+        let mut first = TcpStream::connect(("127.0.0.1", test.port)).await.unwrap();
+        first.write_all(b"a").await.unwrap();
+        assert_eq!(read_answer(&mut first, "a").await, "db-0#1:a");
+        let mut second = TcpStream::connect(("127.0.0.1", test.port)).await.unwrap();
+        second.write_all(b"b").await.unwrap();
+        assert_eq!(read_answer(&mut second, "b").await, "db-0#2:b");
+
+        test.context.force_state(ContextState::AuthFailed {
+            since: SystemTime::now(),
+            message: "token expired".into(),
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        first.write_all(b"c").await.unwrap();
+        assert_eq!(read_answer(&mut first, "c").await, "db-0#1:c");
+
+        test.context.force_state(unreachable());
+        for socket in [&mut first, &mut second] {
+            assert_eq!(read_answer(socket, "never").await, "", "not closed");
+        }
+        test.wait("no connection", |t| {
+            t.observe().active_conns == 0 && t.open_streams().is_empty()
+        })
+        .await;
+        let closed: Vec<String> = test
+            .events()
+            .into_iter()
+            .filter(|message| message.contains("closed"))
+            .collect();
+        assert_eq!(
+            closed,
+            ["2 connections closed: API server unreachable (refused)"]
+        );
+        assert_eq!(test.handle.last_error(), None);
+
+        test.context.force_state(healthy());
+        assert_eq!(test.send("d").await, "db-0#3:d");
     }
 
     #[tokio::test]

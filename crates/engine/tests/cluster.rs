@@ -216,6 +216,49 @@ async fn hostname_at(host: &str, port: u16) -> Result<String, String> {
         .map_err(|_| "no answer within 15 s".to_owned())?
 }
 
+/// `GET /` on a connection that stays open afterwards, as a database client
+/// keeps its connections; the pod name whoami answers with.
+async fn hostname_on(stream: &mut TcpStream) -> Result<String, String> {
+    let request = async {
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: whoami\r\n\r\n")
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut response = Vec::new();
+        let mut chunk = [0; 4096];
+        // The head, then exactly the body, so nothing is left unread.
+        let body_at = loop {
+            if let Some(at) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+                break at + 4;
+            }
+            match stream.read(&mut chunk).await.map_err(|e| e.to_string())? {
+                0 => return Err("closed before the answer".to_owned()),
+                n => response.extend_from_slice(&chunk[..n]),
+            }
+        };
+        let head = String::from_utf8_lossy(&response[..body_at]).to_lowercase();
+        let length: usize = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length: "))
+            .and_then(|length| length.trim().parse().ok())
+            .ok_or_else(|| format!("no content-length in {head:?}"))?;
+        while response.len() < body_at + length {
+            match stream.read(&mut chunk).await.map_err(|e| e.to_string())? {
+                0 => return Err("closed in the body".to_owned()),
+                n => response.extend_from_slice(&chunk[..n]),
+            }
+        }
+        String::from_utf8_lossy(&response[body_at..])
+            .lines()
+            .find_map(|line| line.strip_prefix("Hostname: "))
+            .map(str::to_owned)
+            .ok_or_else(|| "no hostname in the answer".to_owned())
+    };
+    timeout(Duration::from_secs(15), request)
+        .await
+        .map_err(|_| "no answer within 15 s".to_owned())?
+}
+
 async fn wait_for(
     engine: &Engine,
     forward: &Forward,
@@ -385,6 +428,14 @@ async fn recovers_from_an_api_server_outage() {
     engine.reconcile(std::slice::from_ref(&forward)).await;
     wait_for(&engine, &forward, "ready", Duration::from_secs(60), ready).await;
     hostname(port).await.expect("request before the outage");
+    // A connection that is open when the outage starts, as a database
+    // client keeps one.
+    let mut open = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    hostname_on(&mut open)
+        .await
+        .expect("request on a connection that stays open");
 
     // Freeze the API server: no answers at all, like a VPN that went away.
     // Detection takes about 15 s: two probe timeouts in a row.
@@ -400,7 +451,21 @@ async fn recovers_from_an_api_server_outage() {
     .await;
     eprintln!("outage detected after {detected:?}");
 
-    // Meanwhile connections are closed at once instead of hanging.
+    // The open connection is closed with the detection instead of hanging,
+    // so its client can notice and connect again.
+    let closed = timeout(Duration::from_secs(2), open.read(&mut [0; 1])).await;
+    assert!(
+        matches!(closed, Ok(Ok(0) | Err(_))),
+        "the open connection was not closed: {closed:?}"
+    );
+    let seen = events(&engine, &forward);
+    assert!(
+        seen.iter()
+            .any(|message| message.starts_with("1 connection closed: API server unreachable")),
+        "{seen:?}"
+    );
+
+    // Meanwhile new connections are closed at once instead of hanging.
     let started = Instant::now();
     let during = hostname(port).await;
     let took = started.elapsed();

@@ -350,7 +350,12 @@ becomes a forward event and shows up in the TUI.
 
 **Liveness.** Every connection runs as a task owned by the forward actor, so the
 actor always knows whether it is still alive; disabling the forward ends them all.
-A warm stream waits in a small keeper task that reads from it: a close, an error
+So does an outage: once the context is declared unreachable, the open connections
+are closed. Their streams go over a connection to the API server that is most
+likely dead and might not fail for minutes, or never while neither side sends;
+closed, their clients notice and connect again, as with kubectl, which exits when
+it loses the API server. A login state does not close them, as an open stream
+stays authorized. A warm stream waits in a small keeper task that reads from it: a close, an error
 or unexpected data ends it. A stream that dies silently is caught by the 60 s
 maximum age and by the context's health probe. WebSocket pings are not used.
 
@@ -766,7 +771,8 @@ These are shown in the INFO column and by `kprtfwd status`.
   - the watch cache's lookup over hand-built Services and EndpointSlices
     (several slices, dual stack, unknown readiness, named target ports), and
     the forward actor through a fake kubelet: pod choice and the move to
-    another pod, connections closed at once while not ready, a refused
+    another pod, connections closed at once while not ready, open connections
+    closed once the context is unreachable but not while it logs in, a refused
     port-forward, the error channel, warm streams and when they are dropped,
     the `::1` listener and a busy port;
   - cluster tests in `crates/engine/tests/cluster.rs`, run in CI against kind
@@ -779,8 +785,9 @@ These are shown in the INFO column and by `kprtfwd status`.
     - scaled to 0, connections close at once and the state is
       `WaitingForPods`; scaled up, it works again without a restart;
     - with `KPRTFWD_TEST_PAUSE`/`RESUME` (`docker pause` of the kind control
-      plane): the outage is detected (about 15 s; the test allows 25 s),
-      connections close at once meanwhile, and the forward is ready again
+      plane): the outage is detected (about 15 s; the test allows 25 s), a
+      connection open since before the outage is closed with the detection,
+      new connections close at once meanwhile, and the forward is ready again
       about 2 s after the resume (the test allows 10 s). A failing test still
       resumes the control plane.
 - **proto:** serde round trips and the protocol version check.
@@ -846,7 +853,9 @@ staging: pod deleted while in use (60 of 60 requests answered), scale to 0 and
 back, busy port, missing service, and a TCP proxy to the API server that was
 frozen and killed (detected after about 15 s and at once, recovered within a
 second; a request during the undetected phase ends after the 10 s open
-timeout).
+timeout). Since 2026-11-06, connections that are open when an outage is detected
+are closed, including one that took a warm stream in the undetected phase and
+so skipped the open timeout.
 
 Phase 2 runs locally: the TUI, CRUD for forwards and projects, discovery, prune
 and the event view. Every v1 feature has a counterpart except grouping, which
