@@ -185,8 +185,13 @@ Main dependencies:
 
 - **Directory.** `~/.config/kprtfwd`, or `$XDG_CONFIG_HOME/kprtfwd`, holds
   `config.toml`, the database, `daemon.sock`, `daemon.pid`, `daemon.lock` and
-  `logs/`. The directory has mode 0700 and the socket 0600. `KPRTFWD_HOME`
-  replaces the directory, e.g. for tests. Unix socket paths are limited to
+  `logs/`. The directory has mode 0700 and the socket 0600: whoever can write
+  there could replace the socket or plant a database whose forwards run with
+  this user's credentials. The daemon refuses a directory that belongs to
+  another user, narrows one that others can reach to 0700 (a directory made
+  by hand, by a dotfiles manager or under `/tmp`), binds the socket under
+  umask 077, and refuses connections of another user (by the peer's uid).
+  `KPRTFWD_HOME` replaces the directory, e.g. for tests. Unix socket paths are limited to
   about 100 bytes; the CLI refuses longer ones and names `KPRTFWD_HOME` as the
   way out.
 - **Settings.** `config.toml`; the daemon writes a commented template on its

@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::fs::{self, DirBuilder, File, TryLockError};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24,7 +24,8 @@ use kprtfwd_proto::{
     LastError, PROTOCOL_VERSION, ProjectView, Request, Response, ServerMessage, Snapshot,
     read_frame, stop_daemon, write_message,
 };
-use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+use rustix::fs::Mode;
+use rustix::process::{Resource, Rlimit, geteuid, getrlimit, setrlimit, umask};
 use tokio::io::BufReader;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
@@ -59,7 +60,11 @@ pub fn run(options: Options) -> Result<()> {
         .mode(0o700)
         .create(&data_dir)
         .with_context(|| format!("create {}", data_dir.display()))?;
+    let narrowed = secure_data_dir(&data_dir, geteuid().as_raw())?;
     let _log_guard = init_logging(&options, &data_dir)?;
+    if let Some(mode) = narrowed {
+        info!(dir = %data_dir.display(), from = format!("{mode:o}"), "data directory narrowed to 700");
+    }
     raise_open_files_limit();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -81,6 +86,31 @@ pub fn run(options: Options) -> Result<()> {
         tracing::error!("{err:#}");
     }
     result
+}
+
+/// Makes sure that only this user (`uid`) can reach the data directory:
+/// it must be theirs, and its mode is narrowed to 0700. Another user who
+/// could write there could replace the socket or plant a database, whose
+/// forwards would then run with this user's kubeconfig credentials. A
+/// directory created by hand, by a dotfiles manager or under `/tmp` for
+/// `KPRTFWD_HOME` may have another mode. Returns the mode it had if it was
+/// narrowed.
+fn secure_data_dir(dir: &Path, uid: u32) -> Result<Option<u32>> {
+    let metadata = fs::metadata(dir).with_context(|| format!("read {}", dir.display()))?;
+    if metadata.uid() != uid {
+        bail!(
+            "{} belongs to uid {}, not to this user (uid {uid}); use a directory of your own",
+            dir.display(),
+            metadata.uid()
+        );
+    }
+    let mode = metadata.mode() & 0o7777;
+    if mode == 0o700 {
+        return Ok(None);
+    }
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("narrow the mode of {} to 700", dir.display()))?;
+    Ok(Some(mode))
 }
 
 /// Takes `daemon.lock` in the data directory, which a daemon holds from
@@ -367,7 +397,12 @@ async fn bind_socket(path: &Path) -> Result<Option<UnixListener>> {
             Err(err) => bail!("cannot use {}: {err}", path.display()),
         }
     }
-    let listener = match UnixListener::bind(path) {
+    // Created with mode 0700, never open to others before the chmod below.
+    // Other threads that create files meanwhile only get stricter modes.
+    let previous = umask(Mode::RWXG | Mode::RWXO);
+    let bound = UnixListener::bind(path);
+    umask(previous);
+    let listener = match bound {
         Ok(listener) => listener,
         Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
             info!("another daemon started at the same time");
@@ -445,6 +480,19 @@ async fn serve_client(
     tuis: Arc<Tuis>,
     _count: ClientCount,
 ) {
+    // Only processes of this user can reach the socket in its directory;
+    // checked again in case the modes were circumvented.
+    match stream.peer_cred() {
+        Ok(peer) if peer.uid() == geteuid().as_raw() => {}
+        Ok(peer) => {
+            warn!(uid = peer.uid(), "refused a connection of another user");
+            return;
+        }
+        Err(err) => {
+            warn!(%err, "cannot tell whose connection it is; refused");
+            return;
+        }
+    }
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
@@ -1000,6 +1048,28 @@ mod tests {
             .iter()
             .map(|(ns, name)| ((*ns).to_owned(), (*name).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn the_data_dir_must_be_the_users_and_is_narrowed_to_700() {
+        let dir = tempfile::tempdir().unwrap();
+        let uid = geteuid().as_raw();
+        let mode = || fs::metadata(dir.path()).unwrap().mode() & 0o7777;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o775)).unwrap();
+        assert_eq!(secure_data_dir(dir.path(), uid).unwrap(), Some(0o775));
+        assert_eq!(mode(), 0o700);
+        assert_eq!(secure_data_dir(dir.path(), uid).unwrap(), None);
+
+        let err = secure_data_dir(dir.path(), uid + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.ends_with(&format!(
+                "belongs to uid {uid}, not to this user (uid {}); use a directory of your own",
+                uid + 1
+            )),
+            "{err}"
+        );
     }
 
     #[test]

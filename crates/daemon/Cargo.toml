@@ -11,11 +11,14 @@ kprtfwd-core.workspace = true
 kprtfwd-engine.workspace = true
 kprtfwd-proto.workspace = true
 anyhow.workspace = true
-rustix = { workspace = true, features = ["process"] }
+rustix = { workspace = true, features = ["fs", "process"] }
 tokio.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

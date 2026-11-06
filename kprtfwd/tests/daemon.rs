@@ -416,6 +416,24 @@ async fn bad_input_is_answered_and_keeps_the_connection() {
     assert!(!enabled(&home.db()));
 }
 
+/// The daemon narrows a data directory others can reach to 0700, and its
+/// socket is 0600.
+#[tokio::test]
+async fn the_data_directory_and_socket_are_the_users_only() {
+    let home = Home::new();
+    std::fs::create_dir_all(home.data_dir()).unwrap();
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    std::fs::set_permissions(home.data_dir(), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    home.start_daemon();
+    assert_eq!(mode(&home.data_dir()), 0o700);
+    assert_eq!(mode(&home.socket()), 0o600);
+    assert!(daemon_log(&home).contains("data directory narrowed to 700"));
+    Client::connect(&home.socket())
+        .await
+        .expect("serves its user");
+}
+
 /// Shortens the daemon's idle exit, in milliseconds.
 const IDLE_EXIT: &str = "KPRTFWD_IDLE_EXIT_MS";
 
