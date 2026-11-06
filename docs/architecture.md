@@ -736,8 +736,10 @@ These are shown in the INFO column and by `kprtfwd status`.
     - scaled to 0, connections close at once and the state is
       `WaitingForPods`; scaled up, it works again without a restart;
     - with `KPRTFWD_TEST_PAUSE`/`RESUME` (`docker pause` of the kind control
-      plane): the outage is detected (about 15 s), connections close at once
-      meanwhile, and the forward is ready again about 2 s after the resume.
+      plane): the outage is detected (about 15 s; the test allows 25 s),
+      connections close at once meanwhile, and the forward is ready again
+      about 2 s after the resume (the test allows 10 s). A failing test still
+      resumes the control plane.
 - **proto:** serde round trips and the protocol version check.
 - **daemon:** `kprtfwd/tests/daemon.rs` runs the real binary with `HOME` set to
   a temporary directory: quitting the last TUI switches the forwards off and

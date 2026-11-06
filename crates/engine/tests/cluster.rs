@@ -258,6 +258,29 @@ fn shell(command: &str) {
     assert!(status.success(), "{command} failed");
 }
 
+/// Runs the resume command when dropped, so that a failed check, wherever it
+/// panics, never leaves the cluster paused.
+struct Resume<'a>(Option<&'a str>);
+
+impl Resume<'_> {
+    /// Resumes now and checks that it worked.
+    fn now(mut self) {
+        if let Some(command) = self.0.take() {
+            shell(command);
+        }
+    }
+}
+
+impl Drop for Resume<'_> {
+    fn drop(&mut self) {
+        if let Some(command) = self.0.take() {
+            let _ = std::process::Command::new("sh")
+                .args(["-c", command])
+                .status();
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn follows_pod_restarts_and_scaling() {
     let Some(cluster) = TestCluster::new("kprtfwd-it-pods").await else {
@@ -364,27 +387,29 @@ async fn recovers_from_an_api_server_outage() {
     hostname(port).await.expect("request before the outage");
 
     // Freeze the API server: no answers at all, like a VPN that went away.
+    // Detection takes about 15 s: two probe timeouts in a row.
+    let paused = Resume(Some(&resume));
     shell(&pause);
     let detected = wait_for(
         &engine,
         &forward,
         "waiting for the context",
-        Duration::from_secs(40),
+        Duration::from_secs(25),
         |s| *s == ForwardState::WaitingForContext,
     )
     .await;
     eprintln!("outage detected after {detected:?}");
 
-    // Meanwhile connections are closed at once instead of hanging. Resume
-    // before checking, so a failure does not leave the cluster frozen.
+    // Meanwhile connections are closed at once instead of hanging.
     let started = Instant::now();
     let during = hostname(port).await;
     let took = started.elapsed();
-    shell(&resume);
+    paused.now();
     assert!(during.is_err(), "a request got through during the outage");
     assert!(took < Duration::from_secs(2), "closing took {took:?}");
 
-    let recovered = wait_for(&engine, &forward, "ready", Duration::from_secs(60), ready).await;
+    // About 2 s: the next probe, every 2 s while unreachable.
+    let recovered = wait_for(&engine, &forward, "ready", Duration::from_secs(10), ready).await;
     eprintln!("recovered after {recovered:?}");
     let mut last = Err(String::new());
     for _ in 0..20 {
