@@ -48,7 +48,6 @@ pub struct Login {
 
 struct Token {
     header: HeaderValue,
-    expires: Option<SystemTime>,
     /// When to log in again; see [`renewal`].
     renew: Option<SystemTime>,
 }
@@ -459,7 +458,6 @@ fn parse(stdout: &[u8]) -> Result<Token, String> {
     header.set_sensitive(true);
     Ok(Token {
         header,
-        expires,
         renew: renewal(expires, SystemTime::now()),
     })
 }
@@ -701,15 +699,16 @@ mod tests {
         .unwrap();
         assert_eq!(token.header, "Bearer abc");
         assert!(token.header.is_sensitive());
+        // A minute before it expires.
         assert_eq!(
-            token.expires,
+            token.renew,
             Some(SystemTime::from(
-                "2030-01-02T03:04:05Z".parse::<jiff::Timestamp>().unwrap()
+                "2030-01-02T03:03:05Z".parse::<jiff::Timestamp>().unwrap()
             ))
         );
 
         let token = parse(br#"{"status":{"token":"abc"}}"#).unwrap();
-        assert_eq!(token.expires, None);
+        assert_eq!(token.renew, None);
 
         let problem = |stdout: &[u8]| parse(stdout).err().unwrap();
         assert!(
@@ -729,7 +728,6 @@ mod tests {
         let set = |renew| {
             *login.token.write().unwrap() = Some(Token {
                 header: HeaderValue::from_static("Bearer abc"),
-                expires: None,
                 renew,
             });
         };
