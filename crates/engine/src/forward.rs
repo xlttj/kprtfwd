@@ -46,13 +46,24 @@ impl ForwardHandle {
         Self { spec, shared, task }
     }
 
-    /// Closes the listeners and all connections.
+    /// Tells the forward's task to close the listeners and all connections.
+    /// They are closed once a worker thread gets to the task, which may be
+    /// after a forward started next; [`ForwardHandle::close`] waits for it.
     pub fn stop(&self) {
         if !self.shared.stopped.swap(true, Ordering::Relaxed) {
             self.shared.events.push("stopped");
         }
         self.shared.warm.lock().unwrap().take();
         self.task.abort();
+    }
+
+    /// Stops the forward and waits until its listeners and connections are
+    /// closed, so that its port is free for the next forward.
+    pub async fn close(mut self) {
+        self.stop();
+        // An aborted task drops its future, which owns the listeners,
+        // before its handle completes.
+        let _ = (&mut self.task).await;
     }
 
     pub fn observe(&self, context: &Context) -> Observed {

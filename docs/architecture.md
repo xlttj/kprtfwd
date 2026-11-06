@@ -293,6 +293,9 @@ There is one actor per enabled forward.
   clients that resolve `localhost` may try `::1` first.
 - The listeners stay bound while the forward is enabled, even when the context is
   unreachable. That keeps the port reserved.
+- A forward that starts again (an edit, a reconnect, a kubeconfig change)
+  starts only once the old one has closed its listeners, so it does not find
+  its own port busy.
 - While the forward is not ready, incoming connections are closed immediately and
   the reason is recorded as a forward event.
 
@@ -786,7 +789,8 @@ These are shown in the INFO column and by `kprtfwd status`.
     client's own stack, which sends the kubeconfig's token and impersonation on
     requests and port-forwards and leaves a proxy to kube;
     `Engine::reconcile` and `reconnect` with a kubeconfig of their own, never
-    `~/.kube/config`; kubeconfig fingerprints (maps read in any order, the
+    `~/.kube/config`, and a forward they start again on its port, which
+    binds it at the first attempt; kubeconfig fingerprints (maps read in any order, the
     default namespace), merging with missing files, and the watcher on
     files in a temporary directory (a change read only once settled, a
     truncated or half-written file never used, a failed read tried again with

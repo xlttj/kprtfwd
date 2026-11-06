@@ -55,20 +55,25 @@ impl Engine {
     }
 
     /// Runs exactly `wanted`: starts what is missing, stops what is no longer
-    /// wanted, and restarts forwards whose settings changed.
+    /// wanted, and restarts forwards whose settings changed. A restarted
+    /// forward starts once the old one has closed its listeners, so it finds
+    /// its port free.
     pub async fn reconcile(&mut self, wanted: &[Forward]) {
         let wanted_by_id: HashMap<&ForwardId, &Forward> =
             wanted.iter().map(|f| (&f.id, f)).collect();
-        self.forwards.retain(|id, handle| {
-            let keep = wanted_by_id
-                .get(id)
-                .is_some_and(|f| same_settings(f, &handle.spec));
-            if !keep {
-                handle.stop();
+        let stopped: Vec<ForwardHandle> = self
+            .forwards
+            .extract_if(|id, handle| {
+                !wanted_by_id
+                    .get(id)
+                    .is_some_and(|f| same_settings(f, &handle.spec))
+            })
+            .map(|(id, handle)| {
                 info!(%id, "forward stopped");
-            }
-            keep
-        });
+                handle
+            })
+            .collect();
+        close(stopped).await;
 
         let needed: HashSet<&str> = wanted.iter().map(|f| f.context.as_str()).collect();
         self.contexts.retain(|name, context| {
@@ -124,8 +129,12 @@ impl Engine {
     ) {
         if let Some(old) = self.contexts.remove(context) {
             old.stop();
-            self.forwards
-                .retain(|_, handle| handle.spec.context != context);
+            let stopped = self
+                .forwards
+                .extract_if(|_, handle| handle.spec.context == context)
+                .map(|(_, handle)| handle)
+                .collect();
+            close(stopped).await;
         }
         if wanted.iter().any(|forward| forward.context == context) {
             self.start_context(context, kubeconfig).await;
@@ -195,6 +204,11 @@ impl Engine {
     }
 }
 
+/// Stops forwards and waits until their listeners are closed.
+async fn close(forwards: Vec<ForwardHandle>) {
+    futures::future::join_all(forwards.into_iter().map(ForwardHandle::close)).await;
+}
+
 /// Whether a running forward can keep running with `wanted`'s settings.
 fn same_settings(wanted: &Forward, running: &Forward) -> bool {
     wanted.context == running.context
@@ -207,6 +221,8 @@ fn same_settings(wanted: &Forward, running: &Forward) -> bool {
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
+
+    use kprtfwd_core::state::Bind;
 
     use super::*;
     use crate::fake::{closed_port, free_port};
@@ -431,6 +447,67 @@ contexts:
             engine.context_state("staging"),
             Some(ContextState::ConfigError { .. })
         ));
+    }
+
+    /// The outcome of the first attempt to bind the port of the forward
+    /// running as `id` now.
+    async fn first_bind(engine: &Engine, id: &ForwardId) -> Bind {
+        let started = Instant::now();
+        loop {
+            let bind = engine.observe(id).unwrap().bind;
+            if bind != Bind::Pending {
+                return bind;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "no bind attempt"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// A forward started again on its port binds it at the first attempt:
+    /// the old forward's listeners are closed before. The engine runs in a
+    /// worker task, as in the daemon, where tokio tends to run a task just
+    /// spawned before the one aborted just before it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restarted_forward_binds_its_port_at_once() {
+        tokio::spawn(async {
+            let mut engine = Engine::with_kubeconfig(kubeconfig());
+            // Another test's socket may take the free port first.
+            let mut api = forward("staging", "shop", "api");
+            for _ in 0..5 {
+                api.local_port = free_port();
+                engine.reconcile(std::slice::from_ref(&api)).await;
+                if first_bind(&engine, &api.id).await == Bind::Bound {
+                    break;
+                }
+            }
+            assert_eq!(engine.observe(&api.id).unwrap().bind, Bind::Bound);
+
+            let edited = Forward {
+                namespace: "web".into(),
+                ..api.clone()
+            };
+            for round in 0..10 {
+                let wanted = if round % 2 == 0 { &edited } else { &api };
+                engine.reconcile(std::slice::from_ref(wanted)).await;
+                assert_eq!(first_bind(&engine, &api.id).await, Bind::Bound, "edit");
+                engine
+                    .reconnect("staging", std::slice::from_ref(wanted), None)
+                    .await;
+                assert_eq!(first_bind(&engine, &api.id).await, Bind::Bound, "reconnect");
+            }
+            let busy: Vec<String> = engine
+                .forward_events(&api.id)
+                .into_iter()
+                .map(|event| event.message)
+                .filter(|message| message.contains("busy"))
+                .collect();
+            assert!(busy.is_empty(), "{busy:?}");
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
