@@ -187,8 +187,13 @@ impl TestCluster {
 
 /// `GET /` through the forward; the pod name whoami answers with.
 async fn hostname(port: u16) -> Result<String, String> {
+    hostname_at("127.0.0.1", port).await
+}
+
+/// [`hostname`] through the forward's listener on `host`.
+async fn hostname_at(host: &str, port: u16) -> Result<String, String> {
     let request = async {
-        let mut stream = TcpStream::connect(("127.0.0.1", port))
+        let mut stream = TcpStream::connect((host, port))
             .await
             .map_err(|e| e.to_string())?;
         stream
@@ -236,6 +241,15 @@ fn ready(state: &ForwardState) -> bool {
     matches!(state, ForwardState::Ready { .. })
 }
 
+/// The forward's events.
+fn events(engine: &Engine, forward: &Forward) -> Vec<String> {
+    engine
+        .forward_events(&forward.id)
+        .into_iter()
+        .map(|event| event.message)
+        .collect()
+}
+
 fn shell(command: &str) {
     let status = std::process::Command::new("sh")
         .args(["-c", command])
@@ -256,10 +270,14 @@ async fn follows_pod_restarts_and_scaling() {
     engine.reconcile(std::slice::from_ref(&forward)).await;
     wait_for(&engine, &forward, "ready", Duration::from_secs(60), ready).await;
 
-    // Connections stay on one pod.
+    // Connections stay on one pod, also those to ::1.
     let first = hostname(port).await.expect("first request");
     for _ in 0..5 {
         assert_eq!(hostname(port).await.expect("request"), first);
+    }
+    if std::net::TcpListener::bind("[::1]:0").is_ok() {
+        let pod = hostname_at("::1", port).await.expect("request to ::1");
+        assert_eq!(pod, first);
     }
 
     // When that pod goes, the forward moves to the other one by itself.
@@ -280,9 +298,19 @@ async fn follows_pod_restarts_and_scaling() {
         }
         sleep(Duration::from_millis(200)).await;
     }
-    assert!(moved_to.is_some(), "still on {first}");
+    let moved_to = moved_to.unwrap_or_else(|| panic!("still on {first}"));
     // Requests in the moment the pod stops may fail; there must not be more.
     assert!(failures <= 3, "{failures} failed requests");
+    let seen = events(&engine, &forward);
+    assert!(
+        seen.contains(&format!("listening on port {port}")),
+        "{seen:?}"
+    );
+    assert!(seen.contains(&format!("pod {first}")), "{seen:?}");
+    assert!(
+        seen.contains(&format!("pod {first} gone, now {moved_to}")),
+        "{seen:?}"
+    );
 
     // Without pods, connections are closed at once and the state says why.
     cluster.scale(0).await;
@@ -300,6 +328,12 @@ async fn follows_pod_restarts_and_scaling() {
         started.elapsed() < Duration::from_secs(2),
         "closing took {:?}",
         started.elapsed()
+    );
+    let seen = events(&engine, &forward);
+    assert!(
+        seen.iter()
+            .any(|message| message.starts_with("connection closed: 0/")),
+        "{seen:?}"
     );
 
     // Scaled up again, the same forward works without a restart.

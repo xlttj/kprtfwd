@@ -180,6 +180,41 @@ impl NamespaceCache {
     }
 }
 
+#[cfg(test)]
+impl NamespaceCache {
+    /// A cache whose listing is these objects, without watches.
+    pub(crate) fn listed(
+        namespace: &str,
+        services: Vec<Service>,
+        slices: Vec<EndpointSlice>,
+    ) -> Arc<Self> {
+        let cache = Self::new(namespace);
+        cache.set_services(services);
+        cache.set_slices(slices);
+        cache
+    }
+
+    pub(crate) fn set_services(&self, services: Vec<Service>) {
+        fill(&self.services, services);
+    }
+
+    pub(crate) fn set_slices(&self, slices: Vec<EndpointSlice>) {
+        fill(&self.slices, slices);
+    }
+}
+
+/// Replaces the objects, as a full listing does.
+#[cfg(test)]
+fn fill<K: Resource>(objects: &Shared<K>, items: Vec<K>) {
+    let mut objects = objects.write().unwrap();
+    objects.items = items
+        .into_iter()
+        .map(|object| (object.name_any(), Arc::new(object)))
+        .collect();
+    objects.ready = true;
+    objects.error = None;
+}
+
 fn count(n: usize) -> u16 {
     u16::try_from(n).unwrap_or(u16::MAX)
 }
@@ -248,5 +283,245 @@ where
                 objects.error = Some(failure);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kprtfwd_core::state::NetCause;
+    use serde_json::json;
+
+    use super::*;
+    use crate::fake::{service, slice};
+
+    fn endpoint(pod: &str, port: u16) -> Endpoint {
+        Endpoint {
+            pod: pod.into(),
+            port,
+        }
+    }
+
+    fn ready_pods(ready: u16, total: u16) -> Target {
+        Target::Endpoints { ready, total }
+    }
+
+    #[test]
+    fn finds_the_ready_pods_of_a_service_port_across_slices() {
+        let cache = NamespaceCache::listed(
+            "shop",
+            vec![service("api", &[("http", 80), ("metrics", 9090)])],
+            vec![
+                slice(
+                    "api-1",
+                    "api",
+                    &[("http", 8080), ("metrics", 9100)],
+                    &[("api-1", Some(true)), ("api-0", Some(true))],
+                ),
+                slice(
+                    "api-2",
+                    "api",
+                    &[("http", 8080), ("metrics", 9100)],
+                    &[("api-2", Some(true))],
+                ),
+            ],
+        );
+        assert_eq!(
+            cache.endpoints("api", 80),
+            Ok(vec![
+                endpoint("api-0", 8080),
+                endpoint("api-1", 8080),
+                endpoint("api-2", 8080)
+            ])
+        );
+        // Another service port, another container port.
+        assert_eq!(
+            cache.endpoints("api", 9090).unwrap()[0],
+            endpoint("api-0", 9100)
+        );
+        assert_eq!(cache.target("api", 80), ready_pods(3, 3));
+    }
+
+    #[test]
+    fn dual_stack_slices_list_each_pod_once() {
+        let mut v6 = slice("api-v6", "api", &[("http", 8080)], &[("api-0", Some(true))]);
+        v6.address_type = "IPv6".into();
+        let cache = NamespaceCache::listed(
+            "shop",
+            vec![service("api", &[("http", 80)])],
+            vec![
+                slice("api-v4", "api", &[("http", 8080)], &[("api-0", Some(true))]),
+                v6,
+            ],
+        );
+        assert_eq!(
+            cache.endpoints("api", 80),
+            Ok(vec![endpoint("api-0", 8080)])
+        );
+        assert_eq!(cache.target("api", 80), ready_pods(1, 1));
+    }
+
+    #[test]
+    fn unknown_readiness_counts_as_ready_and_unready_pods_count_only_in_total() {
+        let cache = NamespaceCache::listed(
+            "shop",
+            vec![service("api", &[("http", 80)])],
+            vec![slice(
+                "api",
+                "api",
+                &[("http", 8080)],
+                &[("api-0", None), ("api-1", Some(false))],
+            )],
+        );
+        assert_eq!(
+            cache.endpoints("api", 80),
+            Ok(vec![endpoint("api-0", 8080)])
+        );
+        assert_eq!(cache.target("api", 80), ready_pods(1, 2));
+
+        // Only terminating pods left.
+        cache.set_slices(vec![slice(
+            "api",
+            "api",
+            &[("http", 8080)],
+            &[("api-0", Some(false)), ("api-1", Some(false))],
+        )]);
+        assert_eq!(cache.endpoints("api", 80), Err(ready_pods(0, 2)));
+        assert_eq!(cache.target("api", 80), ready_pods(0, 2));
+        // No pods at all.
+        cache.set_slices(vec![]);
+        assert_eq!(cache.endpoints("api", 80), Err(ready_pods(0, 0)));
+    }
+
+    /// A named target port can mean another container port per pod, as in a
+    /// rollout that changes it; each slice says which.
+    #[test]
+    fn named_target_ports_resolve_per_slice() {
+        let cache = NamespaceCache::listed(
+            "shop",
+            vec![service("api", &[("http", 80)])],
+            vec![
+                slice(
+                    "api-old",
+                    "api",
+                    &[("http", 8080)],
+                    &[("api-old", Some(true))],
+                ),
+                slice(
+                    "api-new",
+                    "api",
+                    &[("http", 8081)],
+                    &[("api-new", Some(true))],
+                ),
+            ],
+        );
+        assert_eq!(
+            cache.endpoints("api", 80),
+            Ok(vec![endpoint("api-new", 8081), endpoint("api-old", 8080)])
+        );
+    }
+
+    #[test]
+    fn an_unnamed_port_matches_the_unnamed_slice_port() {
+        let cache = NamespaceCache::listed(
+            "shop",
+            vec![service("api", &[("", 80)])],
+            vec![slice("api", "api", &[("", 8080)], &[("api-0", Some(true))])],
+        );
+        assert_eq!(
+            cache.endpoints("api", 80),
+            Ok(vec![endpoint("api-0", 8080)])
+        );
+    }
+
+    #[test]
+    fn ignores_other_services_ports_and_targets() {
+        let mut node = slice(
+            "api-node",
+            "api",
+            &[("http", 8080)],
+            &[("node-0", Some(true))],
+        );
+        node.endpoints.as_mut().unwrap()[0]
+            .target_ref
+            .as_mut()
+            .unwrap()
+            .kind = Some("Node".into());
+        let no_target: EndpointSlice = serde_json::from_value(json!({
+            "metadata": {
+                "name": "api-ip",
+                "labels": {"kubernetes.io/service-name": "api"},
+            },
+            "addressType": "IPv4",
+            "ports": [{"name": "http", "port": 8080}],
+            "endpoints": [{"addresses": ["10.0.0.9"], "conditions": {"ready": true}}],
+        }))
+        .unwrap();
+        let cache = NamespaceCache::listed(
+            "shop",
+            vec![
+                service("api", &[("http", 80)]),
+                service("web", &[("http", 80)]),
+            ],
+            vec![
+                slice("api", "api", &[("http", 8080)], &[("api-0", Some(true))]),
+                slice("web", "web", &[("http", 8080)], &[("web-0", Some(true))]),
+                slice(
+                    "api-grpc",
+                    "api",
+                    &[("grpc", 9000)],
+                    &[("grpc-0", Some(true))],
+                ),
+                node,
+                no_target,
+            ],
+        );
+        assert_eq!(
+            cache.endpoints("api", 80),
+            Ok(vec![endpoint("api-0", 8080)])
+        );
+        assert_eq!(cache.target("api", 80), ready_pods(1, 1));
+    }
+
+    #[test]
+    fn says_what_is_missing() {
+        let cache = NamespaceCache::listed("shop", vec![service("api", &[("http", 80)])], vec![]);
+        assert_eq!(cache.target("web", 80), Target::ServiceNotFound);
+        assert_eq!(cache.endpoints("web", 80), Err(Target::ServiceNotFound));
+        assert_eq!(cache.target("api", 8080), Target::PortNotOnService);
+    }
+
+    #[test]
+    fn waits_for_both_listings_unless_they_are_forbidden() {
+        let cache = NamespaceCache::new("shop");
+        assert_eq!(cache.target("api", 80), Target::Syncing);
+
+        cache.set_services(vec![service("api", &[("http", 80)])]);
+        assert_eq!(
+            cache.target("api", 80),
+            Target::Syncing,
+            "slices not listed yet"
+        );
+
+        cache.slices.write().unwrap().error = Some(Failure::Net(NetCause::Timeout));
+        assert_eq!(cache.target("api", 80), Target::Syncing);
+        cache.slices.write().unwrap().error = Some(Failure::Forbidden("no slices".into()));
+        assert_eq!(
+            cache.target("api", 80),
+            Target::Forbidden("no slices".into())
+        );
+        assert_eq!(
+            cache.endpoints("api", 80),
+            Err(Target::Forbidden("no slices".into()))
+        );
+
+        // A failed watch after the first listing keeps what was listed.
+        cache.set_slices(vec![slice(
+            "api",
+            "api",
+            &[("http", 8080)],
+            &[("api-0", Some(true))],
+        )]);
+        cache.slices.write().unwrap().error = Some(Failure::Forbidden("no slices".into()));
+        assert_eq!(cache.target("api", 80), ready_pods(1, 1));
     }
 }

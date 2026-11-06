@@ -259,6 +259,35 @@ impl Context {
     }
 }
 
+#[cfg(test)]
+impl Context {
+    /// A context in `state` without a health probe; the test sets its state
+    /// and caches.
+    pub(crate) fn fake(client: Client, state: ContextState) -> Arc<Self> {
+        Arc::new(Self {
+            name: "test".into(),
+            client: Some(client),
+            login: None,
+            state: watch::channel(state).0,
+            namespaces: Mutex::new(HashMap::new()),
+            health: Mutex::new(None),
+            events: EventLog::default(),
+            timing: Timing::default(),
+        })
+    }
+
+    pub(crate) fn put_namespace(&self, namespace: &str, cache: Arc<NamespaceCache>) {
+        self.namespaces
+            .lock()
+            .unwrap()
+            .insert(namespace.to_owned(), cache);
+    }
+
+    pub(crate) fn force_state(&self, state: ContextState) {
+        self.set_state(state);
+    }
+}
+
 /// Probes the API server until the context is dropped or stopped.
 async fn probe_health(context: Weak<Context>) {
     let mut timeouts = 0;

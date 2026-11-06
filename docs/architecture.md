@@ -720,12 +720,19 @@ These are shown in the INFO column and by `kprtfwd status`.
     `~/.kube/config`; kubeconfig fingerprints; discovery and its
     per-namespace fallback; the error classification with the errors kube-rs,
     hyper-util and rustls really return;
+  - the watch cache's lookup over hand-built Services and EndpointSlices
+    (several slices, dual stack, unknown readiness, named target ports), and
+    the forward actor through a fake kubelet: pod choice and the move to
+    another pod, connections closed at once while not ready, a refused
+    port-forward, the error channel, warm streams and when they are dropped,
+    the `::1` listener and a busy port;
   - cluster tests in `crates/engine/tests/cluster.rs`, run in CI against kind
     (job `cluster`) and locally against any throwaway cluster. They only run
     when `KPRTFWD_TEST_CONTEXT` is set; each creates and deletes its own
     namespace:
-    - the forward stays on one pod; deleting that pod moves it to the other
-      one by itself (at most 3 failed requests allowed, 0 seen);
+    - the forward stays on one pod, also for requests to `::1`; deleting that
+      pod moves it to the other one by itself (at most 3 failed requests
+      allowed, 0 seen), and the events say so;
     - scaled to 0, connections close at once and the state is
       `WaitingForPods`; scaled up, it works again without a restart;
     - with `KPRTFWD_TEST_PAUSE`/`RESUME` (`docker pause` of the kind control

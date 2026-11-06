@@ -436,3 +436,487 @@ impl Drop for Decrement<'_> {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use k8s_openapi::api::discovery::v1::EndpointSlice;
+    use kprtfwd_core::ForwardId;
+    use kprtfwd_core::state::{ContextState, NetCause};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+    use crate::cache::NamespaceCache;
+    use crate::fake::{self, FakeApi, Kubelet, Reply, free_port, slice, status};
+
+    const CONTAINER_PORT: u16 = 8080;
+
+    fn healthy() -> ContextState {
+        ContextState::Healthy {
+            server_version: "v1.33.0".into(),
+        }
+    }
+
+    fn unreachable() -> ContextState {
+        ContextState::Unreachable {
+            since: SystemTime::now(),
+            cause: NetCause::Refused,
+        }
+    }
+
+    fn echo(_: &fake::Request) -> Reply {
+        Reply::Kubelet(Kubelet::Echo)
+    }
+
+    fn spec(service: &str, remote_port: u16, local_port: u16) -> Forward {
+        Forward {
+            id: ForwardId::new(format!("test.shop.{service}-{remote_port}")),
+            context: "test".into(),
+            namespace: "shop".into(),
+            service: service.into(),
+            remote_port,
+            local_port,
+            enabled: true,
+        }
+    }
+
+    fn endpoint(pod: &str) -> Endpoint {
+        Endpoint {
+            pod: pod.into(),
+            port: CONTAINER_PORT,
+        }
+    }
+
+    /// The service's pods, with the container port of its port "web".
+    fn pods(service: &str, ready: &[(&str, bool)]) -> Vec<EndpointSlice> {
+        let endpoints: Vec<(&str, Option<bool>)> = ready
+            .iter()
+            .map(|(pod, ready)| (*pod, Some(*ready)))
+            .collect();
+        vec![slice(
+            service,
+            service,
+            &[("web", CONTAINER_PORT)],
+            &endpoints,
+        )]
+    }
+
+    /// A forward in a healthy fake context, through a fake API server.
+    struct Test {
+        api: FakeApi,
+        context: Arc<Context>,
+        cache: Arc<NamespaceCache>,
+        events: EventLog,
+        handle: ForwardHandle,
+        port: u16,
+    }
+
+    impl Test {
+        /// Forwards port `remote_port` (named "web") of `service`.
+        async fn start(
+            service: &str,
+            remote_port: u16,
+            ready: &[(&str, bool)],
+            reply: impl Fn(&fake::Request) -> Reply + Send + Sync + 'static,
+        ) -> Self {
+            let api = FakeApi::start(reply).await;
+            let context = Context::fake(api.client(), healthy());
+            let cache = NamespaceCache::listed(
+                "shop",
+                vec![fake::service(service, &[("web", remote_port)])],
+                pods(service, ready),
+            );
+            context.put_namespace("shop", cache.clone());
+            let port = free_port();
+            let events = EventLog::default();
+            let handle = ForwardHandle::start(
+                spec(service, remote_port, port),
+                context.clone(),
+                events.clone(),
+            );
+            let test = Self {
+                api,
+                context,
+                cache,
+                events,
+                handle,
+                port,
+            };
+            test.wait("listening", |t| t.observe().bind == Bind::Bound)
+                .await;
+            test
+        }
+
+        fn observe(&self) -> Observed {
+            self.handle.observe(&self.context)
+        }
+
+        fn events(&self) -> Vec<String> {
+            messages(&self.events)
+        }
+
+        /// The numbers of the port-forward streams still open.
+        fn open_streams(&self) -> Vec<usize> {
+            self.api
+                .streams()
+                .into_iter()
+                .filter(|stream| stream.open)
+                .map(|stream| stream.number)
+                .collect()
+        }
+
+        /// A warm stream is stored and no other is being opened.
+        fn warm_ready(&self) -> bool {
+            self.handle.shared.warm.lock().unwrap().is_some()
+                && !self.handle.shared.refilling.load(Ordering::Acquire)
+        }
+
+        async fn wait(&self, what: &str, done: impl Fn(&Self) -> bool) {
+            let started = Instant::now();
+            while !done(self) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "not {what}: {:?}, {:?}, {:?}",
+                    self.observe(),
+                    self.events(),
+                    self.api.streams()
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        /// Sends `text` on a new connection to 127.0.0.1.
+        async fn send(&self, text: &str) -> String {
+            self.send_to("127.0.0.1", text).await
+        }
+
+        /// The kubelet's answer to `text`, or "" if the forward closed the
+        /// connection.
+        async fn send_to(&self, host: &str, text: &str) -> String {
+            let mut socket = TcpStream::connect((host, self.port)).await.unwrap();
+            let _ = socket.write_all(text.as_bytes()).await;
+            read_answer(&mut socket, text).await
+        }
+    }
+
+    fn messages(events: &EventLog) -> Vec<String> {
+        events
+            .entries()
+            .into_iter()
+            .map(|event| event.message)
+            .collect()
+    }
+
+    /// Reads until the answer ends with `text` or the connection closes.
+    async fn read_answer(socket: &mut TcpStream, text: &str) -> String {
+        let mut answer = Vec::new();
+        let mut chunk = [0; 1024];
+        let read = async {
+            loop {
+                match socket.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        answer.extend_from_slice(&chunk[..n]);
+                        if answer.ends_with(text.as_bytes()) {
+                            break;
+                        }
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .expect("an answer or a close within 5 s");
+        String::from_utf8(answer).unwrap()
+    }
+
+    #[test]
+    fn stays_on_its_pod_while_it_is_ready() {
+        let events = EventLog::default();
+        let shared = Shared::new(events.clone());
+        let spec = spec("api", 80, 18080);
+        let both = [endpoint("api-0"), endpoint("api-1")];
+        assert_eq!(shared.choose(&both, &spec), endpoint("api-0"));
+        assert_eq!(
+            shared.choose(&[endpoint("api-1"), endpoint("api-0")], &spec),
+            endpoint("api-0")
+        );
+        assert_eq!(
+            shared.choose(&[endpoint("api-1")], &spec),
+            endpoint("api-1")
+        );
+        assert_eq!(shared.choose(&both, &spec), endpoint("api-1"));
+        assert_eq!(
+            messages(&events),
+            ["pod api-0", "pod api-0 gone, now api-1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn connections_stay_on_one_pod_and_move_when_it_goes() {
+        // Not HTTP, so no warm streams.
+        let test = Test::start("db", 5432, &[("db-0", true), ("db-1", true)], echo).await;
+        assert_eq!(test.send("a").await, "db-0#1:a");
+        assert_eq!(test.send("b").await, "db-0#2:b");
+        let observed = test.observe();
+        assert_eq!(observed.pod.as_deref(), Some("db-0"));
+        assert_eq!(observed.target, Target::Endpoints { ready: 2, total: 2 });
+        assert!(
+            test.api
+                .streams()
+                .iter()
+                .all(|stream| stream.pod == "db-0" && stream.port == CONTAINER_PORT),
+            "{:?}",
+            test.api.streams()
+        );
+
+        test.cache
+            .set_slices(pods("db", &[("db-0", false), ("db-1", true)]));
+        assert_eq!(test.send("c").await, "db-1#3:c");
+        // Ready again, the old pod does not get the connections back.
+        test.cache
+            .set_slices(pods("db", &[("db-0", true), ("db-1", true)]));
+        assert_eq!(test.send("d").await, "db-1#4:d");
+        assert_eq!(
+            test.events(),
+            [
+                "started".to_owned(),
+                format!("listening on port {}", test.port),
+                "pod db-0".to_owned(),
+                "pod db-0 gone, now db-1".to_owned(),
+            ]
+        );
+        assert_eq!(test.handle.last_error(), None);
+    }
+
+    #[tokio::test]
+    async fn counts_open_connections_and_listens_on_both_loopback_addresses() {
+        let test = Test::start("db", 5432, &[("db-0", true)], echo).await;
+        let mut socket = TcpStream::connect(("127.0.0.1", test.port)).await.unwrap();
+        socket.write_all(b"a").await.unwrap();
+        assert_eq!(read_answer(&mut socket, "a").await, "db-0#1:a");
+        assert_eq!(test.observe().active_conns, 1);
+        drop(socket);
+        test.wait("no connection", |t| t.observe().active_conns == 0)
+            .await;
+
+        // Clients may resolve localhost to ::1 first.
+        if std::net::TcpListener::bind("[::1]:0").is_ok() {
+            assert_eq!(test.send_to("::1", "b").await, "db-0#2:b");
+        }
+    }
+
+    #[tokio::test]
+    async fn connections_are_closed_at_once_while_not_ready() {
+        let test = Test::start("db", 5432, &[("db-0", false), ("db-1", false)], echo).await;
+        assert_eq!(test.send("a").await, "");
+        test.cache.set_services(vec![]);
+        assert_eq!(test.send("b").await, "");
+        test.context
+            .put_namespace("shop", NamespaceCache::new("shop"));
+        assert_eq!(test.send("c").await, "");
+        test.context.force_state(unreachable());
+        assert_eq!(test.send("d").await, "");
+
+        assert!(test.api.requests().is_empty(), "{:?}", test.api.requests());
+        let closed: Vec<String> = test
+            .events()
+            .into_iter()
+            .filter(|message| message.starts_with("connection closed"))
+            .collect();
+        assert_eq!(
+            closed,
+            [
+                "connection closed: 0/2 pods ready",
+                "connection closed: service not found",
+                "connection closed: starting",
+                "connection closed: API server unreachable (refused)",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forbidden_port_forward_shows_in_the_target_until_one_works() {
+        let forbidden = Arc::new(AtomicBool::new(true));
+        let reply = {
+            let forbidden = forbidden.clone();
+            move |_: &fake::Request| {
+                if forbidden.load(Ordering::Relaxed) {
+                    Reply::Json(403, status(403, "pods \"db-0\" is forbidden"))
+                } else {
+                    Reply::Kubelet(Kubelet::Echo)
+                }
+            }
+        };
+        let test = Test::start("db", 5432, &[("db-0", true)], reply).await;
+        assert_eq!(test.send("a").await, "");
+        let message =
+            "failed to upgrade to a WebSocket connection: failed to switch protocol: 403 Forbidden";
+        assert_eq!(test.observe().target, Target::Forbidden(message.into()));
+        assert!(
+            test.events()
+                .contains(&format!("port-forward forbidden: {message}")),
+            "{:?}",
+            test.events()
+        );
+        assert_eq!(test.handle.last_error(), None);
+
+        forbidden.store(false, Ordering::Relaxed);
+        assert_eq!(test.send("b").await, "db-0#1:b");
+        assert_eq!(
+            test.observe().target,
+            Target::Endpoints { ready: 1, total: 1 }
+        );
+    }
+
+    #[tokio::test]
+    async fn the_error_channel_becomes_the_last_error() {
+        let text = "error forwarding port 8080 to pod db-0: connection refused";
+        let test = Test::start("db", 5432, &[("db-0", true)], move |_| {
+            Reply::Kubelet(Kubelet::Error(text.into()))
+        })
+        .await;
+        assert_eq!(test.send("a").await, "");
+        test.wait("an error", |t| t.handle.last_error().is_some())
+            .await;
+        assert_eq!(test.handle.last_error().unwrap().message, text);
+        assert!(
+            test.events()
+                .contains(&format!("connection failed: {text}")),
+            "{:?}",
+            test.events()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_warm_stream_serves_the_next_connection_to_its_pod() {
+        let test = Test::start("frontend", 80, &[("web-0", true), ("web-1", true)], echo).await;
+        assert_eq!(test.send("a").await, "web-0#1:a");
+        test.wait("a warm stream", |t| {
+            t.warm_ready() && t.open_streams() == [2]
+        })
+        .await;
+        assert_eq!(test.send("b").await, "web-0#2:b");
+        test.wait("the next warm stream", |t| {
+            t.warm_ready() && t.open_streams() == [3]
+        })
+        .await;
+
+        // The pod goes: its warm stream is dropped, not used.
+        test.cache
+            .set_slices(pods("frontend", &[("web-0", false), ("web-1", true)]));
+        assert_eq!(test.send("c").await, "web-1#4:c");
+        test.wait("a warm stream to the other pod", |t| {
+            t.warm_ready() && t.open_streams() == [5]
+        })
+        .await;
+        assert_eq!(test.api.streams()[4].pod, "web-1");
+
+        // An outage drops it too.
+        test.context.force_state(unreachable());
+        test.wait("no warm stream", |t| t.open_streams().is_empty())
+            .await;
+        test.context.force_state(healthy());
+        assert_eq!(test.send("d").await, "web-1#6:d");
+
+        // So does stopping the forward.
+        test.wait("a warm stream", |t| {
+            t.warm_ready() && t.open_streams() == [7]
+        })
+        .await;
+        test.handle.stop();
+        test.wait("no stream", |t| t.open_streams().is_empty())
+            .await;
+        assert_eq!(test.events().last().map(String::as_str), Some("stopped"));
+    }
+
+    #[tokio::test]
+    async fn a_warm_stream_that_receives_data_is_dropped() {
+        let opened = Arc::new(AtomicUsize::new(0));
+        let reply = {
+            let opened = opened.clone();
+            move |_: &fake::Request| {
+                // The second stream is the first warm one; it talks first.
+                if opened.fetch_add(1, Ordering::Relaxed) == 1 {
+                    Reply::Kubelet(Kubelet::Greeting("hello".into()))
+                } else {
+                    Reply::Kubelet(Kubelet::Echo)
+                }
+            }
+        };
+        let test = Test::start("frontend", 80, &[("web-0", true)], reply).await;
+        assert_eq!(test.send("a").await, "web-0#1:a");
+        test.wait("the warm stream to end", |t| {
+            t.api.streams().len() == 2 && t.open_streams().is_empty()
+        })
+        .await;
+        assert_eq!(test.send("b").await, "web-0#3:b");
+    }
+
+    #[tokio::test]
+    async fn a_stopped_forward_stores_no_warm_stream() {
+        let api = FakeApi::start(echo).await;
+        let shared = Shared::new(EventLog::default());
+        shared.stopped.store(true, Ordering::Relaxed);
+        let stream = portforward::open(&api.client(), "shop", "web-0", CONTAINER_PORT)
+            .await
+            .unwrap();
+        shared.store_warm(endpoint("web-0"), stream);
+        assert!(shared.warm.lock().unwrap().is_none());
+        let started = Instant::now();
+        while api.streams()[0].open {
+            assert!(started.elapsed() < Duration::from_secs(5), "stream kept");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_busy_port_is_reported_and_taken_once_free() {
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let api = FakeApi::start(echo).await;
+        let context = Context::fake(api.client(), healthy());
+        let events = EventLog::default();
+        let handle = ForwardHandle::start(spec("db", 5432, port), context.clone(), events.clone());
+        let observe = || handle.observe(&context).bind;
+        let started = Instant::now();
+        while observe() == Bind::Pending {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "no bind attempt"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let Bind::Busy { holder: who } = observe() else {
+            panic!("{:?}", observe());
+        };
+        // lsof names this process, where it is installed.
+        let busy = match &who {
+            Some(who) => {
+                assert!(
+                    who.ends_with(&format!("(pid {})", std::process::id())),
+                    "{who}"
+                );
+                format!("port {port} busy: {who}")
+            }
+            None => format!("port {port} busy"),
+        };
+        assert_eq!(messages(&events), ["started".to_owned(), busy]);
+
+        // The next attempt, 5 s later, takes it.
+        drop(holder);
+        while observe() != Bind::Bound {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "{:?}",
+                observe()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            messages(&events).last(),
+            Some(&format!("listening on port {port}"))
+        );
+    }
+}

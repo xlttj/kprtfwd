@@ -1,15 +1,24 @@
-//! A fake API server on a local port, for unit tests.
+//! A fake API server and kubelet on a local port, and builders for the
+//! objects the watch caches hold, for unit tests.
 //!
 //! The server reads one request per connection and answers it as the test's
-//! handler says.
+//! handler says: with JSON, or by accepting the port-forward upgrade and
+//! acting as the kubelet behind it.
 
 use std::sync::{Arc, Mutex};
 
+use futures::{SinkExt, StreamExt};
+use k8s_openapi::api::core::v1::Service;
+use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::{Client, Config};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+use tokio_tungstenite::tungstenite::protocol::Role;
 
 pub const VERSION: &str = r#"{"major":"1","minor":"33","gitVersion":"v1.33.0","gitCommit":"","gitTreeState":"","buildDate":"","goVersion":"","compiler":"","platform":""}"#;
 
@@ -19,13 +28,52 @@ pub struct Request {
     pub method: String,
     /// Without the query.
     pub path: String,
+    pub query: String,
     /// The header lines, lowercased.
     pub head: String,
+}
+
+impl Request {
+    /// `(pod, port)` of a port-forward request.
+    pub fn port_forward(&self) -> Option<(String, u16)> {
+        let rest = self.path.strip_suffix("/portforward")?;
+        let (_, pod) = rest.rsplit_once("/pods/")?;
+        let port = self
+            .query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("ports="))?
+            .parse()
+            .ok()?;
+        Some((pod.to_owned(), port))
+    }
 }
 
 pub enum Reply {
     /// An HTTP answer with a JSON body.
     Json(u16, String),
+    /// Accepts the port-forward upgrade and acts as the kubelet.
+    Kubelet(Kubelet),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Kubelet {
+    /// Sends the port headers, then answers every data frame with the
+    /// stream's tag `pod#n:` and the data.
+    Echo,
+    /// Sends the port headers and this text on the error channel.
+    Error(String),
+    /// Sends the port headers and this text as data, unasked.
+    Greeting(String),
+}
+
+/// One port-forward stream the kubelet accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stream {
+    pub pod: String,
+    pub port: u16,
+    /// Counts from 1 across all streams of the server.
+    pub number: usize,
+    pub open: bool,
 }
 
 type Handler = Arc<dyn Fn(&Request) -> Reply + Send + Sync>;
@@ -33,6 +81,7 @@ type Handler = Arc<dyn Fn(&Request) -> Reply + Send + Sync>;
 #[derive(Default)]
 struct Log {
     requests: Vec<String>,
+    streams: Vec<Stream>,
 }
 
 pub struct FakeApi {
@@ -68,6 +117,10 @@ impl FakeApi {
     pub fn requests(&self) -> Vec<String> {
         self.log.lock().unwrap().requests.clone()
     }
+
+    pub fn streams(&self) -> Vec<Stream> {
+        self.log.lock().unwrap().streams.clone()
+    }
 }
 
 impl Drop for FakeApi {
@@ -95,12 +148,11 @@ async fn answer(mut socket: TcpStream, handler: Handler, log: Arc<Mutex<Log>>) {
     let mut words = head.split_whitespace();
     let method = words.next().unwrap_or_default().to_owned();
     let target = words.next().unwrap_or_default().to_owned();
-    let path = target
-        .split_once('?')
-        .map_or(target.as_str(), |(path, _)| path);
+    let (path, query) = target.split_once('?').unwrap_or((&target, ""));
     let request = Request {
         method,
         path: path.to_owned(),
+        query: query.to_owned(),
         head: head.to_lowercase(),
     };
     log.lock()
@@ -119,6 +171,42 @@ async fn answer(mut socket: TcpStream, handler: Handler, log: Arc<Mutex<Log>>) {
             let _ = socket.write_all(response.as_bytes()).await;
             let _ = socket.shutdown().await;
         }
+        Reply::Kubelet(kubelet) => {
+            let Some((pod, port)) = request.port_forward() else {
+                return;
+            };
+            // The key is case-sensitive, so it comes from the original head.
+            let Some(key) = head.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("sec-websocket-key")
+                    .then(|| value.trim().to_owned())
+            }) else {
+                return;
+            };
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\
+                 connection: Upgrade\r\nsec-websocket-accept: {}\r\n\
+                 sec-websocket-protocol: v4.channel.k8s.io\r\n\r\n",
+                derive_accept_key(key.as_bytes())
+            );
+            if socket.write_all(response.as_bytes()).await.is_err() {
+                return;
+            }
+            let number = {
+                let mut log = log.lock().unwrap();
+                let number = log.streams.len() + 1;
+                log.streams.push(Stream {
+                    pod: pod.clone(),
+                    port,
+                    number,
+                    open: true,
+                });
+                number
+            };
+            let ws = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
+            kubelet_stream(ws, &kubelet, &format!("{pod}#{number}:"), port).await;
+            log.lock().unwrap().streams[number - 1].open = false;
+        }
     }
 }
 
@@ -129,6 +217,48 @@ fn reason(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         _ => "Status",
+    }
+}
+
+fn frame(channel: u8, payload: &[u8]) -> Message {
+    let mut frame = vec![channel];
+    frame.extend_from_slice(payload);
+    Message::binary(frame)
+}
+
+async fn kubelet_stream(
+    mut ws: WebSocketStream<TcpStream>,
+    kubelet: &Kubelet,
+    tag: &str,
+    port: u16,
+) {
+    for channel in [0, 1] {
+        if ws.send(frame(channel, &port.to_le_bytes())).await.is_err() {
+            return;
+        }
+    }
+    let first = match kubelet {
+        Kubelet::Echo => None,
+        Kubelet::Error(text) => Some(frame(1, text.as_bytes())),
+        Kubelet::Greeting(text) => Some(frame(0, text.as_bytes())),
+    };
+    if let Some(first) = first
+        && ws.send(first).await.is_err()
+    {
+        return;
+    }
+    while let Some(Ok(message)) = ws.next().await {
+        match message {
+            Message::Binary(data) if *kubelet == Kubelet::Echo && data.first() == Some(&0) => {
+                let mut answer = tag.as_bytes().to_vec();
+                answer.extend_from_slice(&data[1..]);
+                if ws.send(frame(0, &answer)).await.is_err() {
+                    return;
+                }
+            }
+            Message::Close(_) => return,
+            _ => {}
+        }
     }
 }
 
@@ -164,4 +294,73 @@ pub fn list(kind: &str, items: &[Value]) -> String {
         "items": items,
     })
     .to_string()
+}
+
+/// A TCP port; an empty name is left out, as for a service's only port.
+fn port_json(name: &str, port: u16) -> Value {
+    let mut json = json!({"port": port, "protocol": "TCP"});
+    if !name.is_empty() {
+        json["name"] = json!(name);
+    }
+    json
+}
+
+/// A service in namespace `shop` with TCP ports `(name, port)`.
+pub fn service(name: &str, ports: &[(&str, u16)]) -> Service {
+    serde_json::from_value(service_json("shop", name, ports)).unwrap()
+}
+
+fn service_json(namespace: &str, name: &str, ports: &[(&str, u16)]) -> Value {
+    let ports: Vec<Value> = ports
+        .iter()
+        .map(|(name, port)| port_json(name, *port))
+        .collect();
+    json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": name, "namespace": namespace},
+        "spec": {"ports": ports},
+    })
+}
+
+/// An EndpointSlice of `service` with container ports `(name, port)` and
+/// endpoints `(pod, ready)`; `None` leaves `ready` unset.
+pub fn slice(
+    name: &str,
+    service: &str,
+    ports: &[(&str, u16)],
+    endpoints: &[(&str, Option<bool>)],
+) -> EndpointSlice {
+    let ports: Vec<Value> = ports
+        .iter()
+        .map(|(name, port)| port_json(name, *port))
+        .collect();
+    let endpoints: Vec<Value> = endpoints
+        .iter()
+        .enumerate()
+        .map(|(i, (pod, ready))| {
+            let mut conditions = json!({});
+            if let Some(ready) = ready {
+                conditions["ready"] = json!(ready);
+            }
+            json!({
+                "addresses": [format!("10.0.0.{}", i + 1)],
+                "conditions": conditions,
+                "targetRef": {"kind": "Pod", "name": pod, "namespace": "shop"},
+            })
+        })
+        .collect();
+    serde_json::from_value(json!({
+        "apiVersion": "discovery.k8s.io/v1",
+        "kind": "EndpointSlice",
+        "metadata": {
+            "name": name,
+            "namespace": "shop",
+            "labels": {"kubernetes.io/service-name": service},
+        },
+        "addressType": "IPv4",
+        "ports": ports,
+        "endpoints": endpoints,
+    }))
+    .unwrap()
 }
