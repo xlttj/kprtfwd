@@ -934,6 +934,7 @@ mod tests {
             daemon: 3,
             client: 2,
             daemon_version: "2.1.0".into(),
+            pid: 4242,
         }
         .to_string();
         {

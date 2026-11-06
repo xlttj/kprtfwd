@@ -107,7 +107,8 @@ async fn lock_data_dir(data_dir: &Path) -> Result<Option<File>> {
                 return Err(err).with_context(|| format!("lock {}", path.display()));
             }
         }
-        match Client::connect(&socket).await {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match Client::connect_within(&socket, left.max(Duration::from_millis(50))).await {
             Ok(other) => {
                 info!(pid = other.daemon_pid, "another daemon is running");
                 return Ok(None);
@@ -115,7 +116,7 @@ async fn lock_data_dir(data_dir: &Path) -> Result<Option<File>> {
             Err(err @ ClientError::ProtocolMismatch { .. }) => {
                 bail!("a daemon answers on {}, but: {err}", socket.display())
             }
-            // Not bound yet, or no longer.
+            // Not bound yet, or no longer, or not answering yet.
             Err(_) => {}
         }
         if Instant::now() >= deadline {
@@ -199,11 +200,11 @@ async fn serve(data_dir: &Path) -> Result<()> {
         socket,
         pid: data_dir.join("daemon.pid"),
     };
-    adopt_legacy_dir(data_dir).await?;
-    // Lets `kprtfwd daemon stop` end a daemon of another version, which it
-    // cannot talk to.
+    // Lets `kprtfwd daemon stop` end a daemon it cannot talk to: one of
+    // another version, or one that does not answer, also while it starts.
     fs::write(&files.pid, format!("{}\n", std::process::id()))
         .with_context(|| format!("write {}", files.pid.display()))?;
+    adopt_legacy_dir(data_dir).await?;
     let config_path = data_dir.join("config.toml");
     match Config::write_template(&config_path) {
         Ok(true) => info!(path = %config_path.display(), "wrote the default settings"),
@@ -362,7 +363,7 @@ async fn bind_socket(path: &Path) -> Result<Option<UnixListener>> {
                 fs::remove_file(path)
                     .with_context(|| format!("remove stale {}", path.display()))?;
             }
-            Err(err) => bail!("a daemon answers on {}, but: {err}", path.display()),
+            Err(err) => bail!("cannot use {}: {err}", path.display()),
         }
     }
     let listener = match UnixListener::bind(path) {

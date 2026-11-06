@@ -204,8 +204,8 @@ Main dependencies:
   copy. With `KPRTFWD_HOME` set, this step is skipped.
 - **Start on demand.** A client that finds no daemon runs `kprtfwd daemon run`
   in its own process group, with no terminal attached. If that process exits
-  right away, the client reports it and names the log directory instead of
-  waiting.
+  right away, or fails after binding the socket, the client reports it and
+  names the log directory instead of waiting or blaming another version.
 - **Single instance.** On start the daemon first takes an exclusive lock
   (`flock`) on `daemon.lock` in the directory and holds it until it has
   exited; the system releases it however the process ends. While another
@@ -264,7 +264,10 @@ Main dependencies:
 - **Upgrade.** Clients compare versions in the handshake. A daemon of another
   version is reported with the hint `kprtfwd daemon restart`; the desired state
   is persisted, so forwards come back on their own. The daemon writes its PID to
-  `daemon.pid`, so `daemon stop` can end a daemon it cannot talk to.
+  `daemon.pid` as soon as it has bound the socket, so `daemon stop` can end a
+  daemon it cannot talk to: one of another protocol by the PID in its
+  welcome, one whose answer is no welcome, or that does not answer within
+  5 s, by `daemon.pid`.
 
 ### 6.2 Context actor
 
@@ -567,8 +570,11 @@ them itself:
 - **Framing.** Newline-delimited JSON with serde-tagged enums. It is easy to debug:
   `socat - UNIX-CONNECT:$HOME/.config/kprtfwd/daemon.sock`.
 - **Handshake.** The client sends `Hello { protocol, client_version }`, the daemon
-  answers `Welcome { protocol, daemon_version }`. Different protocol numbers mean
-  the client asks the user to restart the daemon.
+  answers `Welcome { protocol, daemon_version, pid }`. Different protocol numbers
+  mean the client asks the user to restart the daemon; so does an answer that is
+  no welcome, or a closed connection. A client waits at most 5 s for the
+  welcome, except one that has just started the daemon, which waits for the
+  start (10 s).
 - **Requests.** `{"id": 7, "request": {"type": "set_enabled", ...}}`; the response
   echoes the `id`. The request is nested, not flattened next to `id`, because some
   requests have an `id` field of their own; a test sends every request kind

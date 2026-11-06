@@ -191,8 +191,19 @@ async fn daemons_started_at_once_leave_one_running() {
     assert!(daemons.exit_status(serving).await.success());
 }
 
-/// Answers a client's hello as a daemon `pid` of another protocol would.
-fn welcome_in_another_protocol(stream: UnixStream, pid: u32) {
+/// How a stand-in for a daemon answers a client's hello.
+#[derive(Clone, Copy)]
+enum Speaks {
+    /// As a daemon of another protocol, with its PID.
+    AnotherProtocol,
+    /// With a line that is no message.
+    Garbage,
+    /// Not at all: it never accepts the connection.
+    Nothing,
+}
+
+/// Answers a client's hello as `speaks` says, for a daemon `pid`.
+fn answer_hello(stream: UnixStream, speaks: Speaks, pid: u32) {
     let mut hello = String::new();
     let mut reader = BufReader::new(&stream);
     if reader.read_line(&mut hello).is_err() {
@@ -201,25 +212,32 @@ fn welcome_in_another_protocol(stream: UnixStream, pid: u32) {
     let Ok(hello) = serde_json::from_str::<ClientMessage>(&hello) else {
         return;
     };
-    let welcome = ServerMessage::Response {
-        id: hello.id,
-        response: Response::Welcome {
-            protocol: PROTOCOL_VERSION + 1,
-            daemon_version: "9.9.9".into(),
-            pid,
-        },
+    let mut line = match speaks {
+        Speaks::AnotherProtocol => {
+            let welcome = ServerMessage::Response {
+                id: hello.id,
+                response: Response::Welcome {
+                    protocol: PROTOCOL_VERSION + 1,
+                    daemon_version: "9.9.9".into(),
+                    pid,
+                },
+            };
+            serde_json::to_vec(&welcome).unwrap()
+        }
+        Speaks::Garbage | Speaks::Nothing => b"{\"type\":\"welcome\"}".to_vec(),
     };
-    let mut line = serde_json::to_vec(&welcome).unwrap();
     line.push(b'\n');
     let _ = (&stream).write_all(&line);
 }
 
-/// A process standing in for a daemon of another version. When the test
-/// ends, its PID file goes first, so that no later `daemon stop` kills that
-/// PID once it is free, and then the process is killed.
+/// A process standing in for a daemon `daemon stop` cannot talk to. When
+/// the test ends, its PID file goes first, so that no later `daemon stop`
+/// kills that PID once it is free, and then the process is killed.
 struct StandIn {
     pid_file: PathBuf,
     process: Children,
+    /// Bound for one that never accepts.
+    _listener: Option<UnixListener>,
 }
 
 impl Drop for StandIn {
@@ -228,13 +246,10 @@ impl Drop for StandIn {
     }
 }
 
-/// `daemon stop` cannot talk to a daemon of another version and ends it by
-/// the PID in `daemon.pid`. The stand-in: the test answers on the socket in
-/// another protocol, and the PID is a shell's that, like a daemon, removes
-/// the socket and the PID file when terminated.
-#[tokio::test]
-async fn stops_a_daemon_of_another_version_by_its_pid() {
-    let home = Home::new();
+/// The test answers on the socket as `speaks` says; the PID is a shell's
+/// that, like a daemon, removes the socket and the PID file when terminated.
+/// With `pid_file`, the PID is written to `daemon.pid`.
+async fn stand_in(home: &Home, speaks: Speaks, pid_file: bool) -> StandIn {
     std::fs::create_dir_all(home.data_dir()).unwrap();
     let listener = UnixListener::bind(home.socket()).unwrap();
     let ready = home.path().join("ready");
@@ -245,23 +260,81 @@ async fn stops_a_daemon_of_another_version_by_its_pid() {
         .args([home.socket(), home.pid_file(), ready.clone()])
         .spawn()
         .unwrap();
-    let mut stand_in = StandIn {
+    let pid = shell.id();
+    if pid_file {
+        std::fs::write(home.pid_file(), format!("{pid}\n")).unwrap();
+    }
+    let listener = match speaks {
+        Speaks::Nothing => Some(listener),
+        _ => {
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    answer_hello(stream, speaks, pid);
+                }
+            });
+            None
+        }
+    };
+    wait_until("trap set", || ready.exists()).await;
+    StandIn {
         pid_file: home.pid_file(),
         process: Children(vec![shell]),
-    };
-    let pid = stand_in.process.0[0].id();
-    std::fs::write(home.pid_file(), format!("{pid}\n")).unwrap();
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            welcome_in_another_protocol(stream, pid);
-        }
-    });
-    wait_until("trap set", || ready.exists()).await;
+        _listener: listener,
+    }
+}
 
+/// `daemon stop` stops a daemon it cannot talk to by its PID, and returns
+/// once it is gone.
+async fn stop_stand_in(home: &Home, stand_in: &mut StandIn) {
     let output = home.run(&["daemon", "stop"]);
     assert!(output.status.success(), "{output:?}");
     assert_eq!(String::from_utf8_lossy(&output.stdout), "daemon stopped\n");
     assert!(stand_in.process.exit_status(0).await.success());
+    assert!(gone(home));
+}
+
+/// A daemon of another protocol is stopped by the PID in its welcome, also
+/// without `daemon.pid`.
+#[tokio::test]
+async fn stops_a_daemon_of_another_version_by_its_pid() {
+    let home = Home::new();
+    let mut stand_in = stand_in(&home, Speaks::AnotherProtocol, false).await;
+    stop_stand_in(&home, &mut stand_in).await;
+}
+
+/// A welcome that cannot be read comes from a daemon of another version,
+/// which is stopped by the PID in `daemon.pid`.
+#[tokio::test]
+async fn stops_a_daemon_that_answers_garbage_by_its_pid() {
+    let home = Home::new();
+    let mut stand_in = stand_in(&home, Speaks::Garbage, true).await;
+    stop_stand_in(&home, &mut stand_in).await;
+}
+
+/// A daemon that does not answer is given up after a few seconds, and
+/// stopped by the PID in `daemon.pid`.
+#[tokio::test]
+async fn stops_a_daemon_that_does_not_answer_by_its_pid() {
+    let home = Home::new();
+    let mut stand_in = stand_in(&home, Speaks::Nothing, true).await;
+    stop_stand_in(&home, &mut stand_in).await;
+}
+
+/// A daemon that binds the socket and then fails, here because it cannot
+/// stop the daemon of the old directory, which does not answer, is reported
+/// as failed to start, not as a daemon of another version.
+#[tokio::test]
+async fn a_daemon_that_fails_after_binding_is_reported_as_failed() {
+    let home = Home::new();
+    database(&home.legacy_dir().join("kprtfwd.db"));
+    let _silent = UnixListener::bind(home.legacy_dir().join("daemon.sock")).unwrap();
+
+    let output = home.run(&["status"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(stderr.contains("exited right after starting"), "{stderr}");
+    assert!(stderr.contains("log: "), "{stderr}");
+    assert!(daemon_log(&home).contains("does not answer"));
     assert!(gone(&home));
 }
 
