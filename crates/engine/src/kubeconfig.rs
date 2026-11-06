@@ -1,13 +1,16 @@
 //! Reading the kubeconfig files, and noticing changes per context.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
+use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use kube::config::{Kubeconfig, KubeconfigError};
 use serde_json::Value;
+use tracing::{debug, warn};
 
 /// A kubeconfig error as text for messages, events and the log. A parse
 /// error keeps only its line and column: the parser would quote the lines
@@ -82,16 +85,129 @@ fn read_files(files: &[PathBuf]) -> Result<Kubeconfig, String> {
     Err(format!("no kubeconfig file found: {}", names.join(", ")))
 }
 
+/// How a kubeconfig file looks from outside: its modification time and
+/// length, `None` if it does not exist. A write that truncates the file
+/// changes the length even where modification times are coarse.
+type Stamp = Option<(SystemTime, u64)>;
+
+fn stamps(files: &[PathBuf]) -> Vec<Stamp> {
+    files
+        .iter()
+        .map(|file| {
+            let meta = fs::metadata(file).ok()?;
+            Some((meta.modified().ok()?, meta.len()))
+        })
+        .collect()
+}
+
+/// Notices changes of the kubeconfig files and tells which contexts they
+/// touched, by a hash per context over what its client is built from (the
+/// names of its cluster and user and their entries). Tools rewrite the files
+/// in place, so a check can catch one half written, even empty. Changed
+/// files are therefore read only once they looked the same at two checks in
+/// a row, and the read counts only if they still look the same after it.
+/// They count as read only after a read that worked; until then every check
+/// tries again, also where a fixed file keeps the time and length of the
+/// broken one.
+pub struct Watcher {
+    files: Vec<PathBuf>,
+    /// The stamps at the last check.
+    seen: Vec<Stamp>,
+    /// The stamps of the last read that worked.
+    read: Option<Vec<Stamp>>,
+    /// The stamps of the last read that failed, so it is reported once.
+    failed: Option<Vec<Stamp>>,
+    /// Only the prints are kept, never the settings, which include
+    /// credentials.
+    prints: HashMap<String, u64>,
+}
+
+/// A read of changed kubeconfig files.
+pub struct Change {
+    /// What was read. Contexts that are reconnected start from it, so they
+    /// run exactly the settings that were compared.
+    pub kubeconfig: Kubeconfig,
+    /// The contexts whose print changed: new, gone, or with other settings.
+    pub contexts: HashSet<String>,
+}
+
+impl Watcher {
+    /// Watches `files` and reads them now.
+    pub fn new(files: Vec<PathBuf>) -> Self {
+        let mut watcher = Self {
+            seen: stamps(&files),
+            files,
+            read: None,
+            failed: None,
+            prints: HashMap::new(),
+        };
+        watcher.try_read(watcher.seen.clone());
+        debug!(files = ?watcher.files, contexts = watcher.prints.len(), "watching kubeconfig");
+        watcher
+    }
+
+    /// Looks at the files once; the daemon does so every 2 s. Returns the
+    /// read once changed files have settled and could be read.
+    pub fn check(&mut self) -> Option<Change> {
+        let now = stamps(&self.files);
+        if now != self.seen {
+            // Maybe still being written; wait for the next check.
+            self.seen = now;
+            return None;
+        }
+        if self.read.as_ref() == Some(&now) {
+            return None;
+        }
+        let change = self.try_read(now)?;
+        debug!(changed = ?change.contexts, "kubeconfig read");
+        Some(change)
+    }
+
+    /// Reads the files, which looked like `before`.
+    fn try_read(&mut self, before: Vec<Stamp>) -> Option<Change> {
+        let result = read_files(&self.files)
+            .and_then(|kubeconfig| Ok((fingerprints_of(&kubeconfig)?, kubeconfig)));
+        if stamps(&self.files) != before {
+            // Written while being read; the next checks wait for it.
+            return None;
+        }
+        match result {
+            Ok((prints, kubeconfig)) => {
+                let contexts = changed(&self.prints, &prints);
+                self.prints = prints;
+                self.read = Some(before);
+                self.failed = None;
+                Some(Change {
+                    kubeconfig,
+                    contexts,
+                })
+            }
+            Err(err) => {
+                if self.failed.as_ref() != Some(&before) {
+                    warn!(%err, "cannot read the kubeconfig, trying again at every check");
+                    self.failed = Some(before);
+                }
+                None
+            }
+        }
+    }
+}
+
+/// The contexts whose print differs between `before` and `after`.
+fn changed(before: &HashMap<String, u64>, after: &HashMap<String, u64>) -> HashSet<String> {
+    before
+        .keys()
+        .chain(after.keys())
+        .filter(|name| before.get(*name) != after.get(*name))
+        .cloned()
+        .collect()
+}
+
 /// A hash per context over what its client is built from, to tell which
 /// contexts a change of the kubeconfig touched: the names of its cluster and
 /// user and their entries. The context's default namespace and extensions do
 /// not count; forwards carry their own namespace, so `kubens` must not
-/// reconnect them. Only the hash is kept, never the settings, which include
-/// credentials.
-pub fn fingerprints() -> Result<HashMap<String, u64>, String> {
-    fingerprints_of(&read()?)
-}
-
+/// reconnect them.
 fn fingerprints_of(config: &Kubeconfig) -> Result<HashMap<String, u64>, String> {
     let mut prints = HashMap::new();
     for named in &config.contexts {
@@ -230,14 +346,12 @@ contexts:
 
     /// The contexts whose print differs.
     fn changed(before: &HashMap<String, u64>, after: &HashMap<String, u64>) -> Vec<String> {
-        let mut names: Vec<String> = before
-            .keys()
-            .chain(after.keys())
-            .filter(|name| before.get(*name) != after.get(*name))
-            .cloned()
-            .collect();
+        sorted(super::changed(before, after))
+    }
+
+    fn sorted(names: HashSet<String>) -> Vec<String> {
+        let mut names: Vec<String> = names.into_iter().collect();
         names.sort();
-        names.dedup();
         names
     }
 
@@ -486,5 +600,116 @@ contexts:
 
         let missing = describe(&Kubeconfig::read_from(dir.path().join("missing")).unwrap_err());
         assert!(missing.contains("missing"), "{missing:?}");
+    }
+
+    fn yaml(one: &str, alice: &str) -> String {
+        TEMPLATE
+            .replace("{one}", one)
+            .replace("{alice}", alice)
+            .replace("{current}", "a")
+    }
+
+    /// The contexts a check reports as changed; `None` if it read nothing.
+    fn check(watcher: &mut Watcher) -> Option<Vec<String>> {
+        watcher.check().map(|change| sorted(change.contexts))
+    }
+
+    #[test]
+    fn a_change_is_read_once_the_files_have_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config");
+        std::fs::write(&file, yaml(ONE, TOKEN)).unwrap();
+        let mut watcher = Watcher::new(vec![file.clone()]);
+        assert_eq!(watcher.prints.len(), 3);
+        assert_eq!(check(&mut watcher), None);
+
+        std::fs::write(&file, yaml("https://moved.example:6443", TOKEN)).unwrap();
+        assert_eq!(check(&mut watcher), None, "read before it settled");
+        let change = watcher.check().expect("read once settled");
+        assert_eq!(sorted(change.contexts), ["a"]);
+        // The read comes along, for the contexts to start from.
+        assert_eq!(change.kubeconfig.contexts.len(), 3);
+        assert_eq!(check(&mut watcher), None, "read twice");
+
+        // `kubectl config use-context` is read, but touches no context. (Every
+        // write in these tests changes the length too, so it shows even
+        // where modification times are coarse.)
+        std::fs::write(
+            &file,
+            yaml("https://moved.example:6443", TOKEN)
+                .replace("current-context: a", "current-context: c\n"),
+        )
+        .unwrap();
+        assert_eq!(check(&mut watcher), None);
+        assert_eq!(check(&mut watcher), Some(vec![]));
+    }
+
+    #[test]
+    fn a_file_caught_mid_write_is_not_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config");
+        std::fs::write(&file, yaml(ONE, TOKEN)).unwrap();
+        let mut watcher = Watcher::new(vec![file.clone()]);
+
+        // Truncated at one check, written by the next: the empty file, which
+        // kube-rs reads as a kubeconfig without contexts, is never used.
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(check(&mut watcher), None);
+        std::fs::write(&file, yaml(ONE, "tok-renewed")).unwrap();
+        assert_eq!(check(&mut watcher), None);
+        assert_eq!(check(&mut watcher), Some(vec!["a".into(), "b".into()]));
+
+        // Half a file that cannot be parsed is not used either.
+        let full = yaml(ONE, TOKEN);
+        std::fs::write(&file, &full[..full.len() / 2]).unwrap();
+        assert_eq!(check(&mut watcher), None);
+        std::fs::write(&file, &full).unwrap();
+        assert_eq!(check(&mut watcher), None);
+        assert_eq!(check(&mut watcher), Some(vec!["a".into(), "b".into()]));
+    }
+
+    #[test]
+    fn a_read_that_fails_is_tried_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config");
+        std::fs::write(&file, yaml(ONE, "tok-old")).unwrap();
+        let mut watcher = Watcher::new(vec![file.clone()]);
+
+        // A broken file, then the fixed one with the same length and
+        // modification time, as on a file system with coarse times.
+        let renewed = "tok-fedcba9876543210";
+        let fixed = yaml(ONE, renewed);
+        let broken = fixed.replace("kind: Config", "kind: [onfig");
+        assert_eq!(broken.len(), fixed.len());
+        std::fs::write(&file, &broken).unwrap();
+        assert_eq!(check(&mut watcher), None);
+        assert_eq!(check(&mut watcher), None, "cannot be read");
+        assert_eq!(check(&mut watcher), None, "cannot be read");
+        let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::fs::write(&file, &fixed).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(check(&mut watcher), Some(vec!["a".into(), "b".into()]));
+    }
+
+    #[test]
+    fn a_file_that_appears_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::write(&first, yaml(ONE, TOKEN)).unwrap();
+        let mut watcher = Watcher::new(vec![first, second.clone()]);
+        assert_eq!(watcher.prints.len(), 3);
+
+        std::fs::write(&second, SECOND).unwrap();
+        assert_eq!(check(&mut watcher), None);
+        assert_eq!(check(&mut watcher), Some(vec!["d".into()]));
+        std::fs::remove_file(&second).unwrap();
+        assert_eq!(check(&mut watcher), None);
+        assert_eq!(check(&mut watcher), Some(vec!["d".into()]));
     }
 }

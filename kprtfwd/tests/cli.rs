@@ -6,13 +6,12 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::io::{BufRead, BufReader};
 use std::process::{Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use common::{Home, forward, forward_ids, write_database};
+use common::{Home, NOT_FOUND, forward, forward_ids, write_database};
 
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
@@ -99,38 +98,13 @@ const SERVICES: &str = r#"{"kind":"ServiceList","apiVersion":"v1","metadata":{"r
 
 /// An API server that lists one service, shop/api, across the cluster.
 fn fake_api() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        for socket in listener.incoming() {
-            let Ok(mut socket) = socket else { continue };
-            let mut head = Vec::new();
-            let mut chunk = [0; 1024];
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                match socket.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => head.extend_from_slice(&chunk[..n]),
-                }
-            }
-            let head = String::from_utf8_lossy(&head);
-            let path = head.split_whitespace().nth(1).unwrap_or_default();
-            let (status, body) = if path.starts_with("/api/v1/services") {
-                ("200 OK", SERVICES)
-            } else {
-                (
-                    "404 Not Found",
-                    r#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":404}"#,
-                )
-            };
-            let _ = write!(
-                socket,
-                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
-                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
+    common::fake_api(|path| {
+        if path.starts_with("/api/v1/services") {
+            ("200 OK", SERVICES)
+        } else {
+            NOT_FOUND
         }
-    });
-    port
+    })
 }
 
 fn kubeconfig(port: u16) -> String {

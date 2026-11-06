@@ -442,7 +442,7 @@ impl Daemon {
             }
             Request::ReconnectContext { name } => {
                 let wanted = self.wanted().map_err(text)?;
-                self.engine.reconnect(&name, &wanted).await;
+                self.engine.reconnect(&name, &wanted, None).await;
                 info!(context = %name, "reconnected");
                 return Ok(Response::Done);
             }
@@ -614,48 +614,34 @@ async fn adopt_legacy_dir(data_dir: &Path) -> Result<()> {
 }
 
 /// Reconnects contexts whose kubeconfig settings changed: a renewed token, a
-/// moved cluster, a context that did not exist before. Checks the files'
-/// modification times every 2 s; a change elsewhere in the file, like
-/// `kubectl config use-context`, touches no running context.
+/// moved cluster, a context that did not exist before. Checks the files every
+/// 2 s and reads them once a change has settled; see [`kubeconfig::Watcher`].
+/// A change elsewhere in the file, like `kubectl config use-context` or
+/// `kubens`, touches no running context.
 async fn watch_kubeconfig(daemon: Arc<Mutex<Daemon>>) {
-    let files = kubeconfig::files();
-    let modified = || -> Vec<Option<std::time::SystemTime>> {
-        files
-            .iter()
-            .map(|file| fs::metadata(file).and_then(|m| m.modified()).ok())
-            .collect()
-    };
-    let mut last_modified = modified();
-    let mut prints = kubeconfig::fingerprints().unwrap_or_default();
-    debug!(?files, contexts = prints.len(), "watching kubeconfig");
+    let mut watcher = kubeconfig::Watcher::new(kubeconfig::files());
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let now = modified();
-        if now == last_modified {
+        let Some(change) = watcher.check() else {
+            continue;
+        };
+        if change.contexts.is_empty() {
             continue;
         }
-        last_modified = now;
-        debug!("kubeconfig modified");
-        let new_prints = match kubeconfig::fingerprints() {
-            Ok(new_prints) => new_prints,
-            Err(err) => {
-                // Possibly caught mid-write; the next change retries.
-                warn!(%err, "kubeconfig changed but cannot be read");
-                continue;
-            }
-        };
         let mut daemon = daemon.lock().await;
         for name in daemon.engine.context_names() {
-            if new_prints.get(&name) == prints.get(&name) {
+            if !change.contexts.contains(&name) {
                 continue;
             }
             info!(context = %name, "kubeconfig changed, reconnecting");
             match daemon.wanted() {
-                Ok(wanted) => daemon.engine.reconnect(&name, &wanted).await,
+                Ok(wanted) => {
+                    let kubeconfig = Some(&change.kubeconfig);
+                    daemon.engine.reconnect(&name, &wanted, kubeconfig).await;
+                }
                 Err(err) => warn!(%err, "cannot read forwards"),
             }
         }
-        prints = new_prints;
     }
 }
 

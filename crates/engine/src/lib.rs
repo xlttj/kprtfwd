@@ -81,13 +81,7 @@ impl Engine {
         });
         for name in needed {
             if !self.contexts.contains_key(name) {
-                let events = self
-                    .context_events
-                    .entry(name.to_owned())
-                    .or_default()
-                    .clone();
-                let context = Context::start(name, self.kubeconfig.as_ref(), events).await;
-                self.contexts.insert(name.to_owned(), context);
+                self.start_context(name, None).await;
             }
         }
         for (name, context) in &self.contexts {
@@ -119,14 +113,37 @@ impl Engine {
         }
     }
 
-    /// Stops a context and its forwards and starts them again from scratch.
-    pub async fn reconnect(&mut self, context: &str, wanted: &[Forward]) {
+    /// Stops a context and its forwards and starts them again from scratch:
+    /// with the settings in `kubeconfig` if given, as the kubeconfig watcher
+    /// does with the read it just compared, else from the kubeconfig files.
+    pub async fn reconnect(
+        &mut self,
+        context: &str,
+        wanted: &[Forward],
+        kubeconfig: Option<&Kubeconfig>,
+    ) {
         if let Some(old) = self.contexts.remove(context) {
             old.stop();
             self.forwards
                 .retain(|_, handle| handle.spec.context != context);
         }
+        if wanted.iter().any(|forward| forward.context == context) {
+            self.start_context(context, kubeconfig).await;
+        }
         self.reconcile(wanted).await;
+    }
+
+    /// Starts the actor of a context, with the settings in `kubeconfig`, else
+    /// in the engine's own, else in the kubeconfig files.
+    async fn start_context(&mut self, name: &str, kubeconfig: Option<&Kubeconfig>) {
+        let events = self
+            .context_events
+            .entry(name.to_owned())
+            .or_default()
+            .clone();
+        let kubeconfig = kubeconfig.or(self.kubeconfig.as_ref());
+        let context = Context::start(name, kubeconfig, events).await;
+        self.contexts.insert(name.to_owned(), context);
     }
 
     /// The state of a context in use; `None` if no enabled forward uses it.
@@ -360,7 +377,7 @@ contexts:
         let staging = engine.contexts["staging"].clone();
         let production = engine.contexts["production"].clone();
 
-        engine.reconnect("staging", &wanted).await;
+        engine.reconnect("staging", &wanted, None).await;
         assert!(!Arc::ptr_eq(&staging, &engine.contexts["staging"]));
         assert!(Arc::ptr_eq(&production, &engine.contexts["production"]));
         assert!(watched(&engine, "staging", "shop"));
@@ -371,9 +388,43 @@ contexts:
         assert_eq!(starts_and_stops(&engine, &prod.id), ["started"]);
 
         // A context not in use is just reconciled.
-        engine.reconnect("idle", &wanted).await;
+        engine.reconnect("idle", &wanted, None).await;
         assert_eq!(sorted(engine.context_names()), ["production", "staging"]);
         assert_eq!(starts_and_stops(&engine, &prod.id), ["started"]);
+    }
+
+    #[tokio::test]
+    async fn reconnect_uses_the_kubeconfig_it_is_given() {
+        let mut engine = Engine::with_kubeconfig(kubeconfig());
+        let api = forward("staging", "shop", "api");
+        let wanted = [api.clone()];
+        engine.reconcile(&wanted).await;
+        assert!(!matches!(
+            engine.context_state("staging"),
+            Some(ContextState::ConfigError { .. })
+        ));
+
+        // A read without the context, as the watcher would pass it.
+        let without: Kubeconfig = Kubeconfig {
+            contexts: vec![],
+            ..kubeconfig()
+        };
+        engine.reconnect("staging", &wanted, Some(&without)).await;
+        let Some(ContextState::ConfigError { message }) = engine.context_state("staging") else {
+            panic!("{:?}", engine.context_state("staging"));
+        };
+        assert!(message.contains("staging"), "{message}");
+        assert_eq!(
+            starts_and_stops(&engine, &api.id),
+            ["started", "stopped", "started"]
+        );
+
+        // Without one, the engine's own counts again.
+        engine.reconnect("staging", &wanted, None).await;
+        assert!(!matches!(
+            engine.context_state("staging"),
+            Some(ContextState::ConfigError { .. })
+        ));
     }
 
     #[tokio::test]

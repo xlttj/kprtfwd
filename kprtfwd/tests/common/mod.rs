@@ -1,9 +1,9 @@
-//! What the binary tests share: a home directory of their own and databases
-//! to start from.
+//! What the binary tests share: a home directory of their own, databases to
+//! start from, and a fake API server.
 //!
 //! Every command runs with `HOME` set to a fresh directory and without
 //! `KPRTFWD_HOME` and `XDG_CONFIG_HOME`, so nothing touches the real data.
-//! `KUBECONFIG` is removed too, unless a test gives its own file. Daemons are
+//! `KUBECONFIG` is removed too, unless a test gives its own files. Daemons are
 //! only ever started through [`Home::command`]: one started from the test
 //! process would inherit the real `HOME`.
 
@@ -11,7 +11,8 @@
 #![allow(dead_code)]
 
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -190,4 +191,42 @@ pub async fn wait_until(what: &str, done: impl Fn() -> bool) {
         assert!(started.elapsed() < Duration::from_secs(10), "not {what}");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// A status line and a JSON body.
+pub type Answer = (&'static str, &'static str);
+
+pub const NOT_FOUND: Answer = (
+    "404 Not Found",
+    r#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":404}"#,
+);
+
+/// An API server in this process that answers every request with what
+/// `answer` returns for its path. Returns its port.
+pub fn fake_api(answer: fn(&str) -> Answer) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for socket in listener.incoming() {
+            let Ok(mut socket) = socket else { continue };
+            let mut head = Vec::new();
+            let mut chunk = [0; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match socket.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let head = String::from_utf8_lossy(&head);
+            let path = head.split_whitespace().nth(1).unwrap_or_default();
+            let (status, body) = answer(path);
+            let _ = write!(
+                socket,
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    port
 }

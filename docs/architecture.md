@@ -214,15 +214,21 @@ Main dependencies:
   one place, for clients, discovery and the hashes below, and skips files that
   do not exist, as kubectl does: a stale entry in `KUBECONFIG` breaks no
   context, and `status` marks it missing. Every 2 s the daemon checks the
-  files' modification times. After a change it hashes, per context, what its client
-  is built from (the names of its cluster and user and their entries) and
-  reconnects only the running contexts whose hash changed: a renewed token, a
-  moved cluster, a context that was missing. The hash sorts the keys of every
-  map first: kube-rs keeps some settings (exec env entries, auth-provider
-  config) in maps whose order differs between reads. Switching
-  `current-context`, editing another context, or changing a context's default
-  namespace (`kubens`) or extensions leaves running forwards alone; forwards
-  carry their own namespace.
+  files' modification times and lengths. Tools rewrite the kubeconfig in
+  place, so a check can catch it half written, even empty: a change is read
+  only once the files looked the same at two checks in a row, and the read
+  counts only if they still look the same after it. The files count as read
+  only after a read that worked; until then every check reads them again, so
+  a fix is not missed where modification times are coarse. After a read it
+  hashes, per context, what its client is built from (the names of its
+  cluster and user and their entries) and reconnects only the running
+  contexts whose hash changed: a renewed token, a moved cluster, a context
+  that was missing. They start from that read, so they run exactly what was
+  compared. The hash sorts the keys of every map first: kube-rs keeps some
+  settings (exec env entries, auth-provider config) in maps whose order
+  differs between reads. Switching `current-context`, editing another
+  context, or changing a context's default namespace (`kubens`) or extensions
+  leaves running forwards alone; forwards carry their own namespace.
   Only the hashes are kept, not the settings, which include credentials. For
   the same reason a kubeconfig that cannot be parsed is reported by line and
   column only, never with the lines around the error.
@@ -725,7 +731,11 @@ These are shown in the INFO column and by `kprtfwd status`.
   - unit tests with a fake API server on a local port (`fake.rs`): the probe's
     state machine with a given time and the rule for restarting watches;
     `Engine::reconcile` and `reconnect` with a kubeconfig of their own, never
-    `~/.kube/config`; kubeconfig fingerprints; discovery and its
+    `~/.kube/config`; kubeconfig fingerprints (maps read in any order, the
+    default namespace), merging with missing files, and the watcher on
+    files in a temporary directory (a change read only once settled, a
+    truncated or half-written file never used, a failed read tried again with
+    the same time and length, a file that appears); discovery and its
     per-namespace fallback; the error classification with the errors kube-rs,
     hyper-util and rustls really return;
   - the watch cache's lookup over hand-built Services and EndpointSlices
@@ -751,14 +761,17 @@ These are shown in the INFO column and by `kprtfwd status`.
 - **proto:** serde round trips and the protocol version check.
 - **daemon:** `kprtfwd/tests/daemon.rs` runs the real binary with `HOME` set to
   a temporary directory: quitting the last TUI switches the forwards off and
-  lifts the pause, another client or `keep_forwards_running` keeps them, and a
-  daemon still running in `~/.kprtfwd` is stopped and its database copied.
+  lifts the pause, another client or `keep_forwards_running` keeps them, a
+  daemon still running in `~/.kprtfwd` is stopped and its database copied,
+  and with a fake API server and exec plugin, `use-context`, `kubens` and a
+  rewrite of a user with env entries cause no reconnect and no login while a
+  moved cluster causes exactly one.
 - **cli:** unit tests for the exit code rules; `kprtfwd/tests/cli.rs` runs the
   binary the same way: exit code 2 without a daemon and for one that cannot
   start, 3 while an enabled forward is not ready and 0 once it is paused, `up`
   and `down` by words and with `--all`, `prune` against a fake API server
-  (declined, confirmed, `-y`, the daemon's current context), and `logs` with
-  and without `-f`.
+  (declined, confirmed, `-y`, the daemon's current context, a missing file in
+  `KUBECONFIG`), and `logs` with and without `-f`.
 - **tui:** key-by-key tests of `App::update`, drawing tests with `TestBackend`,
   tests of the event loop against a fake daemon on tokio's paused clock (a
   lost daemon and the reconnect, a request's result and the fresh snapshot, a
