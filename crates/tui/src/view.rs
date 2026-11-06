@@ -4,8 +4,8 @@
 use std::time::SystemTime;
 
 use kprtfwd_core::clock::local_time;
-use kprtfwd_core::{ContextState, ForwardState};
-use kprtfwd_proto::Snapshot;
+use kprtfwd_core::{ContextState, ForwardId, ForwardState};
+use kprtfwd_proto::{EventEntry, Snapshot};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -99,23 +99,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             popup(frame, title, lines, 64);
         }
         Mode::Discovery(step) => draw_discovery(frame, app, step),
-        Mode::Events { id, entries } => {
-            let mut lines: Vec<Line> = entries
-                .iter()
-                .map(|e| {
-                    // Context events say which context; the forward's own don't need to.
-                    if e.source == id.as_str() {
-                        Line::raw(format!("{}  {}", local_time(e.at), e.message))
-                    } else {
-                        Line::raw(format!("{}  {}: {}", local_time(e.at), e.source, e.message))
-                    }
-                })
-                .collect();
-            if lines.is_empty() {
-                lines.push(Line::styled("no events yet", dim()));
-            }
-            popup(frame, &format!(" events: {id} "), lines, 100);
-        }
+        Mode::Events { id, entries, back } => draw_events(frame, app, id, entries, *back),
         Mode::Confirm { question, .. } => {
             popup(
                 frame,
@@ -340,8 +324,45 @@ fn info(view: &kprtfwd_proto::ForwardView, context: &ContextState) -> String {
     }
 }
 
+/// The events oldest first, so the newest are at the bottom, next to the
+/// keys; scrolled to the newest unless the user scrolled back.
+fn draw_events(frame: &mut Frame, app: &App, id: &ForwardId, entries: &[EventEntry], back: usize) {
+    let mut items: Vec<Line> = entries
+        .iter()
+        .map(|e| {
+            // Context events say which context; the forward's own don't need to.
+            if e.source == id.as_str() {
+                Line::raw(format!("{}  {}", local_time(e.at), e.message))
+            } else {
+                Line::raw(format!("{}  {}: {}", local_time(e.at), e.source, e.message))
+            }
+        })
+        .collect();
+    if items.is_empty() {
+        items.push(Line::styled("no events yet", dim()));
+    }
+    // A blank line and the keys below the events.
+    let area = popup_area(frame, 100, items.len() + 2);
+    let rows = usize::from(area.height).saturating_sub(4);
+    app.popup.rows.set(rows);
+    let oldest = items.len().saturating_sub(rows);
+    let back = back.min(oldest);
+    let keys = match (oldest, back) {
+        (0, _) => "esc close".to_owned(),
+        (_, 0) => "j k PgUp PgDn g G scroll · esc close".to_owned(),
+        (_, back) => format!("{back} newer below · j k PgUp PgDn g G scroll · esc close"),
+    };
+    let lines = items
+        .into_iter()
+        .skip(oldest - back)
+        .take(rows)
+        .chain([Line::raw(""), Line::styled(keys, dim())])
+        .collect();
+    boxed(frame, area, &format!(" events: {id} "), lines);
+}
+
 fn draw_projects(frame: &mut Frame, app: &App, selected: usize, naming: Option<&str>) {
-    let mut lines: Vec<Line> = app
+    let mut items: Vec<Line> = app
         .snapshot
         .projects
         .iter()
@@ -355,30 +376,30 @@ fn draw_projects(frame: &mut Frame, app: &App, selected: usize, naming: Option<&
             }
         })
         .collect();
-    if lines.is_empty() {
-        lines.push(Line::styled("no projects yet", dim()));
+    if items.is_empty() {
+        items.push(Line::styled("no projects yet", dim()));
     }
-    lines.push(Line::raw(""));
+    let mut footer = vec![Line::raw("")];
     match naming {
         Some(name) => {
             let listed = app.visible().len();
-            lines.push(Line::raw(format!(
+            footer.push(Line::raw(format!(
                 "new project with the {listed} listed forwards: {name}_"
             )));
-            lines.push(Line::styled("enter create · esc cancel", dim()));
+            footer.push(Line::styled("enter create · esc cancel", dim()));
         }
         None => {
-            lines.push(Line::styled(
+            footer.push(Line::styled(
                 "enter on · - off · s switch to · f show members",
                 dim(),
             ));
-            lines.push(Line::styled(
+            footer.push(Line::styled(
                 "n new from list · u set to list · x delete · esc back",
                 dim(),
             ));
         }
     }
-    popup(frame, " projects ", lines, 64);
+    scrolled_popup(frame, " projects ", items, &app.popup, selected, footer, 64);
 }
 
 fn draw_discovery(frame: &mut Frame, app: &App, step: &Discovery) {
@@ -402,7 +423,7 @@ fn draw_discovery(frame: &mut Frame, app: &App, step: &Discovery) {
             80,
         ),
         Discovery::Contexts { names, selected } => {
-            let mut lines: Vec<Line> = names
+            let items: Vec<Line> = names
                 .iter()
                 .enumerate()
                 .map(|(i, name)| {
@@ -413,9 +434,12 @@ fn draw_discovery(frame: &mut Frame, app: &App, step: &Discovery) {
                     }
                 })
                 .collect();
-            lines.push(Line::raw(""));
-            lines.push(Line::styled("enter choose · esc cancel", dim()));
-            popup(frame, " discover: context ", lines, 60);
+            let footer = vec![
+                Line::raw(""),
+                Line::styled("enter choose · esc cancel", dim()),
+            ];
+            let title = " discover: context ";
+            scrolled_popup(frame, title, items, &app.popup, *selected, footer, 60);
         }
         Discovery::Namespace { context, input } => popup(
             frame,
@@ -568,10 +592,41 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
 
 /// A bordered box in the middle of the screen, sized to its lines.
 fn popup(frame: &mut Frame, title: &str, lines: Vec<Line>, width: u16) {
-    let height = u16::try_from(lines.len())
-        .unwrap_or(u16::MAX)
-        .saturating_add(2);
-    let area = centered(frame.area(), width, height);
+    let area = popup_area(frame, width, lines.len());
+    boxed(frame, area, title, lines);
+}
+
+/// A popup of `items` that keeps the `selected` one in view when they do
+/// not fit the screen; it scrolls from where it was last time (`shown`).
+/// `footer` stays below the items.
+fn scrolled_popup(
+    frame: &mut Frame,
+    title: &str,
+    items: Vec<Line>,
+    shown: &Shown,
+    selected: usize,
+    footer: Vec<Line>,
+    width: u16,
+) {
+    let area = popup_area(frame, width, items.len() + footer.len());
+    let rows = usize::from(area.height).saturating_sub(footer.len() + 2);
+    let top = scroll(shown, Some(selected), items.len(), rows);
+    let lines = items
+        .into_iter()
+        .skip(top)
+        .take(rows)
+        .chain(footer)
+        .collect();
+    boxed(frame, area, title, lines);
+}
+
+/// Where a popup of `lines` lines goes: in the middle, cut to the screen.
+fn popup_area(frame: &Frame, width: u16, lines: usize) -> Rect {
+    let height = u16::try_from(lines).unwrap_or(u16::MAX).saturating_add(2);
+    centered(frame.area(), width, height)
+}
+
+fn boxed(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line>) {
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(title.to_owned())),
@@ -593,9 +648,8 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tests::{key, port, snapshot, view};
+    use crate::app::tests::{events, key, port, snapshot, view};
     use crate::app::{Candidate, Msg};
-    use kprtfwd_core::ForwardId;
     use kprtfwd_proto::ContextView;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -852,6 +906,67 @@ mod tests {
         assert_eq!(at(None, 8, 10), 0);
         assert_eq!(at(Some(0), 1, 0), 0, "no rows");
         assert_eq!(shown.rows.get(), 0);
+    }
+
+    #[test]
+    fn the_events_view_shows_the_newest_and_scrolls_back() {
+        let mut app = App::new(snapshot());
+        app.update(key(KeyCode::Char('l')));
+        app.update(Msg::Events(Ok(events(60))));
+        let screen = render(&app, 120, 30).join("\n");
+        // 30 lines leave 26 for events, after the border, the blank line
+        // and the keys.
+        assert_eq!(app.popup.rows.get(), 26);
+        assert!(screen.contains("event 059"), "{screen}");
+        assert!(screen.contains("event 034"), "{screen}");
+        assert!(!screen.contains("event 033"), "{screen}");
+        assert!(screen.contains("j k PgUp PgDn g G scroll · esc close"));
+
+        app.update(key(KeyCode::Char('k')));
+        let screen = render(&app, 120, 30).join("\n");
+        assert!(screen.contains("event 033") && !screen.contains("event 059"));
+        assert!(screen.contains("1 newer below"), "{screen}");
+
+        app.update(key(KeyCode::Char('g')));
+        let screen = render(&app, 120, 30).join("\n");
+        assert!(screen.contains("event 000") && screen.contains("event 025"));
+        assert!(screen.contains("34 newer below"), "{screen}");
+
+        // A short list shows whole, with nothing to scroll.
+        app.update(Msg::Events(Ok(events(3))));
+        let screen = render(&app, 120, 30).join("\n");
+        assert!(screen.contains("event 000") && screen.contains("event 002"));
+        assert!(screen.contains("esc close") && !screen.contains("scroll"));
+    }
+
+    #[test]
+    fn popups_keep_the_selection_in_view() {
+        let mut app = App::new(snapshot());
+        let names: Vec<String> = (0..40).map(|i| format!("cluster-{i:02}")).collect();
+        app.mode = Mode::Discovery(Discovery::Contexts {
+            names,
+            selected: 35,
+        });
+        let screen = render(&app, 100, 20);
+        let at = position(&screen, "cluster-35").1;
+        let below = position(&screen, "enter choose").1;
+        assert!(at < below, "{screen:?}");
+        assert!(screen.iter().any(|line| line.contains("cluster-26")));
+
+        app.snapshot.projects = (0..30)
+            .map(|i| kprtfwd_proto::ProjectView {
+                name: format!("project-{i:02}"),
+                forwards: Vec::new(),
+                enabled: 0,
+            })
+            .collect();
+        app.mode = Mode::Projects {
+            selected: 29,
+            naming: None,
+        };
+        let screen = render(&app, 100, 20);
+        assert!(position(&screen, "project-29").1 < position(&screen, "x delete").1);
+        assert!(!screen.iter().any(|line| line.contains("project-00")));
     }
 
     #[test]

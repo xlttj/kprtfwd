@@ -119,7 +119,10 @@ pub enum Mode {
     Discovery(Discovery),
     Events {
         id: ForwardId,
+        /// Oldest first.
         entries: Vec<EventEntry>,
+        /// Lines scrolled back from the newest event; 0 follows new events.
+        back: usize,
     },
     Confirm {
         question: String,
@@ -400,7 +403,17 @@ impl App {
             }
             Msg::Events(result) => {
                 match (result, &mut self.mode) {
-                    (Ok(new), Mode::Events { entries, .. }) => *entries = new,
+                    (Ok(new), Mode::Events { entries, back, .. }) => {
+                        // Scrolled back, the same events stay in view while
+                        // newer ones arrive.
+                        if *back > 0
+                            && let Some(newest) = entries.last()
+                            && let Some(at) = new.iter().rposition(|entry| entry == newest)
+                        {
+                            *back += new.len() - 1 - at;
+                        }
+                        *entries = new;
+                    }
                     (Err(err), Mode::Events { .. }) => {
                         self.mode = Mode::List;
                         self.error(err);
@@ -420,12 +433,7 @@ impl App {
                     Mode::Projects { selected, naming } => self.projects_key(key, selected, naming),
                     Mode::Form(form) => self.form_key(key, form),
                     Mode::Discovery(step) => self.discovery_key(key, step),
-                    Mode::Events { id, entries } => {
-                        if !matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | 'l')) {
-                            self.mode = Mode::Events { id, entries };
-                        }
-                        Vec::new()
-                    }
+                    Mode::Events { id, entries, back } => self.events_key(key, id, entries, back),
                     Mode::Confirm { cmd, .. } => {
                         if key.code == KeyCode::Char('y') {
                             vec![cmd]
@@ -598,6 +606,7 @@ impl App {
                     self.mode = Mode::Events {
                         id: id.clone(),
                         entries: Vec::new(),
+                        back: 0,
                     };
                     return vec![Cmd::Events { id }];
                 }
@@ -605,6 +614,34 @@ impl App {
             KeyCode::Char('?') => self.mode = Mode::Help,
             _ => {}
         }
+        Vec::new()
+    }
+
+    /// Keys in the events view: it scrolls back from the newest event.
+    fn events_key(
+        &mut self,
+        key: KeyEvent,
+        id: ForwardId,
+        entries: Vec<EventEntry>,
+        back: usize,
+    ) -> Vec<Cmd> {
+        let page = self.popup.rows.get().max(1);
+        let oldest = entries.len().saturating_sub(page);
+        let back = match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | 'l') => return Vec::new(),
+            KeyCode::Up | KeyCode::Char('k') => back + 1,
+            KeyCode::Down | KeyCode::Char('j') => back.saturating_sub(1),
+            KeyCode::PageUp => back + page,
+            KeyCode::PageDown => back.saturating_sub(page),
+            KeyCode::Home | KeyCode::Char('g') => oldest,
+            KeyCode::End | KeyCode::Char('G') => 0,
+            _ => back,
+        };
+        self.mode = Mode::Events {
+            id,
+            entries,
+            back: back.min(oldest),
+        };
         Vec::new()
     }
 
@@ -1336,6 +1373,17 @@ pub(crate) mod tests {
         ));
     }
 
+    /// `n` events of `prd-web`, a second apart, oldest first.
+    pub fn events(n: u64) -> Vec<EventEntry> {
+        (0..n)
+            .map(|i| EventEntry {
+                at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(i),
+                source: "prd-web".into(),
+                message: format!("event {i:03}"),
+            })
+            .collect()
+    }
+
     pub fn found(ports: Vec<DiscoveredPort>) -> Found {
         Found {
             ports,
@@ -1505,6 +1553,7 @@ pub(crate) mod tests {
             app.mode = Mode::Events {
                 id: id.clone(),
                 entries: vec![],
+                back: 0,
             };
             app.update(key(close));
             assert!(matches!(app.mode, Mode::List), "{close:?}");
@@ -1516,6 +1565,40 @@ pub(crate) mod tests {
         app.update(Msg::Events(Err("unknown forward".into())));
         assert!(matches!(app.mode, Mode::List));
         assert_eq!(message(&app), ("unknown forward", true));
+    }
+
+    #[test]
+    fn the_events_view_scrolls_back_and_keeps_its_place() {
+        let back = |app: &App| match &app.mode {
+            Mode::Events { back, .. } => *back,
+            _ => panic!("events view closed"),
+        };
+        let mut app = App::new(snapshot());
+        app.popup.rows.set(10);
+        app.update(key(KeyCode::Char('l')));
+        app.update(Msg::Events(Ok(events(30))));
+        let mut press = |code| {
+            app.update(key(code));
+            back(&app)
+        };
+        assert_eq!(press(KeyCode::Char('k')), 1);
+        assert_eq!(press(KeyCode::PageUp), 11);
+        assert_eq!(press(KeyCode::Char('g')), 20, "the oldest on top");
+        assert_eq!(press(KeyCode::Up), 20);
+        assert_eq!(press(KeyCode::PageDown), 10);
+        assert_eq!(press(KeyCode::Char('j')), 9);
+        assert_eq!(press(KeyCode::Char('G')), 0);
+        assert_eq!(press(KeyCode::Down), 0);
+        assert_eq!(press(KeyCode::Home), 20);
+        assert_eq!(press(KeyCode::End), 0);
+
+        // At the newest it follows new events; scrolled back it stays put,
+        // also when old ones drop out.
+        app.update(Msg::Events(Ok(events(32))));
+        assert_eq!(back(&app), 0);
+        app.update(key(KeyCode::Char('k')));
+        app.update(Msg::Events(Ok(events(35)[2..].to_vec())));
+        assert_eq!(back(&app), 4);
     }
 
     #[test]

@@ -746,7 +746,7 @@ Keys:
 | `d` | discover services |
 | `P` | pause or resume all |
 | `r` | reconnect the selected forward's context |
-| `l` | events of the selected forward |
+| `l` | events of the selected forward, the newest at the bottom; `j k`, `PgUp PgDn`, `g G` scroll back |
 | `?` | key help |
 | `ctrl+l` | redraw the screen |
 | `q` | quit and switch all forwards off; with `keep_forwards_running` they keep running |
