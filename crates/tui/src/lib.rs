@@ -1,15 +1,19 @@
 //! The kprtfwd terminal UI: one list of all forwards across all contexts.
 //!
 //! It asks the daemon for a snapshot every 300 ms; the local socket makes that
-//! cheap, and it keeps the UI free of a push protocol.
+//! cheap, and it keeps the UI free of a push protocol. Daemon calls run one at
+//! a time next to the keys, each with a time limit, so a slow or lost daemon
+//! never holds up the keys.
 
 mod app;
 mod view;
 
+use std::collections::VecDeque;
+use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use kprtfwd_core::{Config, paths};
 use kprtfwd_proto::{Client, ClientError, Request, Response, Snapshot, connect_or_start};
 use ratatui::Terminal;
@@ -17,17 +21,34 @@ use ratatui::backend::Backend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::widgets::Clear;
 use tokio::sync::mpsc;
+use tokio::time::{Instant, MissedTickBehavior, timeout};
 
 use crate::app::{App, Cmd, Msg};
 
 const REFRESH: Duration = Duration::from_millis(300);
+/// How long the daemon may take to answer a snapshot or a request. It needs
+/// milliseconds; a daemon that takes longer counts as lost.
+const ANSWER_WITHIN: Duration = Duration::from_secs(5);
+/// How long connecting may take, a daemon start included (which
+/// `connect_or_start` waits 10 s for).
+const CONNECT_WITHIN: Duration = Duration::from_secs(15);
+/// The pause between two attempts to reach a lost daemon.
+const RECONNECT_EVERY: Duration = Duration::from_secs(1);
+/// How long discovery may take: the daemon gives a browser login 5 minutes.
+const DISCOVER_WITHIN: Duration = Duration::from_secs(6 * 60);
+const NOT_CONNECTED: &str = "not connected to the daemon";
+const UNEXPECTED: &str = "unexpected answer from the daemon";
 
 pub async fn run() -> Result<()> {
     // A broken config.toml is reported now, not only when quitting.
     let config_path = paths::config_path().context("neither KPRTFWD_HOME nor HOME is set")?;
     let config = Config::load(&config_path)?;
-    let mut daemon = Connection(attach().await?);
-    let snapshot = daemon.snapshot().await?;
+    let mut client = timeout(CONNECT_WITHIN, attach())
+        .await
+        .map_err(|_| anyhow!(no_answer(CONNECT_WITHIN)))??;
+    let snapshot = timeout(ANSWER_WITHIN, client.snapshot())
+        .await
+        .map_err(|_| anyhow!(no_answer(ANSWER_WITHIN)))??;
     let mut app = App::new(snapshot);
     app.keep_forwards_running = config.keep_forwards_running;
     app.config_path = home_relative(&config_path);
@@ -35,19 +56,17 @@ pub async fn run() -> Result<()> {
     let mut terminal = ratatui::init();
     let (tx, rx) = mpsc::unbounded_channel::<Msg>();
     read_terminal(tx.clone());
-    let result = event_loop(&mut terminal, &mut daemon, &mut app, rx, tx).await;
+    let result = event_loop(&mut terminal, Socket, client, &mut app, rx, tx).await;
     ratatui::restore();
     result
 }
 
-/// What the TUI needs from the daemon; a fake in tests.
+/// The daemon, as the TUI needs it; a fake in tests.
 trait Daemon {
-    async fn snapshot(&mut self) -> Result<Snapshot, ClientError>;
+    type Conn: Connection;
 
-    async fn request(&mut self, request: Request) -> Result<Response, ClientError>;
-
-    /// Connects again, after the connection was lost.
-    async fn reconnect(&mut self) -> Result<()>;
+    /// Connects as a TUI, starting the daemon if needed.
+    fn attach(&self) -> impl Future<Output = Result<Self::Conn, String>> + 'static;
 
     /// Sends a request on a connection of its own, for slow ones: the list
     /// stays usable meanwhile.
@@ -57,21 +76,22 @@ trait Daemon {
     ) -> impl Future<Output = Result<Response, String>> + Send + 'static;
 }
 
-/// The daemon over its socket.
-struct Connection(Client);
+/// One connection to the daemon.
+trait Connection: 'static {
+    async fn snapshot(&mut self) -> Result<Snapshot, ClientError>;
 
-impl Daemon for Connection {
-    async fn snapshot(&mut self) -> Result<Snapshot, ClientError> {
-        self.0.snapshot().await
-    }
+    async fn request(&mut self, request: Request) -> Result<Response, ClientError>;
+}
 
-    async fn request(&mut self, request: Request) -> Result<Response, ClientError> {
-        self.0.request(request).await
-    }
+/// The daemon on its socket.
+struct Socket;
 
-    async fn reconnect(&mut self) -> Result<()> {
-        self.0 = attach().await?;
-        Ok(())
+impl Daemon for Socket {
+    type Conn = Client;
+
+    fn attach(&self) -> impl Future<Output = Result<Client, String>> + 'static {
+        let attaching = attach();
+        async move { attaching.await.map_err(|err| format!("{err:#}")) }
     }
 
     fn request_aside(
@@ -83,6 +103,16 @@ impl Daemon for Connection {
             let mut client = Client::connect(&socket?).await.map_err(|e| e.to_string())?;
             client.request(request).await.map_err(|e| e.to_string())
         }
+    }
+}
+
+impl Connection for Client {
+    async fn snapshot(&mut self) -> Result<Snapshot, ClientError> {
+        Client::snapshot(self).await
+    }
+
+    async fn request(&mut self, request: Request) -> Result<Response, ClientError> {
+        Client::request(self, request).await
     }
 }
 
@@ -128,7 +158,8 @@ fn read_terminal(tx: mpsc::UnboundedSender<Msg>) {
 /// user quits. `tx` is for answers that arrive later.
 async fn event_loop<B, D>(
     terminal: &mut Terminal<B>,
-    daemon: &mut D,
+    daemon: D,
+    conn: D::Conn,
     app: &mut App,
     mut rx: mpsc::UnboundedReceiver<Msg>,
     tx: mpsc::UnboundedSender<Msg>,
@@ -138,7 +169,10 @@ where
     B::Error: Send + Sync + 'static,
     D: Daemon,
 {
+    let mut link = Link::new(daemon, conn);
     let mut refresh = tokio::time::interval(REFRESH);
+    // A tick missed while the loop was busy is not made up for.
+    refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         terminal.draw(|frame| view::draw(frame, app))?;
@@ -161,16 +195,9 @@ where
                 }
                 app.update(msg)
             }
+            finished = link.finished() => link.finish(finished, app),
             _ = refresh.tick() => {
-                match daemon.snapshot().await {
-                    Ok(snapshot) => {
-                        app.update(Msg::Snapshot(snapshot));
-                    }
-                    Err(err) => {
-                        app.update(Msg::Done(Err(format!("lost the daemon: {err}; reconnecting"))));
-                        let _ = daemon.reconnect().await;
-                    }
-                }
+                link.refresh();
                 app.tick()
             }
         };
@@ -178,64 +205,288 @@ where
             return Ok(());
         }
         for cmd in cmds {
-            run_cmd(cmd, daemon, app, &tx).await;
+            run_cmd(cmd, &mut link, app, &tx);
         }
+        link.start_next();
     }
 }
 
-async fn run_cmd(
+/// A daemon call in flight. It owns the connection and gives it back.
+type Call<C> = Pin<Box<dyn Future<Output = Finished<C>>>>;
+
+/// What a daemon call gives back.
+struct Finished<C> {
+    conn: C,
+    msgs: Vec<Msg>,
+    /// Why the connection is lost, if it is.
+    lost: Option<String>,
+}
+
+/// The event loop's connection to the daemon. One call runs at a time, with
+/// a time limit, while the loop goes on taking keys.
+struct Link<D: Daemon> {
+    daemon: D,
+    /// The connection while no call has it. While the daemon is lost it is
+    /// the old one, kept open until a new one has attached: the daemon must
+    /// not see this TUI leave in between and switch the forwards off.
+    idle: Option<D::Conn>,
+    call: Option<Call<D::Conn>>,
+    /// Daemon commands waiting for the call in flight.
+    queue: VecDeque<Cmd>,
+    /// While the daemon is lost: when to try to reach it again.
+    retry_at: Option<Instant>,
+}
+
+impl<D: Daemon> Link<D> {
+    fn new(daemon: D, conn: D::Conn) -> Self {
+        Self {
+            daemon,
+            idle: Some(conn),
+            call: None,
+            queue: VecDeque::new(),
+            retry_at: None,
+        }
+    }
+
+    /// The result of the call in flight; never ready without one.
+    async fn finished(&mut self) -> Finished<D::Conn> {
+        match &mut self.call {
+            Some(call) => call.await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// A fresh snapshot, unless the connection is busy or lost.
+    fn refresh(&mut self) {
+        if self.retry_at.is_none() && self.queue.is_empty() && self.call.is_none() {
+            self.start(Work::Refresh);
+        }
+    }
+
+    /// Takes a daemon command; it runs once the connection is free. While
+    /// the daemon is lost it fails at once.
+    fn push(&mut self, cmd: Cmd, app: &mut App) {
+        if self.retry_at.is_some() {
+            app.update(refused(cmd, NOT_CONNECTED));
+            return;
+        }
+        // The events view asks on every tick; once in the queue is enough.
+        if matches!(cmd, Cmd::Events { .. }) && self.queue.contains(&cmd) {
+            return;
+        }
+        self.queue.push_back(cmd);
+    }
+
+    /// Starts what is due once the connection is free: the next command, or
+    /// while the daemon is lost, the next attempt to reach it.
+    fn start_next(&mut self) {
+        if self.call.is_some() {
+            return;
+        }
+        if let Some(cmd) = self.queue.pop_front() {
+            self.start(Work::Cmd(cmd));
+        } else if self.retry_at.is_some_and(|at| at <= Instant::now()) {
+            self.start(Work::Reconnect);
+        }
+    }
+
+    fn start(&mut self, work: Work) {
+        let Some(conn) = self.idle.take() else {
+            return;
+        };
+        self.call = Some(match work {
+            Work::Refresh => Box::pin(refreshed(conn)),
+            Work::Cmd(cmd) => Box::pin(ask(conn, cmd)),
+            Work::Reconnect => Box::pin(reconnect(conn, self.daemon.attach())),
+        });
+    }
+
+    /// Takes the result of the call that finished.
+    fn finish(&mut self, finished: Finished<D::Conn>, app: &mut App) -> Vec<Cmd> {
+        self.call = None;
+        self.idle = Some(finished.conn);
+        let cmds = finished
+            .msgs
+            .into_iter()
+            .flat_map(|msg| app.update(msg))
+            .collect();
+        match finished.lost {
+            None => self.retry_at = None,
+            Some(reason) => {
+                for cmd in self.queue.drain(..) {
+                    app.update(refused(cmd, NOT_CONNECTED));
+                }
+                self.retry_at = Some(match self.retry_at {
+                    // Just lost: try again at once, a restart takes a moment.
+                    None => {
+                        app.update(Msg::Done(Err(format!(
+                            "lost the daemon: {reason}; reconnecting"
+                        ))));
+                        Instant::now()
+                    }
+                    Some(_) => Instant::now() + RECONNECT_EVERY,
+                });
+            }
+        }
+        cmds
+    }
+}
+
+/// What a daemon call does.
+enum Work {
+    Refresh,
+    Cmd(Cmd),
+    Reconnect,
+}
+
+/// The answer to a daemon command that cannot be sent.
+fn refused(cmd: Cmd, reason: &str) -> Msg {
+    match cmd {
+        Cmd::ListContexts => Msg::Contexts(Err(reason.into())),
+        Cmd::Events { .. } => Msg::Events(Err(reason.into())),
+        // The others do not go over the connection; only requests are left.
+        _ => Msg::Done(Err(reason.into())),
+    }
+}
+
+/// A daemon call with its time limit. The outer error says why the
+/// connection is lost; the daemon's own refusal is the inner one.
+async fn bounded<T>(
+    call: impl Future<Output = Result<T, ClientError>>,
+) -> Result<Result<T, String>, String> {
+    match timeout(ANSWER_WITHIN, call).await {
+        Ok(Ok(value)) => Ok(Ok(value)),
+        Ok(Err(ClientError::Daemon(message))) => Ok(Err(message)),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err(no_answer(ANSWER_WITHIN)),
+    }
+}
+
+/// The answer of a [`bounded`] call, and why the connection is lost, if it is.
+fn split<T>(result: Result<Result<T, String>, String>) -> (Result<T, String>, Option<String>) {
+    match result {
+        Ok(answer) => (answer, None),
+        Err(reason) => (Err(reason.clone()), Some(reason)),
+    }
+}
+
+fn no_answer(limit: Duration) -> String {
+    let secs = limit.as_secs();
+    if secs >= 60 && secs.is_multiple_of(60) {
+        format!("the daemon did not answer within {} min", secs / 60)
+    } else {
+        format!("the daemon did not answer within {secs} s")
+    }
+}
+
+/// Asks for a snapshot; returns why the connection is lost, if it is.
+async fn fetch_snapshot(conn: &mut impl Connection, msgs: &mut Vec<Msg>) -> Option<String> {
+    let (answer, lost) = split(bounded(conn.snapshot()).await);
+    match answer {
+        Ok(snapshot) => msgs.push(Msg::Snapshot(snapshot)),
+        Err(message) if lost.is_none() => msgs.push(Msg::Done(Err(message))),
+        Err(_) => {}
+    }
+    lost
+}
+
+async fn refreshed<C: Connection>(mut conn: C) -> Finished<C> {
+    let mut msgs = Vec::new();
+    let lost = fetch_snapshot(&mut conn, &mut msgs).await;
+    Finished { conn, msgs, lost }
+}
+
+/// Sends a daemon command.
+async fn ask<C: Connection>(mut conn: C, cmd: Cmd) -> Finished<C> {
+    let mut msgs = Vec::new();
+    let lost = match cmd {
+        Cmd::Request { request, success } => {
+            let (answer, lost) = split(bounded(conn.request(request)).await);
+            msgs.push(Msg::Done(answer.map(|_| success)));
+            match lost {
+                // Show the effect right away instead of at the next tick.
+                None => fetch_snapshot(&mut conn, &mut msgs).await,
+                lost => lost,
+            }
+        }
+        Cmd::ListContexts => {
+            let (answer, lost) = split(bounded(conn.request(Request::ListContexts)).await);
+            msgs.push(Msg::Contexts(answer.and_then(|response| match response {
+                Response::Contexts { names, current } => Ok((names, current)),
+                _ => Err(UNEXPECTED.into()),
+            })));
+            lost
+        }
+        Cmd::Events { id } => {
+            let request = Request::Events { ids: vec![id] };
+            let (answer, lost) = split(bounded(conn.request(request)).await);
+            msgs.push(Msg::Events(answer.and_then(|response| match response {
+                Response::Events { entries } => Ok(entries),
+                _ => Err(UNEXPECTED.into()),
+            })));
+            lost
+        }
+        cmd => {
+            msgs.push(refused(cmd, "not a daemon command"));
+            None
+        }
+    };
+    Finished { conn, msgs, lost }
+}
+
+/// Connects again. `old` stays open until the new connection has attached.
+async fn reconnect<C: Connection>(
+    old: C,
+    attach: impl Future<Output = Result<C, String>>,
+) -> Finished<C> {
+    let lost = match timeout(CONNECT_WITHIN, attach).await {
+        Ok(Ok(mut conn)) => {
+            drop(old);
+            let mut msgs = Vec::new();
+            let lost = fetch_snapshot(&mut conn, &mut msgs).await;
+            return Finished { conn, msgs, lost };
+        }
+        Ok(Err(reason)) => reason,
+        Err(_) => no_answer(CONNECT_WITHIN),
+    };
+    Finished {
+        conn: old,
+        msgs: Vec::new(),
+        lost: Some(lost),
+    }
+}
+
+/// Runs a command: daemon commands go to `link`, the others run here.
+fn run_cmd<D: Daemon>(
     cmd: Cmd,
-    daemon: &mut impl Daemon,
+    link: &mut Link<D>,
     app: &mut App,
     tx: &mpsc::UnboundedSender<Msg>,
 ) {
     match cmd {
-        Cmd::Request { request, success } => {
-            let result = daemon
-                .request(request)
-                .await
-                .map(|_| success)
-                .map_err(|e| e.to_string());
-            app.update(Msg::Done(result));
-            // Show the effect right away instead of at the next tick.
-            if let Ok(snapshot) = daemon.snapshot().await {
-                app.update(Msg::Snapshot(snapshot));
-            }
-        }
-        Cmd::ListContexts => {
-            let result = match daemon.request(Request::ListContexts).await {
-                Ok(Response::Contexts { names, current }) => Ok((names, current)),
-                Ok(_) => Err("unexpected answer from the daemon".into()),
-                Err(err) => Err(err.to_string()),
-            };
-            app.update(Msg::Contexts(result));
-        }
+        Cmd::Request { .. } | Cmd::ListContexts | Cmd::Events { .. } => link.push(cmd, app),
         Cmd::Discover {
             context,
             namespace_filter,
         } => {
             // Listing a cluster takes seconds; the list stays usable meanwhile.
-            let answer = daemon.request_aside(Request::Discover {
-                context,
-                namespace_filter,
-            });
+            let answer = timeout(
+                DISCOVER_WITHIN,
+                link.daemon.request_aside(Request::Discover {
+                    context,
+                    namespace_filter,
+                }),
+            );
             let tx = tx.clone();
             tokio::spawn(async move {
                 let result = match answer.await {
-                    Ok(Response::Discovered { ports }) => Ok(ports),
-                    Ok(_) => Err("unexpected answer from the daemon".to_owned()),
-                    Err(err) => Err(err),
+                    Ok(Ok(Response::Discovered { ports })) => Ok(ports),
+                    Ok(Ok(_)) => Err(UNEXPECTED.to_owned()),
+                    Ok(Err(err)) => Err(err),
+                    Err(_) => Err(no_answer(DISCOVER_WITHIN)),
                 };
                 let _ = tx.send(Msg::Discovered(result));
             });
-        }
-        Cmd::Events { id } => {
-            let result = match daemon.request(Request::Events { ids: vec![id] }).await {
-                Ok(Response::Events { entries }) => Ok(entries),
-                Ok(_) => Err("unexpected answer from the daemon".into()),
-                Err(err) => Err(err.to_string()),
-            };
-            app.update(Msg::Events(result));
         }
         Cmd::Open(url) => {
             let opener = if cfg!(target_os = "macos") {
@@ -315,6 +566,9 @@ mod tests {
 
     struct State {
         calls: Vec<String>,
+        /// Connections opened and closed, in order: `open 1`, `close 1`.
+        links: Vec<String>,
+        opened: usize,
         snapshot: Snapshot,
         /// While false, every call fails like a closed connection.
         connected: bool,
@@ -322,6 +576,8 @@ mod tests {
         daemon_back: bool,
         /// The daemon's error for every request.
         refuse: Option<String>,
+        /// Calls that never get an answer, by the names in `calls`.
+        stall: Vec<&'static str>,
         events: Vec<EventEntry>,
     }
 
@@ -330,10 +586,13 @@ mod tests {
             Self {
                 state: Arc::new(Mutex::new(State {
                     calls: Vec::new(),
+                    links: Vec::new(),
+                    opened: 0,
                     snapshot: snapshot(),
                     connected: true,
                     daemon_back: true,
                     refuse: None,
+                    stall: Vec::new(),
                     events: Vec::new(),
                 })),
                 discovery: Arc::new(Semaphore::new(0)),
@@ -351,6 +610,30 @@ mod tests {
         fn count(&self, call: &str) -> usize {
             self.calls().iter().filter(|c| *c == call).count()
         }
+
+        fn connect(&self) -> FakeConnection {
+            let mut state = self.state();
+            state.opened += 1;
+            let id = state.opened;
+            state.links.push(format!("open {id}"));
+            FakeConnection {
+                fake: self.clone(),
+                id,
+            }
+        }
+
+        /// Notes `call`; never returns if the daemon does not answer it.
+        async fn take(&self, call: String) {
+            let stalled = {
+                let mut state = self.state();
+                let stalled = state.stall.contains(&call.as_str());
+                state.calls.push(call);
+                stalled
+            };
+            if stalled {
+                std::future::pending::<()>().await;
+            }
+        }
     }
 
     /// `SetEnabled { .. }` as `SetEnabled`.
@@ -360,52 +643,22 @@ mod tests {
     }
 
     impl Daemon for FakeDaemon {
-        async fn snapshot(&mut self) -> Result<Snapshot, ClientError> {
-            let mut state = self.state();
-            state.calls.push("snapshot".into());
-            if !state.connected {
-                return Err(ClientError::Closed);
-            }
-            Ok(state.snapshot.clone())
-        }
+        type Conn = FakeConnection;
 
-        async fn request(&mut self, request: Request) -> Result<Response, ClientError> {
-            let mut state = self.state();
-            state.calls.push(name(&request));
-            if !state.connected {
-                return Err(ClientError::Closed);
-            }
-            if let Some(message) = &state.refuse {
-                return Err(ClientError::Daemon(message.clone()));
-            }
-            Ok(match request {
-                Request::SetEnabled { ids, enabled } => {
-                    for view in &mut state.snapshot.forwards {
-                        if ids.contains(&view.forward.id) {
-                            view.forward.enabled = enabled;
-                        }
-                    }
-                    Response::Done
+        fn attach(&self) -> impl Future<Output = Result<FakeConnection, String>> + 'static {
+            let fake = self.clone();
+            async move {
+                fake.take("reconnect".into()).await;
+                let back = {
+                    let mut state = fake.state();
+                    state.connected = state.daemon_back;
+                    state.connected
+                };
+                if back {
+                    Ok(fake.connect())
+                } else {
+                    Err(ClientError::NotRunning(std::io::ErrorKind::NotFound.into()).to_string())
                 }
-                Request::ListContexts => Response::Contexts {
-                    names: vec!["staging".into()],
-                    current: None,
-                },
-                Request::Events { .. } => Response::Events {
-                    entries: state.events.clone(),
-                },
-                _ => Response::Done,
-            })
-        }
-
-        async fn reconnect(&mut self) -> Result<()> {
-            let mut state = self.state();
-            state.calls.push("reconnect".into());
-            state.connected = state.daemon_back;
-            if state.connected {
-                Ok(())
-            } else {
-                Err(ClientError::NotRunning(std::io::ErrorKind::NotFound.into()).into())
             }
         }
 
@@ -436,6 +689,58 @@ mod tests {
                     }],
                 })
             }
+        }
+    }
+
+    /// A connection to the fake; notes when it closes.
+    struct FakeConnection {
+        fake: FakeDaemon,
+        id: usize,
+    }
+
+    impl Drop for FakeConnection {
+        fn drop(&mut self) {
+            self.fake.state().links.push(format!("close {}", self.id));
+        }
+    }
+
+    impl Connection for FakeConnection {
+        async fn snapshot(&mut self) -> Result<Snapshot, ClientError> {
+            self.fake.take("snapshot".into()).await;
+            let state = self.fake.state();
+            if !state.connected {
+                return Err(ClientError::Closed);
+            }
+            Ok(state.snapshot.clone())
+        }
+
+        async fn request(&mut self, request: Request) -> Result<Response, ClientError> {
+            self.fake.take(name(&request)).await;
+            let mut state = self.fake.state();
+            if !state.connected {
+                return Err(ClientError::Closed);
+            }
+            if let Some(message) = &state.refuse {
+                return Err(ClientError::Daemon(message.clone()));
+            }
+            Ok(match request {
+                Request::SetEnabled { ids, enabled } => {
+                    for view in &mut state.snapshot.forwards {
+                        if ids.contains(&view.forward.id) {
+                            view.forward.enabled = enabled;
+                        }
+                    }
+                    Response::Done
+                }
+                Request::ListContexts => Response::Contexts {
+                    names: vec!["staging".into()],
+                    current: None,
+                },
+                Request::Events { .. } => Response::Events {
+                    entries: state.events.clone(),
+                },
+                _ => Response::Done,
+            })
         }
     }
 
@@ -484,14 +789,16 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
         let keys = Keys(tx.clone());
-        let mut daemon = fake.clone();
+        let conn = fake.connect();
         app.quit = false;
         let script = async {
             script(&keys).await;
             keys.send(ctrl('c')).await;
         };
-        let (result, ()) =
-            tokio::join!(event_loop(&mut terminal, &mut daemon, app, rx, tx), script);
+        let (result, ()) = tokio::join!(
+            event_loop(&mut terminal, fake.clone(), conn, app, rx, tx),
+            script
+        );
         result.unwrap();
         terminal
     }
@@ -551,27 +858,141 @@ mod tests {
             state.daemon_back = false;
         }
         let mut app = App::new(snapshot());
-        run_loop(&fake, &mut app, async |keys| keys.ticks(3).await).await;
+        run_loop(&fake, &mut app, async |keys| keys.ticks(10).await).await;
         let message = app.message.as_ref().unwrap();
         assert_eq!(
             message.text,
             "lost the daemon: the daemon closed the connection; reconnecting"
         );
         assert!(message.error);
-        // Every tick tries again.
-        assert!(fake.count("reconnect") >= 3, "{:?}", fake.calls());
+        // It tries again about once a second, not on every tick.
+        let tries = fake.count("reconnect");
+        assert!((2..=4).contains(&tries), "{:?}", fake.calls());
 
-        // Back, the daemon's state shows at the next tick.
+        // Back, the daemon's state shows at once.
         {
             let mut state = fake.state();
             state.daemon_back = true;
             state.snapshot.paused = true;
         }
-        run_loop(&fake, &mut app, async |keys| keys.ticks(2).await).await;
+        run_loop(&fake, &mut app, async |keys| keys.ticks(1).await).await;
         assert!(app.snapshot.paused);
         let calls = fake.calls();
         let back = calls.iter().rposition(|c| c == "reconnect").unwrap();
         assert_eq!(calls[back + 1], "snapshot", "{calls:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keys_and_ctrl_c_work_while_the_daemon_does_not_answer() {
+        let fake = FakeDaemon::new();
+        fake.state().stall = vec!["snapshot"];
+        let mut app = App::new(snapshot());
+        let started = Instant::now();
+        run_loop(&fake, &mut app, async |keys| {
+            keys.ticks(3).await;
+            keys.send(char_key('j')).await;
+        })
+        .await;
+        // ctrl+c ended the loop while the first snapshot was still waiting.
+        assert!(started.elapsed() < ANSWER_WITHIN);
+        assert_eq!(app.selected, Some(ForwardId::new("stg-db")));
+        assert!(app.message.is_none());
+        assert_eq!(fake.count("snapshot"), 1, "one call at a time");
+        assert_eq!(fake.state().links, ["open 1", "close 1"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_without_answer_loses_the_daemon() {
+        let fake = FakeDaemon::new();
+        fake.state().stall = vec!["SetEnabled"];
+        let mut app = App::new(snapshot());
+        run_loop(&fake, &mut app, async |keys| {
+            keys.send(char_key(' ')).await;
+            keys.send(char_key('j')).await;
+            keys.ticks(1).await;
+            // Waits for the first request, and is not sent once that fails.
+            keys.send(char_key(' ')).await;
+            tokio::time::sleep(ANSWER_WITHIN).await;
+        })
+        .await;
+        assert_eq!(app.selected, Some(ForwardId::new("stg-db")));
+        assert_eq!(fake.count("SetEnabled"), 1, "{:?}", fake.calls());
+        let message = app.message.as_ref().unwrap();
+        assert_eq!(
+            message.text,
+            "lost the daemon: the daemon did not answer within 5 s; reconnecting"
+        );
+        // Connected again; the old connection closed only after the new one
+        // was attached, so the daemon always counted this TUI.
+        let calls = fake.calls();
+        let back = calls.iter().rposition(|c| c == "reconnect").unwrap();
+        assert_eq!(calls[back + 1], "snapshot", "{calls:?}");
+        assert_eq!(
+            fake.state().links,
+            ["open 1", "open 2", "close 1", "close 2"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keys_work_while_a_reconnect_waits() {
+        let fake = FakeDaemon::new();
+        {
+            let mut state = fake.state();
+            state.connected = false;
+            state.stall = vec!["reconnect"];
+        }
+        let mut app = App::new(snapshot());
+        run_loop(&fake, &mut app, async |keys| {
+            keys.ticks(1).await;
+            keys.send(char_key('j')).await;
+            tokio::time::sleep(CONNECT_WITHIN + 2 * RECONNECT_EVERY).await;
+        })
+        .await;
+        assert_eq!(app.selected, Some(ForwardId::new("stg-db")));
+        // The first attempt gave up after its time limit; the next one waits.
+        assert_eq!(fake.count("reconnect"), 2, "{:?}", fake.calls());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn commands_fail_at_once_while_the_daemon_is_lost() {
+        let fake = FakeDaemon::new();
+        {
+            let mut state = fake.state();
+            state.connected = false;
+            state.daemon_back = false;
+        }
+        let mut app = App::new(snapshot());
+        run_loop(&fake, &mut app, async |keys| {
+            keys.ticks(1).await;
+            keys.send(char_key(' ')).await;
+        })
+        .await;
+        assert_eq!(fake.count("SetEnabled"), 0);
+        let message = app.message.as_ref().unwrap();
+        assert_eq!(
+            (message.text.as_str(), message.error),
+            ("not connected to the daemon", true)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_discovery_without_answer_ends_after_its_time_limit() {
+        // Straight to the command: 6 minutes of ticks would take seconds.
+        let fake = FakeDaemon::new();
+        let mut link = Link::new(fake.clone(), fake.connect());
+        let mut app = App::new(snapshot());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let discover = Cmd::Discover {
+            context: "staging".into(),
+            namespace_filter: String::new(),
+        };
+        let started = Instant::now();
+        run_cmd(discover, &mut link, &mut app, &tx);
+        let Some(Msg::Discovered(Err(text))) = rx.recv().await else {
+            panic!("no failed discovery");
+        };
+        assert_eq!(text, "the daemon did not answer within 6 min");
+        assert_eq!(started.elapsed(), DISCOVER_WITHIN);
     }
 
     #[tokio::test(start_paused = true)]

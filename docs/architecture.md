@@ -767,9 +767,15 @@ Internal structure:
   `view::draw(&App, &mut Frame)` draws.
 - **Modes.** A `Mode` enum replaces v1's flags: `List`, `Filter`, `Projects`,
   `Form`, `Discovery`, `Events`, `Confirm`, `Help`.
-- **Daemon calls** are commands; their results come back as messages. Requests to
-  the daemon take milliseconds and run in the loop; discovery runs in a task of
-  its own.
+- **Daemon calls** are commands; their results come back as messages. They run
+  one at a time on the TUI's connection, next to the keys, so a slow or lost
+  daemon never holds up the keys: a snapshot or a request may take 5 s,
+  connecting (a daemon start included) 15 s. A call that takes longer, or a
+  broken connection, means the daemon is lost: commands fail at once, and the
+  TUI connects again at once and then every second. The old connection stays
+  open until the new one has attached, so the daemon never takes the TUI for
+  gone and switches the forwards off. Discovery runs on a connection and in a
+  task of its own, for at most 6 minutes (a browser login may take 5).
 - **Tests:** `App::update` is tested key by key; the drawing with ratatui's
   `TestBackend`. The flows were also driven end to end with `expect` against
   orbstack (ratatui only redraws changed cells, so such scripts match single
@@ -904,8 +910,11 @@ These are shown in the INFO column and by `kprtfwd status`.
   `KUBECONFIG`), and `logs` with and without `-f`.
 - **tui:** key-by-key tests of `App::update`, drawing tests with `TestBackend`,
   tests of the event loop against a fake daemon on tokio's paused clock (a
-  lost daemon and the reconnect, a request's result and the fresh snapshot, a
-  discovery answer after Esc, ctrl+l and resizes, the events view), and
+  lost daemon and the reconnect, keys and ctrl+c while the daemon does not
+  answer, the time limits of requests, reconnects and discovery, the new
+  connection attached before the old one closes, a request's result and the
+  fresh snapshot, a discovery answer after Esc, ctrl+l and resizes, the events
+  view), and
   `expect` scripts for the whole flow (see section 10).
 - **Manual checklist, against every configured context:**
   - forward, auth (including an expired `oidc-login` token) and the health probe;
