@@ -345,6 +345,15 @@ becomes `PortBusy`, with the owning process if it can be found, and the forward
 holds neither address. The actor retries the bind every 5 s. This is local and
 cheap, so there is no limit.
 
+**Out of file descriptors.** If accepting fails because the daemon or the system
+has no file descriptor left (`EMFILE`, `ENFILE`), the forward tries again every
+second instead of every 100 ms, and reports it once: a warning in the log, the
+event `cannot accept connections: too many open files`, and the same text as its
+last error, which the INFO column of a ready forward shows while it lasts.
+Meanwhile a client that connects waits in the listen queue on Linux; macOS
+closes it. The event `accepting connections again` comes with the next
+connection accepted.
+
 ### 6.4 Port-forward protocol
 
 v2 implements the WebSocket port-forward protocol itself. kube-rs is only used to
@@ -525,7 +534,8 @@ them itself:
   - state changes,
   - refused connections and why,
   - pod switches,
-  - errors from the error channel.
+  - errors from the error channel,
+  - running out of file descriptors and the end of it.
 
 ## 7. IPC protocol
 
@@ -817,7 +827,9 @@ These are shown in the INFO column and by `kprtfwd status`.
     closed once the context is unreachable but not while it logs in, a refused
     port-forward and its check after an outage, the error channel, warm
     streams and when they are dropped or opened again after an outage, the
-    `::1` listener, and a port busy on `127.0.0.1` or on `::1` only;
+    `::1` listener, a port busy on `127.0.0.1` or on `::1` only, and failed
+    accepts, where running out of file descriptors is reported once per
+    episode and slows the retries down;
   - cluster tests in `crates/engine/tests/cluster.rs`, run in CI against kind
     (job `cluster`) and locally against any throwaway cluster. They only run
     when `KPRTFWD_TEST_CONTEXT` is set; each creates and deletes its own

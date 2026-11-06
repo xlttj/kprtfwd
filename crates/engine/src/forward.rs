@@ -22,6 +22,12 @@ use crate::events::EventLog;
 use crate::portforward::{self, KubeIo, PortForward, PortForwardError};
 
 const BIND_RETRY: Duration = Duration::from_secs(5);
+/// The pause after a failed accept, so that a lasting error does not spin.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+/// The pause while no file descriptor is left: accepting works again only
+/// once connections are closed.
+const ACCEPT_RETRY_NO_FDS: Duration = Duration::from_secs(1);
+const NO_FDS: &str = "cannot accept connections: too many open files";
 /// A warm stream is replaced after this long, in case it died silently.
 const WARM_MAX_AGE: Duration = Duration::from_secs(60);
 
@@ -149,6 +155,10 @@ impl Shared {
     fn record_error(&self, spec: &Forward, message: String) {
         warn!(id = %spec.id, %message, "connection failed");
         self.events.push(format!("connection failed: {message}"));
+        self.set_last_error(message);
+    }
+
+    fn set_last_error(&self, message: String) {
         *self.last_error.lock().unwrap() = Some(LastError {
             at: SystemTime::now(),
             message,
@@ -250,10 +260,12 @@ async fn run(spec: Forward, context: Arc<Context>, shared: Arc<Shared>) {
     let mut rewarm = false;
     // Owned here, so stopping the forward also ends its connections.
     let mut connections = JoinSet::new();
+    let mut failures = AcceptFailures::default();
     loop {
         tokio::select! {
             accepted = listeners.accept() => match accepted {
                 Ok((socket, _)) => {
+                    failures.accepted(&spec, &shared);
                     // Each answer from the pod is written as it comes, not
                     // held back until the client acknowledged the last one.
                     if let Err(err) = socket.set_nodelay(true) {
@@ -268,8 +280,8 @@ async fn run(spec: Forward, context: Arc<Context>, shared: Arc<Shared>) {
                     ));
                 }
                 Err(err) => {
-                    warn!(id = %spec.id, %err, "accept failed");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let pause = failures.failed(&spec, &shared, &err);
+                    tokio::time::sleep(pause).await;
                 }
             },
             Ok(()) = context_state.changed() => {
@@ -289,6 +301,44 @@ async fn run(spec: Forward, context: Arc<Context>, shared: Arc<Shared>) {
             Some(_) = connections.join_next() => {}
         }
     }
+}
+
+/// Failed accepts. Running out of file descriptors lasts until connections
+/// are closed, so it is reported once, as a warning and an event, and as the
+/// last error, which the INFO column of a ready forward shows while it is
+/// recent; it stays recent while accepting fails.
+#[derive(Default)]
+struct AcceptFailures {
+    out_of_fds: bool,
+}
+
+impl AcceptFailures {
+    /// Records a failed accept. Returns how long to wait before the next.
+    fn failed(&mut self, spec: &Forward, shared: &Shared, err: &std::io::Error) -> Duration {
+        if !out_of_fds(err) {
+            warn!(id = %spec.id, %err, "accept failed");
+            return ACCEPT_RETRY;
+        }
+        if !std::mem::replace(&mut self.out_of_fds, true) {
+            warn!(id = %spec.id, %err, "cannot accept connections");
+            shared.events.push(NO_FDS);
+        }
+        shared.set_last_error(NO_FDS.to_owned());
+        ACCEPT_RETRY_NO_FDS
+    }
+
+    fn accepted(&mut self, spec: &Forward, shared: &Shared) {
+        if std::mem::take(&mut self.out_of_fds) {
+            info!(id = %spec.id, "accepting connections again");
+            shared.events.push("accepting connections again");
+        }
+    }
+}
+
+/// Whether the process (EMFILE) or the system (ENFILE) has no file
+/// descriptor left.
+fn out_of_fds(err: &std::io::Error) -> bool {
+    matches!(Errno::from_io_error(err), Some(Errno::MFILE | Errno::NFILE))
 }
 
 /// After an outage (docs §6.2, §6.5): a 403 from before is checked afresh
@@ -818,6 +868,46 @@ mod tests {
         assert!(!port_is_free(port));
         drop(v6);
         assert!(port_is_free(port));
+    }
+
+    #[test]
+    fn running_out_of_file_descriptors_shows_once_and_slows_accepting() {
+        let events = EventLog::default();
+        let shared = Shared::new(events.clone());
+        let spec = spec("db", 5432, 15432);
+        let mut failures = AcceptFailures::default();
+        let error = |errno: Errno| std::io::Error::from_raw_os_error(errno.raw_os_error());
+        let last_error = || shared.last_error.lock().unwrap().clone().unwrap();
+
+        // A client that gave up before the accept: a short pause, no event.
+        let aborted = error(Errno::CONNABORTED);
+        assert_eq!(failures.failed(&spec, &shared, &aborted), ACCEPT_RETRY);
+        assert!(messages(&events).is_empty());
+        assert!(shared.last_error.lock().unwrap().is_none());
+
+        assert_eq!(
+            failures.failed(&spec, &shared, &error(Errno::MFILE)),
+            ACCEPT_RETRY_NO_FDS
+        );
+        let first = last_error();
+        assert_eq!(first.message, NO_FDS);
+        std::thread::sleep(Duration::from_millis(5));
+        for errno in [Errno::MFILE, Errno::NFILE] {
+            let pause = failures.failed(&spec, &shared, &error(errno));
+            assert_eq!(pause, ACCEPT_RETRY_NO_FDS);
+        }
+        assert_eq!(messages(&events), [NO_FDS]);
+        // Kept recent, so the INFO column shows it while it lasts.
+        assert!(last_error().at > first.at);
+
+        failures.accepted(&spec, &shared);
+        failures.accepted(&spec, &shared);
+        assert_eq!(messages(&events), [NO_FDS, "accepting connections again"]);
+        failures.failed(&spec, &shared, &error(Errno::MFILE));
+        assert_eq!(
+            messages(&events),
+            [NO_FDS, "accepting connections again", NO_FDS]
+        );
     }
 
     #[test]
