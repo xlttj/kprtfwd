@@ -73,8 +73,11 @@ pub struct App {
     /// From the settings, for the help.
     pub keep_forwards_running: bool,
     pub config_path: String,
-    /// Rows the list showed last time, for paging; set while drawing.
-    pub page: Cell<usize>,
+    /// What the forward list showed last time.
+    pub list: Shown,
+    /// What the list in a popup showed last time; one popup is open at a
+    /// time.
+    pub popup: Shown,
     /// The number of the last discovery started.
     discoveries: u64,
 }
@@ -82,6 +85,25 @@ pub struct App {
 pub struct Message {
     pub text: String,
     pub error: bool,
+}
+
+/// What a scrolling list showed last time; set while drawing. Paging needs
+/// the rows, and the list scrolls from where it was, only as far as the
+/// selection needs, so the cursor moves within the page.
+pub struct Shown {
+    pub rows: Cell<usize>,
+    /// The first row shown.
+    pub top: Cell<usize>,
+}
+
+impl Default for Shown {
+    fn default() -> Self {
+        Self {
+            // Until the first drawing says better.
+            rows: Cell::new(10),
+            top: Cell::new(0),
+        }
+    }
 }
 
 pub enum Mode {
@@ -199,7 +221,8 @@ impl App {
             quit: false,
             keep_forwards_running: false,
             config_path: String::new(),
-            page: Cell::new(10),
+            list: Shown::default(),
+            popup: Shown::default(),
             discoveries: 0,
         };
         app.keep_selection();
@@ -236,16 +259,40 @@ impl App {
             .find(|view| &view.forward.id == id)
     }
 
-    /// Keeps a visible forward selected after the list changed.
+    /// The IDs of the forwards the filter lets through.
+    fn listed(&self) -> Vec<ForwardId> {
+        self.visible()
+            .iter()
+            .map(|view| view.forward.id.clone())
+            .collect()
+    }
+
+    /// Keeps a visible forward selected after the filter changed: the same
+    /// one, else the first.
     fn keep_selection(&mut self) {
-        let visible = self.visible();
-        let still_there = self
-            .selected
-            .as_ref()
-            .is_some_and(|id| visible.iter().any(|view| &view.forward.id == id));
-        if !still_there {
-            self.selected = visible.first().map(|view| view.forward.id.clone());
+        self.keep_selection_near(&[]);
+    }
+
+    /// Keeps a visible forward selected after the list changed from
+    /// `before`: the same one, else its next neighbour in `before` that is
+    /// still listed, else the one before it, else the first. So after a
+    /// delete the cursor stays where it was.
+    fn keep_selection_near(&mut self, before: &[ForwardId]) {
+        let listed = self.listed();
+        let Some(id) = &self.selected else {
+            self.selected = listed.first().cloned();
+            return;
+        };
+        if listed.contains(id) {
+            return;
         }
+        let near = before.iter().position(|old| old == id).and_then(|at| {
+            before[at + 1..]
+                .iter()
+                .chain(before[..at].iter().rev())
+                .find(|old| listed.contains(old))
+        });
+        self.selected = near.or(listed.first()).cloned();
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -288,8 +335,9 @@ impl App {
                 if self.lost.take().is_some() {
                     self.message = None;
                 }
+                let before = self.listed();
                 self.snapshot = snapshot;
-                self.keep_selection();
+                self.keep_selection_near(&before);
                 Vec::new()
             }
             Msg::Lost(reason) => {
@@ -409,7 +457,7 @@ impl App {
     }
 
     fn list_key(&mut self, key: KeyEvent) -> Vec<Cmd> {
-        let page = self.page.get().max(1) as isize;
+        let page = self.list.rows.get().max(1) as isize;
         match key.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
@@ -442,11 +490,7 @@ impl App {
                 }
             }
             KeyCode::Char(sign @ ('+' | '-')) => {
-                let ids: Vec<ForwardId> = self
-                    .visible()
-                    .iter()
-                    .map(|view| view.forward.id.clone())
-                    .collect();
+                let ids = self.listed();
                 if !ids.is_empty() {
                     let enabled = sign == '+';
                     let success = format!(
@@ -591,12 +635,8 @@ impl App {
     }
 
     fn projects_key(&mut self, key: KeyEvent, selected: usize, naming: Option<String>) -> Vec<Cmd> {
+        let listed = self.listed();
         let projects = &self.snapshot.projects;
-        let listed: Vec<ForwardId> = self
-            .visible()
-            .iter()
-            .map(|view| view.forward.id.clone())
-            .collect();
 
         if let Some(mut name) = naming {
             match key.code {
@@ -1601,7 +1641,7 @@ pub(crate) mod tests {
             .map(|i| view(&format!("fwd-{i:02}"), "staging", "api", 8000 + i, false))
             .collect();
         let mut app = App::new(big);
-        app.page.set(10);
+        app.list.rows.set(10);
         let mut at = |code| {
             app.update(key(code));
             app.selected_index().unwrap()
@@ -1692,6 +1732,36 @@ pub(crate) mod tests {
         empty.forwards.clear();
         app.update(Msg::Snapshot(empty));
         assert_eq!(app.selected, None);
+    }
+
+    #[test]
+    fn a_deleted_forward_hands_the_cursor_to_its_neighbour() {
+        let mut app = App::new(snapshot());
+        app.update(key(KeyCode::Char('j')));
+        let without = |id: &str| {
+            let mut next = snapshot();
+            next.forwards.retain(|v| v.forward.id.as_str() != id);
+            Msg::Snapshot(next)
+        };
+        app.update(without("stg-db"));
+        assert_eq!(
+            app.selected,
+            Some(ForwardId::new("stg-web")),
+            "the next one"
+        );
+
+        // The last one hands it to the one before.
+        app.update(Msg::Snapshot(snapshot()));
+        app.update(without("stg-web"));
+        assert_eq!(app.selected, Some(ForwardId::new("stg-db")));
+
+        // Only listed neighbours count.
+        app.filter = "web".into();
+        app.update(Msg::Snapshot(snapshot()));
+        app.update(key(KeyCode::Char('G')));
+        assert_eq!(app.selected, Some(ForwardId::new("stg-web")));
+        app.update(without("stg-web"));
+        assert_eq!(app.selected, Some(ForwardId::new("prd-web")));
     }
 
     #[test]

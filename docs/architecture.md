@@ -726,7 +726,9 @@ Layout:
   ones. The first snapshot after a reconnect ends this and clears the message
   line.
 - **Order:** the list is sorted by context, namespace, service and port. The order
-  stays fixed, so positions are predictable.
+  stays fixed, so positions are predictable. A long list scrolls only when the
+  cursor leaves the page, and when the selected forward goes away (deleted, or
+  gone from the database), the cursor moves to its neighbour.
 - **STATE values:** `ready`, `waiting`, `error`, `paused`, `off`.
 
 Keys:

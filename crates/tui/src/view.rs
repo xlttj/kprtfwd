@@ -12,7 +12,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Row, Table, TableState};
 
-use crate::app::{App, Discovery, FORM_LABELS, Mode, Services};
+use crate::app::{App, Discovery, FORM_LABELS, Mode, Services, Shown};
 
 const KEYS: &str =
     "space on/off · / filter · +/- all listed · p projects · o open · y copy · ? keys";
@@ -98,7 +98,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             }
             popup(frame, title, lines, 64);
         }
-        Mode::Discovery(step) => draw_discovery(frame, step),
+        Mode::Discovery(step) => draw_discovery(frame, app, step),
         Mode::Events { id, entries } => {
             let mut lines: Vec<Line> = entries
                 .iter()
@@ -227,9 +227,28 @@ fn state_style(state: &ForwardState) -> Style {
     }
 }
 
+/// The first of `len` rows to show in `rows` rows, so that `selected` is in
+/// view: `shown`'s first row from last time, moved only as far as needed,
+/// and so that the rows are filled. Notes it and the rows in `shown`.
+fn scroll(shown: &Shown, selected: Option<usize>, len: usize, rows: usize) -> usize {
+    let mut top = shown.top.get();
+    if let Some(selected) = selected {
+        top = top
+            .min(selected)
+            .max((selected + 1).saturating_sub(rows.max(1)));
+    }
+    let top = top.min(len.saturating_sub(rows));
+    shown.top.set(top);
+    shown.rows.set(rows);
+    top
+}
+
 fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     let visible = app.visible();
-    app.page.set(usize::from(area.height.saturating_sub(1)));
+    // The header takes a row.
+    let rows = usize::from(area.height.saturating_sub(1));
+    let selected = app.selected_index();
+    let top = scroll(&app.list, selected, visible.len(), rows);
     if visible.is_empty() {
         let text = if app.snapshot.forwards.is_empty() {
             " No forwards yet. d discovers services, a adds one."
@@ -294,7 +313,7 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         .header(Row::new(["STATE", "CONTEXT", "SERVICE", "LOCAL", "INFO"]).style(dim()))
         .column_spacing(2)
         .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
-    let mut state = TableState::default().with_selected(app.selected_index());
+    let mut state = TableState::new().with_offset(top).with_selected(selected);
     let inner = Rect {
         x: area.x + 1,
         width: area.width.saturating_sub(1),
@@ -362,7 +381,7 @@ fn draw_projects(frame: &mut Frame, app: &App, selected: usize, naming: Option<&
     popup(frame, " projects ", lines, 64);
 }
 
-fn draw_discovery(frame: &mut Frame, step: &Discovery) {
+fn draw_discovery(frame: &mut Frame, app: &App, step: &Discovery) {
     match step {
         Discovery::Loading(what) | Discovery::Listing { context: what, .. } => popup(
             frame,
@@ -410,11 +429,11 @@ fn draw_discovery(frame: &mut Frame, step: &Discovery) {
             ],
             80,
         ),
-        Discovery::Services(services) => draw_services(frame, services),
+        Discovery::Services(services) => draw_services(frame, &app.popup, services),
     }
 }
 
-fn draw_services(frame: &mut Frame, s: &Services) {
+fn draw_services(frame: &mut Frame, shown: &Shown, s: &Services) {
     let area = centered(frame.area(), 110, frame.area().height.saturating_sub(4));
     frame.render_widget(Clear, area);
     let block = Block::bordered().title(format!(" discover: {} ", s.context));
@@ -481,8 +500,10 @@ fn draw_services(frame: &mut Frame, s: &Services) {
     .header(Row::new(["", "SERVICE", "TYPE", "LOCAL"]).style(dim()))
     .column_spacing(2)
     .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
-    let mut state =
-        TableState::default().with_selected((!visible.is_empty()).then_some(s.selected));
+    let selected = (!visible.is_empty()).then_some(s.selected);
+    let rows = usize::from(list.height.saturating_sub(1));
+    let top = scroll(shown, selected, visible.len(), rows);
+    let mut state = TableState::new().with_offset(top).with_selected(selected);
     frame.render_stateful_widget(table, list, &mut state);
 
     if let Some(note) = skipped_note(&s.skipped) {
@@ -572,11 +593,13 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::Candidate;
-    use crate::app::tests::{port, snapshot};
+    use crate::app::tests::{key, port, snapshot, view};
+    use crate::app::{Candidate, Msg};
+    use kprtfwd_core::ForwardId;
     use kprtfwd_proto::ContextView;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::KeyCode;
 
     fn render(app: &App, width: u16, height: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -748,6 +771,87 @@ mod tests {
             screen.contains("namespace web skipped: you may not list its services"),
             "{screen}"
         );
+    }
+
+    /// `n` forwards, `fwd-00` on, all with their own port.
+    fn many(n: u16) -> Snapshot {
+        let mut snap = snapshot();
+        snap.forwards = (0..n)
+            .map(|i| view(&format!("fwd-{i:02}"), "staging", "api", 8000 + i, false))
+            .collect();
+        snap
+    }
+
+    /// The screen row that shows forward number `i` of [`many`].
+    fn row_of(screen: &[String], i: u16) -> Option<usize> {
+        let service = format!("shop/api:{}", 8000 + i);
+        screen.iter().position(|line| line.contains(&service))
+    }
+
+    #[test]
+    fn the_list_scrolls_only_when_the_cursor_leaves_the_page() {
+        let mut app = App::new(many(30));
+        // 12 lines leave 7 rows for forwards, from line 3 to 9.
+        let press = |app: &mut App, code, times| {
+            for _ in 0..times {
+                app.update(key(code));
+            }
+            render(app, 100, 12)
+        };
+        let screen = press(&mut app, KeyCode::Char('j'), 10);
+        assert_eq!(app.list.rows.get(), 7);
+        assert_eq!(
+            (row_of(&screen, 4), row_of(&screen, 10)),
+            (Some(3), Some(9))
+        );
+
+        // Up within the page moves the cursor, not the list.
+        let screen = press(&mut app, KeyCode::Char('k'), 3);
+        assert_eq!((row_of(&screen, 4), row_of(&screen, 7)), (Some(3), Some(6)));
+        let screen = press(&mut app, KeyCode::Char('k'), 4);
+        assert_eq!(row_of(&screen, 3), Some(3), "scrolled once the cursor left");
+
+        // A deleted forward leaves the cursor where it was, on its neighbour.
+        let screen = press(&mut app, KeyCode::Char('j'), 4);
+        assert_eq!(row_of(&screen, 7), Some(7));
+        let mut gone = many(30);
+        gone.forwards.remove(7);
+        app.update(Msg::Snapshot(gone));
+        let screen = render(&app, 100, 12);
+        assert_eq!(app.selected, Some(ForwardId::new("fwd-08")));
+        assert_eq!((row_of(&screen, 3), row_of(&screen, 8)), (Some(3), Some(7)));
+
+        // At the end the list fills the page, also after it got shorter.
+        let screen = press(&mut app, KeyCode::Char('G'), 1);
+        assert_eq!(
+            (row_of(&screen, 23), row_of(&screen, 29)),
+            (Some(3), Some(9))
+        );
+        app.update(Msg::Snapshot(many(25)));
+        let screen = render(&app, 100, 12);
+        assert_eq!(
+            (row_of(&screen, 18), row_of(&screen, 24)),
+            (Some(3), Some(9))
+        );
+    }
+
+    #[test]
+    fn scroll_moves_only_as_far_as_the_selection_needs() {
+        let shown = Shown::default();
+        let at = |selected, len, rows| scroll(&shown, selected, len, rows);
+        assert_eq!(at(Some(3), 30, 10), 0);
+        assert_eq!(
+            at(Some(12), 30, 10),
+            3,
+            "down: the selection on the last row"
+        );
+        assert_eq!(at(Some(5), 30, 10), 3, "within the page: stays");
+        assert_eq!(at(Some(1), 30, 10), 1, "up: the selection on the first row");
+        assert_eq!(at(Some(29), 30, 10), 20);
+        assert_eq!(at(Some(14), 15, 10), 5, "shorter: the rows stay filled");
+        assert_eq!(at(None, 8, 10), 0);
+        assert_eq!(at(Some(0), 1, 0), 0, "no rows");
+        assert_eq!(shown.rows.get(), 0);
     }
 
     #[test]
