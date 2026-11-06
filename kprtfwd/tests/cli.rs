@@ -95,12 +95,19 @@ fn up_and_down_switch_the_forwards_that_match() {
 }
 
 const SERVICES: &str = r#"{"kind":"ServiceList","apiVersion":"v1","metadata":{"resourceVersion":"1"},"items":[{"metadata":{"name":"api","namespace":"shop"},"spec":{"ports":[{"name":"http","port":80,"protocol":"TCP"}]}}]}"#;
+const NO_SERVICES: &str =
+    r#"{"kind":"ServiceList","apiVersion":"v1","metadata":{"resourceVersion":"1"},"items":[]}"#;
 
-/// An API server that lists one service, shop/api, across the cluster.
+/// An API server with one service, shop/api, listed across the cluster or
+/// per namespace.
 fn fake_api() -> u16 {
     common::fake_api(|path| {
-        if path.starts_with("/api/v1/services") {
+        if path.starts_with("/api/v1/services?")
+            || path.starts_with("/api/v1/namespaces/shop/services?")
+        {
             ("200 OK", SERVICES)
+        } else if path.starts_with("/api/v1/namespaces/") && path.contains("/services?") {
+            ("200 OK", NO_SERVICES)
         } else {
             NOT_FOUND
         }

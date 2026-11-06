@@ -53,6 +53,9 @@ pub enum Reply {
     Json(u16, String),
     /// Accepts the port-forward upgrade and acts as the kubelet.
     Kubelet(Kubelet),
+    /// Answers only when as many requests wait at the barrier as it counts,
+    /// which shows that they run at the same time.
+    Gated(Arc<tokio::sync::Barrier>, Box<Reply>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,7 +167,13 @@ async fn answer(mut socket: TcpStream, handler: Handler, log: Arc<Mutex<Log>>) {
         .requests
         .push(format!("{} {target}", request.method));
 
-    match handler(&request) {
+    let mut reply = handler(&request);
+    while let Reply::Gated(gate, inner) = reply {
+        gate.wait().await;
+        reply = *inner;
+    }
+    match reply {
+        Reply::Gated(..) => unreachable!("opened above"),
         Reply::Json(status, body) => {
             let response = format!(
                 "HTTP/1.1 {status} {}\r\ncontent-type: application/json\r\n\

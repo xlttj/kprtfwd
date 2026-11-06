@@ -653,9 +653,13 @@ prompt waited is kept.
 - **Where it runs.** In the daemon, which already has the clients, the auth and
   the logging. It is exposed via IPC, and the TUI renders it.
 - **Contexts** come straight from the kubeconfig (no `kubectl config get-contexts`).
-- **Listing services.** The daemon first lists services cluster-wide. If that is
-  forbidden, it lists them per namespace for the namespaces that match the filter.
-  If listing namespaces is forbidden too, the TUI asks for namespace names.
+- **Listing services.** A filter without wildcards names one namespace, and only
+  that namespace is listed. Otherwise the daemon first lists services
+  cluster-wide. If that is forbidden, it lists the namespaces and then the
+  services of those that match the filter, eight namespaces at a time. If
+  listing namespaces is forbidden too, the user is asked for an exact namespace
+  name. Every list is read in pages of 500 objects, each page with a time limit
+  of 30 s, so a large cluster does not run into one limit for everything.
 - **Proposed local port.** v1 proposes the remote port; 53 of the 63 local ports in
   use are 10000 or higher, so they were changed by hand. v2 proposes, in order:
   1. the existing local port, if the forward already exists;

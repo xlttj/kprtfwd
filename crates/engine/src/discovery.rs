@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use futures::StreamExt;
 use k8s_openapi::api::core::v1::{Namespace, Service};
 use kprtfwd_core::filter::wildcard;
 use kprtfwd_core::state::NetCause;
@@ -13,7 +14,13 @@ use crate::context::{LoginError, PROBE_TIMEOUT, answered, client_for, log_in, pr
 use crate::errors::{Failure, classify};
 use crate::kubeconfig;
 
+/// How long one page of a list may take.
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Objects per page: a large cluster is listed in several answers, each with
+/// its own time limit, instead of one that may run into it.
+const PAGE: u32 = 500;
+/// Namespaces the fallback lists at the same time.
+const PARALLEL: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceInfo {
@@ -68,12 +75,18 @@ async fn list_services(
     let filter = namespace_filter.trim();
     let all = filter.is_empty() || filter == "*";
 
-    let listed = list(Api::<Service>::all(client.clone())).await;
-    let services = match listed {
-        Ok(services) => services,
-        // Many developers may only list services per namespace.
-        Err(Failure::Forbidden(_)) => per_namespace(client, context, filter).await?,
-        Err(failure) => return Err(describe(&failure, context)),
+    let services = if exact(filter) {
+        // One namespace is listed alone, not picked out of the whole cluster.
+        list(Api::<Service>::namespaced(client.clone(), filter))
+            .await
+            .map_err(|failure| describe(&failure, context))?
+    } else {
+        match list(Api::<Service>::all(client.clone())).await {
+            Ok(services) => services,
+            // Many developers may only list services per namespace.
+            Err(Failure::Forbidden(_)) => per_namespace(client, context, filter).await?,
+            Err(failure) => return Err(describe(&failure, context)),
+        }
     };
 
     let mut found: Vec<ServiceInfo> = services
@@ -108,51 +121,66 @@ async fn list_services(
     Ok(found)
 }
 
-/// Lists services namespace by namespace, for users who may not list them
+/// Whether `filter` names one namespace, without wildcards.
+fn exact(filter: &str) -> bool {
+    !filter.is_empty() && !filter.contains('*')
+}
+
+/// Lists the services of the namespaces that match `filter` (wildcards or
+/// empty), a few namespaces at a time, for users who may not list them
 /// across the cluster.
 async fn per_namespace(
     client: &Client,
     context: &str,
     filter: &str,
 ) -> Result<Vec<Service>, String> {
-    let namespaces: Vec<String> = if !filter.is_empty() && !filter.contains('*') {
-        vec![filter.to_owned()]
-    } else {
-        match list(Api::<Namespace>::all(client.clone())).await {
-            Ok(namespaces) => namespaces
-                .into_iter()
-                .map(|ns| ns.name_any())
-                .filter(|ns| filter.is_empty() || wildcard(filter, ns))
-                .collect(),
-            Err(Failure::Forbidden(_)) => {
-                return Err(
-                    "you may not list services or namespaces across the cluster; enter an exact namespace name"
-                        .into(),
-                );
-            }
-            Err(failure) => return Err(describe(&failure, context)),
+    let namespaces: Vec<String> = match list(Api::<Namespace>::all(client.clone())).await {
+        Ok(namespaces) => namespaces
+            .into_iter()
+            .map(|ns| ns.name_any())
+            .filter(|ns| filter.is_empty() || wildcard(filter, ns))
+            .collect(),
+        Err(Failure::Forbidden(_)) => {
+            return Err(
+                "you may not list services or namespaces across the cluster; enter an exact namespace name"
+                    .into(),
+            );
         }
+        Err(failure) => return Err(describe(&failure, context)),
     };
+    let mut lists = futures::stream::iter(namespaces)
+        .map(|namespace| {
+            let api = Api::<Service>::namespaced(client.clone(), &namespace);
+            async move { (namespace, list(api).await) }
+        })
+        .buffer_unordered(PARALLEL);
     let mut services = Vec::new();
-    for namespace in namespaces {
-        let api = Api::<Service>::namespaced(client.clone(), &namespace);
+    while let Some((namespace, listed)) = lists.next().await {
         services.extend(
-            list(api)
-                .await
-                .map_err(|failure| format!("{namespace}: {}", describe(&failure, context)))?,
+            listed.map_err(|failure| format!("{namespace}: {}", describe(&failure, context)))?,
         );
     }
     Ok(services)
 }
 
+/// Lists every object, a page at a time; the time limit applies per page.
 async fn list<K>(api: Api<K>) -> Result<Vec<K>, Failure>
 where
     K: kube::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
 {
-    match tokio::time::timeout(LIST_TIMEOUT, api.list(&ListParams::default())).await {
-        Ok(Ok(list)) => Ok(list.items),
-        Ok(Err(err)) => Err(classify(&err)),
-        Err(_) => Err(Failure::Net(NetCause::Timeout)),
+    let mut items = Vec::new();
+    let mut params = ListParams::default().limit(PAGE);
+    loop {
+        let page = match tokio::time::timeout(LIST_TIMEOUT, api.list(&params)).await {
+            Ok(Ok(page)) => page,
+            Ok(Err(err)) => return Err(classify(&err)),
+            Err(_) => return Err(Failure::Net(NetCause::Timeout)),
+        };
+        items.extend(page.items);
+        match page.metadata.continue_ {
+            Some(token) if !token.is_empty() => params = params.continue_token(&token),
+            _ => return Ok(items),
+        }
     }
 }
 
@@ -168,7 +196,10 @@ pub fn describe(failure: &Failure, context: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use serde_json::{Value, json};
+    use tokio::sync::Barrier;
 
     use super::*;
     use crate::fake::{FakeApi, Reply, list as list_of, status};
@@ -261,27 +292,73 @@ mod tests {
             found(&list_services(&client, "staging", " shop-* ").await.unwrap()),
             ["shop-a/api:80", "shop-b/db:3306"]
         );
-        assert_eq!(api.requests(), ["GET /api/v1/services?"; 3]);
+        assert_eq!(api.requests(), ["GET /api/v1/services?&limit=500"; 3]);
     }
 
     #[tokio::test]
-    async fn without_cluster_wide_rights_an_exact_namespace_is_listed_alone() {
-        let api = FakeApi::start(namespaced_only(true)).await;
-        let services = list_services(&api.client(), "staging", "shop-a")
+    async fn an_exact_namespace_is_listed_alone() {
+        for namespaces_forbidden in [false, true] {
+            let api = FakeApi::start(namespaced_only(namespaces_forbidden)).await;
+            let services = list_services(&api.client(), "staging", " shop-a ")
+                .await
+                .unwrap();
+            assert_eq!(found(&services), ["shop-a/api:80"]);
+            assert_eq!(
+                api.requests(),
+                ["GET /api/v1/namespaces/shop-a/services?&limit=500"]
+            );
+        }
+        // Also when the user may list services across the cluster.
+        let api = FakeApi::start(|request| match request.path.as_str() {
+            "/api/v1/namespaces/web/services" => {
+                services_json(&[service("web", "frontend", json!([{"port": 80}]))])
+            }
+            _ => services_json(&[]),
+        })
+        .await;
+        let services = list_services(&api.client(), "staging", "web")
             .await
             .unwrap();
-        assert_eq!(found(&services), ["shop-a/api:80"]);
+        assert_eq!(found(&services), ["web/frontend:80"]);
+        assert_eq!(
+            api.requests(),
+            ["GET /api/v1/namespaces/web/services?&limit=500"]
+        );
+    }
+
+    #[tokio::test]
+    async fn large_lists_are_read_page_by_page() {
+        let api = FakeApi::start(|request| {
+            let (items, next) = if request.query.contains("continue=page-2") {
+                (vec![service("web", "frontend", json!([{"port": 80}]))], "")
+            } else {
+                (
+                    vec![service("shop", "api", json!([{"port": 80}]))],
+                    "page-2",
+                )
+            };
+            let page = json!({
+                "kind": "ServiceList",
+                "apiVersion": "v1",
+                "metadata": {"resourceVersion": "1", "continue": next},
+                "items": items,
+            });
+            Reply::Json(200, page.to_string())
+        })
+        .await;
+        let services = list_services(&api.client(), "staging", "").await.unwrap();
+        assert_eq!(found(&services), ["shop/api:80", "web/frontend:80"]);
         assert_eq!(
             api.requests(),
             [
-                "GET /api/v1/services?",
-                "GET /api/v1/namespaces/shop-a/services?"
+                "GET /api/v1/services?&limit=500",
+                "GET /api/v1/services?&limit=500&continue=page-2"
             ]
         );
     }
 
     #[tokio::test]
-    async fn without_cluster_wide_rights_matching_namespaces_are_listed_one_by_one() {
+    async fn without_cluster_wide_rights_the_matching_namespaces_are_listed() {
         let api = FakeApi::start(namespaced_only(false)).await;
         let client = api.client();
         let services = list_services(&client, "staging", "shop-*").await.unwrap();
@@ -289,6 +366,28 @@ mod tests {
         let services = list_services(&client, "staging", "*").await.unwrap();
         assert_eq!(
             found(&services),
+            ["shop-a/api:80", "shop-b/api:80", "web/api:80"]
+        );
+    }
+
+    #[tokio::test]
+    async fn without_cluster_wide_rights_namespaces_are_listed_side_by_side() {
+        // Each namespace answers only when all three wait, which never happens
+        // if they are listed one after another.
+        let gate = Arc::new(Barrier::new(3));
+        let api = FakeApi::start(move |request| match request.path.as_str() {
+            "/api/v1/services" | "/api/v1/namespaces" => namespaced_only(false)(request),
+            _ => Reply::Gated(gate.clone(), Box::new(namespaced_only(false)(request))),
+        })
+        .await;
+        let listed = tokio::time::timeout(
+            Duration::from_secs(5),
+            list_services(&api.client(), "staging", "*"),
+        )
+        .await
+        .expect("the namespaces were listed one by one");
+        assert_eq!(
+            found(&listed.unwrap()),
             ["shop-a/api:80", "shop-b/api:80", "web/api:80"]
         );
     }
