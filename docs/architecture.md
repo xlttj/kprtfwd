@@ -213,7 +213,9 @@ Main dependencies:
   it; `kprtfwd status` shows which files are in use. Every 2 s it checks their
   modification times. After a change it hashes each context's context, cluster
   and user entries and reconnects only the running contexts whose hash changed:
-  a renewed token, a moved cluster, a context that was missing. Switching
+  a renewed token, a moved cluster, a context that was missing. The hash sorts
+  the keys of every map first: kube-rs keeps some settings (exec env entries,
+  auth-provider config) in maps whose order differs between reads. Switching
   `current-context` or editing another context leaves running forwards alone.
   Only the hashes are kept, not the settings, which include credentials. For
   the same reason a kubeconfig that cannot be parsed is reported by line and

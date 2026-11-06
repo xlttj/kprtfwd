@@ -6,6 +6,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 
 use kube::config::{Kubeconfig, KubeconfigError};
+use serde_json::Value;
 
 /// A kubeconfig error as text for messages, events and the log. A parse
 /// error keeps only its line and column: the parser would quote the lines
@@ -56,13 +57,41 @@ fn fingerprints_of(config: &Kubeconfig) -> Result<HashMap<String, u64>, String> 
         let user = context
             .and_then(|c| c.user.as_ref())
             .and_then(|user| config.auth_infos.iter().find(|a| &a.name == user));
-        let settings = serde_json::to_string(&(context, cluster, user))
+        let settings = serde_json::to_value((context, cluster, user))
             .map_err(|err| format!("cannot read kubeconfig: {err}"))?;
         let mut hasher = DefaultHasher::new();
-        settings.hash(&mut hasher);
+        hash_canonical(&settings, &mut hasher);
         prints.insert(named.name.clone(), hasher.finish());
     }
     Ok(prints)
+}
+
+/// Feeds `value` to `hasher` with the keys of every object in sorted order.
+/// kube-rs keeps some settings in `HashMap`s, which every read fills in
+/// another order (exec env entries, auth-provider config); the print must
+/// not depend on that.
+fn hash_canonical(value: &Value, hasher: &mut impl Hasher) {
+    match value {
+        Value::Null => 0u8.hash(hasher),
+        Value::Bool(flag) => (1u8, flag).hash(hasher),
+        Value::Number(number) => (2u8, number.to_string()).hash(hasher),
+        Value::String(text) => (3u8, text).hash(hasher),
+        Value::Array(items) => {
+            (4u8, items.len()).hash(hasher);
+            for item in items {
+                hash_canonical(item, hasher);
+            }
+        }
+        Value::Object(map) => {
+            (5u8, map.len()).hash(hasher);
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            for (key, value) in entries {
+                key.hash(hasher);
+                hash_canonical(value, hasher);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -184,6 +213,70 @@ contexts:
         let read = || fingerprints_of(&Kubeconfig::read_from(&file).unwrap()).unwrap();
         assert_eq!(read(), read());
         assert_eq!(read(), before);
+    }
+
+    /// A user whose settings kube-rs keeps in `HashMap`s: exec env entries,
+    /// auth-provider config and impersonation extras.
+    const MAPS: &str = r#"
+apiVersion: v1
+kind: Config
+clusters:
+- name: one
+  cluster:
+    server: https://one.example:6443
+users:
+- name: eks
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1beta1
+      command: aws
+      args: [eks, get-token, --cluster-name, shop]
+      env:
+      - name: AWS_PROFILE
+        value: shop
+      - name: AWS_REGION
+        value: eu-central-1
+      - name: AWS_STS_REGIONAL_ENDPOINTS
+        value: regional
+- name: legacy
+  user:
+    auth-provider:
+      name: oidc
+      config:
+        client-id: shop
+        idp-issuer-url: https://issuer.example
+        extra-scopes: groups
+    as: admin
+    as-user-extra:
+      team: [shop]
+      reason: [support]
+contexts:
+- name: eks
+  context:
+    cluster: one
+    user: eks
+- name: legacy
+  context:
+    cluster: one
+    user: legacy
+"#;
+
+    #[test]
+    fn maps_in_the_settings_do_not_change_the_print() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config");
+        std::fs::write(&file, MAPS).unwrap();
+        // Every read builds new maps, each with its own iteration order.
+        let read = || fingerprints_of(&Kubeconfig::read_from(&file).unwrap()).unwrap();
+        let first = read();
+        assert_eq!(first.len(), 2);
+        for _ in 0..20 {
+            assert_eq!(read(), first);
+        }
+
+        // A value in a map still counts.
+        std::fs::write(&file, MAPS.replace("value: shop", "value: other")).unwrap();
+        assert_eq!(changed(&first, &read()), ["eks"]);
     }
 
     #[test]
