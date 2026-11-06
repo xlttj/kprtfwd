@@ -778,7 +778,10 @@ to save and `esc` to cancel. They are:
      off). Ports that already have a forward show as `added`. Namespaces
      skipped because their services may not be listed are named below the list.
 
-  Discovery runs in the background; the list stays usable meanwhile.
+  While discovery lists the cluster, `esc` goes back to the list, which stays
+  usable. Each discovery has a number, and only the answer with the number
+  the TUI waits for is shown: the late answer of a discovery left with `esc`
+  is dropped, also when another discovery has started meanwhile.
 
 Internal structure:
 
@@ -936,7 +939,7 @@ These are shown in the INFO column and by `kprtfwd status`.
   and ctrl+c while the daemon does not answer, the time limits of requests,
   reconnects and discovery, the new connection attached before the old one
   closes, a request's result and the fresh snapshot, a discovery answer after
-  Esc, ctrl+l and resizes, the events view), and `expect` scripts for the
+  Esc, also while the next discovery waits, ctrl+l and resizes, the events view), and `expect` scripts for the
   whole flow (see section 10).
 - **Manual checklist, against every configured context:**
   - forward, auth (including an expired `oidc-login` token) and the health probe;

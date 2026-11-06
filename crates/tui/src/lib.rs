@@ -484,6 +484,7 @@ fn run_cmd<D: Daemon>(
         Cmd::Discover {
             context,
             namespace_filter,
+            request,
         } => {
             // Listing a cluster takes seconds; the list stays usable meanwhile.
             let answer = timeout(
@@ -501,7 +502,7 @@ fn run_cmd<D: Daemon>(
                     Ok(Err(err)) => Err(err),
                     Err(_) => Err(no_answer(DISCOVER_WITHIN)),
                 };
-                let _ = tx.send(Msg::Discovered(result));
+                let _ = tx.send(Msg::Discovered { request, result });
             });
         }
         Cmd::Open(url) => {
@@ -1034,10 +1035,15 @@ mod tests {
         let discover = Cmd::Discover {
             context: "staging".into(),
             namespace_filter: String::new(),
+            request: 7,
         };
         let started = Instant::now();
         run_cmd(discover, &mut link, &mut app, &tx);
-        let Some(Msg::Discovered(Err(text))) = rx.recv().await else {
+        let Some(Msg::Discovered {
+            request: 7,
+            result: Err(text),
+        }) = rx.recv().await
+        else {
             panic!("no failed discovery");
         };
         assert_eq!(text, "the daemon did not answer within 6 min");
@@ -1077,6 +1083,35 @@ mod tests {
             panic!("no services shown");
         };
         assert_eq!(services.context, "staging");
+        assert_eq!(services.ports[0].port.namespace, "web");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_discovery_answer_after_esc_is_not_taken_by_the_next_discovery() {
+        let fake = FakeDaemon::new();
+        let mut app = App::new(snapshot());
+        let discover = async |keys: &Keys, namespace: &str| {
+            keys.send(char_key('d')).await;
+            keys.send(key(KeyCode::Enter)).await;
+            keys.type_text(namespace).await;
+            keys.send(key(KeyCode::Enter)).await;
+        };
+        run_loop(&fake, &mut app, async |keys| {
+            discover(keys, "shop").await;
+            keys.send(key(KeyCode::Esc)).await;
+            discover(keys, "web").await;
+            // The daemon answers the discovery left with esc first. Taken
+            // for web's, it would show shop's services and drop web's.
+            fake.discovery.add_permits(1);
+            keys.ticks(1).await;
+            fake.discovery.add_permits(1);
+            keys.ticks(1).await;
+        })
+        .await;
+        assert_eq!(fake.count("aside Discover"), 2);
+        let Mode::Discovery(Discovery::Services(services)) = &app.mode else {
+            panic!("no services shown");
+        };
         assert_eq!(services.ports[0].port.namespace, "web");
     }
 

@@ -19,7 +19,11 @@ pub enum Msg {
     /// A request finished: what to report, or the daemon's error.
     Done(Result<String, String>),
     Contexts(Result<(Vec<String>, Option<String>), String>),
-    Discovered(Result<Found, String>),
+    /// The answer to discovery number `request`.
+    Discovered {
+        request: u64,
+        result: Result<Found, String>,
+    },
     Events(Result<Vec<EventEntry>, String>),
     /// The daemon is lost, or still cannot be reached; why.
     Lost(String),
@@ -45,6 +49,8 @@ pub enum Cmd {
     Discover {
         context: String,
         namespace_filter: String,
+        /// Comes back with the answer.
+        request: u64,
     },
     Events {
         id: ForwardId,
@@ -69,6 +75,8 @@ pub struct App {
     pub config_path: String,
     /// Rows the list showed last time, for paging; set while drawing.
     pub page: Cell<usize>,
+    /// The number of the last discovery started.
+    discoveries: u64,
 }
 
 pub struct Message {
@@ -115,10 +123,23 @@ pub struct Form {
 }
 
 pub enum Discovery {
+    /// Waiting for the contexts.
     Loading(String),
+    /// Waiting for the answer to discovery number `request`. An answer to
+    /// another one belongs to a discovery left with esc and is dropped.
+    Listing {
+        context: String,
+        request: u64,
+    },
     Failed(String),
-    Contexts { names: Vec<String>, selected: usize },
-    Namespace { context: String, input: String },
+    Contexts {
+        names: Vec<String>,
+        selected: usize,
+    },
+    Namespace {
+        context: String,
+        input: String,
+    },
     Services(Services),
 }
 
@@ -179,6 +200,7 @@ impl App {
             keep_forwards_running: false,
             config_path: String::new(),
             page: Cell::new(10),
+            discoveries: 0,
         };
         app.keep_selection();
         app
@@ -297,12 +319,15 @@ impl App {
                 }
                 Vec::new()
             }
-            Msg::Discovered(result) => {
-                if let Mode::Discovery(step @ Discovery::Loading(_)) = &mut self.mode {
-                    let context = match step {
-                        Discovery::Loading(context) => context.clone(),
-                        _ => unreachable!(),
-                    };
+            Msg::Discovered { request, result } => {
+                if let Mode::Discovery(step) = &mut self.mode
+                    && let Discovery::Listing {
+                        context,
+                        request: awaited,
+                    } = step
+                    && *awaited == request
+                {
+                    let context = std::mem::take(context);
                     *step = match result {
                         Ok(found) => Discovery::Services(Services {
                             context,
@@ -779,6 +804,12 @@ impl App {
                     keep(Discovery::Loading(what));
                 }
             }
+            Discovery::Listing { context, request } => {
+                // Esc leaves; the answer will find nothing waiting for it.
+                if key.code != KeyCode::Esc {
+                    keep(Discovery::Listing { context, request });
+                }
+            }
             Discovery::Failed(_) => {}
             Discovery::Contexts { names, selected } => match key.code {
                 KeyCode::Esc => {}
@@ -799,10 +830,16 @@ impl App {
             Discovery::Namespace { context, mut input } => match key.code {
                 KeyCode::Esc => {}
                 KeyCode::Enter => {
-                    keep(Discovery::Loading(context.clone()));
+                    self.discoveries += 1;
+                    let request = self.discoveries;
+                    keep(Discovery::Listing {
+                        context: context.clone(),
+                        request,
+                    });
                     return vec![Cmd::Discover {
                         context,
                         namespace_filter: input,
+                        request,
                     }];
                 }
                 KeyCode::Backspace => {
@@ -1147,7 +1184,8 @@ pub(crate) mod tests {
             app.update(key(KeyCode::Enter)),
             [Cmd::Discover {
                 context: "staging".into(),
-                namespace_filter: "shop".into()
+                namespace_filter: "shop".into(),
+                request: 1,
             }]
         );
 
@@ -1161,10 +1199,10 @@ pub(crate) mod tests {
             id: ForwardId::new(format!("staging.shop.{service}-80")),
             local_port: 10080,
         };
-        app.update(Msg::Discovered(Ok(Found {
-            ports: vec![port("api", false), port("frontend", true)],
-            skipped: Vec::new(),
-        })));
+        app.update(Msg::Discovered {
+            request: 1,
+            result: Ok(found(vec![port("api", false), port("frontend", true)])),
+        });
         app.update(key(KeyCode::Char('+')));
         let cmds = app.update(key(KeyCode::Enter));
         let requests = requested(&cmds);
@@ -1182,6 +1220,80 @@ pub(crate) mod tests {
     fn message(app: &App) -> (&str, bool) {
         let message = app.message.as_ref().expect("a message");
         (message.text.as_str(), message.error)
+    }
+
+    fn listing(context: &str, request: u64) -> Discovery {
+        Discovery::Listing {
+            context: context.into(),
+            request,
+        }
+    }
+
+    /// Starts a discovery of `namespace` in the context `pick` steps below
+    /// the current one; returns its number.
+    fn discover(app: &mut App, pick: usize, namespace: &str) -> u64 {
+        app.update(key(KeyCode::Char('d')));
+        app.update(Msg::Contexts(Ok((
+            vec!["production".into(), "staging".into()],
+            Some("production".into()),
+        ))));
+        for _ in 0..pick {
+            app.update(key(KeyCode::Down));
+        }
+        app.update(key(KeyCode::Enter));
+        type_text(app, namespace);
+        match app.update(key(KeyCode::Enter)).as_slice() {
+            [Cmd::Discover { request, .. }] => *request,
+            cmds => panic!("no discovery: {cmds:?}"),
+        }
+    }
+
+    #[test]
+    fn a_late_answer_of_a_discovery_left_with_esc_is_dropped() {
+        let mut app = App::new(snapshot());
+        let first = discover(&mut app, 0, "shop");
+        app.update(key(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::List));
+        let second = discover(&mut app, 1, "web");
+        assert_ne!(first, second);
+
+        // The first discovery answers late, while the second one waits: its
+        // services of production must not show up as staging's.
+        app.update(Msg::Discovered {
+            request: first,
+            result: Ok(found(vec![port("api")])),
+        });
+        let Mode::Discovery(Discovery::Listing { context, request }) = &app.mode else {
+            panic!("the late answer was taken");
+        };
+        assert_eq!((context.as_str(), *request), ("staging", second));
+        app.update(Msg::Discovered {
+            request: first,
+            result: Err("API server unreachable (timeout)".into()),
+        });
+        assert!(matches!(
+            app.mode,
+            Mode::Discovery(Discovery::Listing { .. })
+        ));
+
+        app.update(Msg::Discovered {
+            request: second,
+            result: Ok(found(vec![port("frontend")])),
+        });
+        let Mode::Discovery(Discovery::Services(services)) = &app.mode else {
+            panic!("the answer was dropped");
+        };
+        assert_eq!(services.context, "staging");
+        assert_eq!(services.ports[0].port.service, "frontend");
+
+        // The contexts' answer does not replace a waiting discovery either.
+        app.update(key(KeyCode::Esc));
+        let third = discover(&mut app, 1, "web");
+        app.update(Msg::Contexts(Ok((vec!["staging".into()], None))));
+        assert!(matches!(
+            app.mode,
+            Mode::Discovery(Discovery::Listing { request, .. }) if request == third
+        ));
     }
 
     pub fn found(ports: Vec<DiscoveredPort>) -> Found {
@@ -1208,7 +1320,10 @@ pub(crate) mod tests {
     fn results_outside_their_step_change_nothing() {
         let mut app = App::new(snapshot());
         app.update(Msg::Contexts(Ok((vec!["staging".into()], None))));
-        app.update(Msg::Discovered(Ok(found(vec![port("api")]))));
+        app.update(Msg::Discovered {
+            request: 1,
+            result: Ok(found(vec![port("api")])),
+        });
         app.update(Msg::Events(Ok(vec![])));
         app.update(Msg::Events(Err("late".into())));
         assert!(matches!(app.mode, Mode::List));
@@ -1242,8 +1357,11 @@ pub(crate) mod tests {
         }
 
         let mut app = App::new(snapshot());
-        app.mode = Mode::Discovery(Discovery::Loading("staging".into()));
-        app.update(Msg::Discovered(Err("API server unreachable (DNS)".into())));
+        app.mode = Mode::Discovery(listing("staging", 1));
+        app.update(Msg::Discovered {
+            request: 1,
+            result: Err("API server unreachable (DNS)".into()),
+        });
         assert!(matches!(
             &app.mode,
             Mode::Discovery(Discovery::Failed(text)) if text == "API server unreachable (DNS)"
@@ -1276,8 +1394,11 @@ pub(crate) mod tests {
     #[test]
     fn a_failed_discovery_save_keeps_the_services_open() {
         let mut app = App::new(snapshot());
-        app.mode = Mode::Discovery(Discovery::Loading("staging".into()));
-        app.update(Msg::Discovered(Ok(found(vec![port("api")]))));
+        app.mode = Mode::Discovery(listing("staging", 1));
+        app.update(Msg::Discovered {
+            request: 1,
+            result: Ok(found(vec![port("api")])),
+        });
         app.update(key(KeyCode::Char(' ')));
         assert_eq!(requested(&app.update(key(KeyCode::Enter))).len(), 1);
         app.update(Msg::Done(Err("port 10080 is taken".into())));

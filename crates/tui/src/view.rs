@@ -364,7 +364,7 @@ fn draw_projects(frame: &mut Frame, app: &App, selected: usize, naming: Option<&
 
 fn draw_discovery(frame: &mut Frame, step: &Discovery) {
     match step {
-        Discovery::Loading(what) => popup(
+        Discovery::Loading(what) | Discovery::Listing { context: what, .. } => popup(
             frame,
             " discover ",
             vec![
