@@ -210,7 +210,8 @@ Main dependencies:
 - **Start on demand.** A client that finds no daemon runs `kprtfwd daemon run`
   in its own process group, with no terminal attached. If that process exits
   right away, or fails after binding the socket, the client reports it and
-  names the log directory instead of waiting or blaming another version.
+  names the log directory instead of waiting or blaming another version; the
+  daemon's stderr goes to `logs/daemon.stderr` there.
 - **Single instance.** On start the daemon first takes an exclusive lock
   (`flock`) on `daemon.lock` in the directory and holds it until it has
   exited; the system releases it however the process ends. While another
@@ -557,6 +558,9 @@ them itself:
 
 - `tracing` writes to `~/.config/kprtfwd/logs/daemon.<date>.log` (daily rotation, 7
   files kept). `kprtfwd daemon run --foreground` logs to the terminal instead.
+- Panics are logged as errors, also those in a task, which end only that task.
+  A daemon started on demand appends its stderr to `logs/daemon.stderr`:
+  errors from before the log is open, and crashes the log cannot hold.
 - `KPRTFWD_LOG` sets the filter (`tracing` syntax). By default kube-rs's own
   request logging is off: it logs every failed request as an error, while an
   outage should be reported once, by the context state.

@@ -62,6 +62,9 @@ pub fn run(options: Options) -> Result<()> {
         .with_context(|| format!("create {}", data_dir.display()))?;
     let narrowed = secure_data_dir(&data_dir, geteuid().as_raw())?;
     let _log_guard = init_logging(&options, &data_dir)?;
+    if !options.foreground {
+        log_panics();
+    }
     if let Some(mode) = narrowed {
         info!(dir = %data_dir.display(), from = format!("{mode:o}"), "data directory narrowed to 700");
     }
@@ -189,6 +192,19 @@ fn init_logging(
         .with_writer(writer)
         .init();
     Ok(Some(guard))
+}
+
+/// Logs panics, then runs the hook installed before, which prints them to
+/// stderr: for a daemon started on demand a file next to the log that
+/// nobody looks at first. A panic in a task ends only that task, like the
+/// connection of a client or the watcher of the kubeconfig, and the daemon
+/// goes on; without this, without a trace in its log.
+fn log_panics() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!("{info}");
+        previous(info);
+    }));
 }
 
 /// Raises the soft limit of open files, which the daemon inherits from the
@@ -1048,6 +1064,39 @@ mod tests {
             .iter()
             .map(|(ns, name)| ((*ns).to_owned(), (*name).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn panics_are_logged() {
+        #[derive(Clone, Default)]
+        struct Log(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Log {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Log::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        log_panics();
+        let panicked = std::panic::catch_unwind(|| panic!("the watcher broke"));
+        // The default hook again.
+        drop(std::panic::take_hook());
+
+        assert!(panicked.is_err());
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("ERROR"), "{text}");
+        assert!(text.contains("panicked at"), "{text}");
+        assert!(text.contains("the watcher broke"), "{text}");
     }
 
     #[test]

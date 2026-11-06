@@ -416,6 +416,33 @@ async fn bad_input_is_answered_and_keeps_the_connection() {
     assert!(!enabled(&home.db()));
 }
 
+/// An error before the daemon's log is open goes to `logs/daemon.stderr`,
+/// which the client names. Here the log file cannot be created: the log
+/// directory is read-only, but `daemon.stderr` exists and is writable.
+#[tokio::test]
+async fn an_error_before_the_log_is_open_is_kept() {
+    let home = Home::new();
+    let logs = home.data_dir().join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let stderr_file = logs.join("daemon.stderr");
+    std::fs::write(&stderr_file, "").unwrap();
+    std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let output = home.run(&["status"]);
+    std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("exited right after starting"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("log: {}", logs.display())),
+        "{stderr}"
+    );
+    let kept = std::fs::read_to_string(&stderr_file).unwrap();
+    assert!(
+        kept.starts_with("kprtfwd daemon: open log directory"),
+        "{kept}"
+    );
+}
+
 /// The daemon narrows a data directory others can reach to 0700, and its
 /// socket is 0600.
 #[tokio::test]

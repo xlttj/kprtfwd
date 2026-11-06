@@ -1,6 +1,8 @@
 //! The client side of the daemon connection.
 
+use std::fs::{DirBuilder, File};
 use std::io;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -174,16 +176,31 @@ impl Client {
     }
 }
 
-/// Starts `<exe> daemon run` in the background, in its own process group, so
-/// it outlives the terminal it was started from.
-pub fn spawn_daemon(exe: &Path) -> io::Result<Child> {
+/// Starts `<exe> daemon run` for `data_dir` in the background, in its own
+/// process group, so it outlives the terminal it was started from. Its
+/// stderr, where errors before its log is open and crashes end up, is
+/// appended to `logs/daemon.stderr` in `data_dir`, if that can be opened;
+/// the daemon reports its own problems with the directory.
+pub fn spawn_daemon(exe: &Path, data_dir: &Path) -> io::Result<Child> {
+    let stderr = stderr_file(&data_dir.join("logs")).map_or_else(|_| Stdio::null(), Stdio::from);
     Command::new(exe)
         .args(["daemon", "run"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .process_group(0)
         .spawn()
+}
+
+/// `daemon.stderr` in `logs`, opened for appending; creates `logs` with
+/// mode 0700, as the daemon would.
+fn stderr_file(logs: &Path) -> io::Result<File> {
+    DirBuilder::new().recursive(true).mode(0o700).create(logs)?;
+    File::options()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(logs.join("daemon.stderr"))
 }
 
 /// Connects to the daemon, starting it first if it is not running.
@@ -193,7 +210,8 @@ pub async fn connect_or_start(socket: &Path, exe: &Path) -> Result<Client, Clien
         Err(ClientError::NotRunning(_)) => {}
         other => return other,
     }
-    let mut daemon = spawn_daemon(exe)?;
+    let data_dir = socket.parent().unwrap_or(Path::new("."));
+    let mut daemon = spawn_daemon(exe, data_dir)?;
     let deadline = Instant::now() + WAIT;
     loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
