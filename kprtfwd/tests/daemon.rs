@@ -21,7 +21,7 @@ use kprtfwd_core::Store;
 use kprtfwd_core::config::TEMPLATE;
 use kprtfwd_proto::{
     Client, ClientError, ClientMessage, MAX_FRAME, PROTOCOL_VERSION, Request, Response,
-    ServerMessage, Snapshot,
+    ServerMessage,
 };
 
 #[tokio::test]
@@ -117,13 +117,10 @@ async fn takes_over_the_old_directory() {
     let legacy_socket = home.legacy_dir().join("daemon.sock");
     assert!(legacy_socket.exists());
 
-    let output = home.run(&["status", "--json"]);
-    let snapshot: Snapshot =
-        serde_json::from_slice(&output.stdout).unwrap_or_else(|err| panic!("{err}: {output:?}"));
-
-    assert_eq!(snapshot.forwards.len(), 1);
-    assert!(snapshot.forwards[0].forward.enabled);
-    assert!(snapshot.paused);
+    let status = status_json(&home);
+    assert_eq!(status["forwards"].as_array().unwrap().len(), 1, "{status}");
+    assert_eq!(status["forwards"][0]["enabled"], true);
+    assert_eq!(status["paused"], true);
     assert!(!legacy_socket.exists(), "the old daemon still runs");
     assert!(legacy_db.exists(), "the old database is gone");
     assert!(home.data_dir().join("kprtfwd.db").exists());
@@ -146,10 +143,14 @@ fn a_failed_take_over_is_tried_again() {
 
     std::fs::remove_file(&legacy_db).unwrap();
     database(&legacy_db);
-    let output = home.run(&["status", "--json"]);
-    let snapshot: Snapshot =
-        serde_json::from_slice(&output.stdout).unwrap_or_else(|err| panic!("{err}: {output:?}"));
-    assert_eq!(snapshot.forwards.len(), 1);
+    let status = status_json(&home);
+    assert_eq!(status["forwards"].as_array().unwrap().len(), 1, "{status}");
+}
+
+/// `status --json --all`: the state with every forward.
+fn status_json(home: &Home) -> serde_json::Value {
+    let output = home.run(&["status", "--json", "--all"]);
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|err| panic!("{err}: {output:?}"))
 }
 
 /// A crashed daemon leaves its socket behind; the next start replaces it.
@@ -487,14 +488,16 @@ async fn a_daemon_started_on_demand_is_detached() {
     home.set_kubeconfig_files(&[PathBuf::from("kubeconfig")]);
 
     let output = home
-        .command(&["status", "--json"])
+        .command(&["status"])
         .current_dir(home.path())
         .output()
         .unwrap();
-    let snapshot: Snapshot =
-        serde_json::from_slice(&output.stdout).unwrap_or_else(|err| panic!("{err}: {output:?}"));
     let kubeconfig = home.kubeconfig_file().display().to_string();
-    assert_eq!(snapshot.kubeconfig_files, vec![kubeconfig]);
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        out.ends_with(&format!("\nkubeconfig: {kubeconfig}\n")),
+        "{output:?}"
+    );
 
     let pid = Client::connect(&home.socket()).await.unwrap().daemon_pid;
     let raw = i32::try_from(pid).unwrap();
