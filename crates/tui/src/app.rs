@@ -1095,7 +1095,7 @@ pub(crate) mod tests {
 
     pub fn snapshot() -> Snapshot {
         Snapshot {
-            daemon_version: "2.0.0-test".into(),
+            daemon_version: kprtfwd_proto::VERSION.into(),
             paused: false,
             kubeconfig_files: vec![],
             contexts: vec![],

@@ -20,6 +20,20 @@ pub use client::{Client, ClientError, connect_or_start, spawn_daemon, stop_daemo
 /// Bumped on every incompatible change to the messages.
 pub const PROTOCOL_VERSION: u32 = 7;
 
+/// This kprtfwd's version, which a client sends in its hello.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// A hint when the daemon runs another version than this kprtfwd. Such a
+/// daemon speaks the same protocol and is served, but keeps running the
+/// code of its own version until it is restarted.
+pub fn other_version(daemon_version: &str) -> Option<String> {
+    (daemon_version != VERSION).then(|| {
+        format!(
+            "the daemon runs kprtfwd {daemon_version}, this is {VERSION}; restart it with `kprtfwd daemon restart`"
+        )
+    })
+}
+
 /// The longest message, without its newline. A snapshot of thousands of
 /// forwards takes a few MB; the limit keeps a writer that sends no newline
 /// from filling the reader's memory.
@@ -404,6 +418,18 @@ mod tests {
                 "{json}"
             );
         }
+    }
+
+    #[test]
+    fn another_version_gets_a_hint() {
+        assert_eq!(other_version(VERSION), None);
+        let hint = other_version("1.0.0").unwrap();
+        assert_eq!(
+            hint,
+            format!(
+                "the daemon runs kprtfwd 1.0.0, this is {VERSION}; restart it with `kprtfwd daemon restart`"
+            )
+        );
     }
 
     #[test]

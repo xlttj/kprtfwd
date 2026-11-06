@@ -12,7 +12,8 @@ use clap::Subcommand;
 use kprtfwd_core::clock::local_time;
 use kprtfwd_core::{ForwardId, ForwardState, Store, filter, paths};
 use kprtfwd_proto::{
-    Client, ClientError, ForwardView, Request, Snapshot, connect_or_start, stop_daemon,
+    Client, ClientError, ForwardView, Request, Snapshot, connect_or_start, other_version,
+    stop_daemon,
 };
 
 use crate::table::print_table;
@@ -191,7 +192,17 @@ fn socket() -> Result<PathBuf> {
 /// Connects to the daemon, starting it if needed.
 async fn connect() -> Result<Client> {
     let exe = std::env::current_exe().context("find the kprtfwd binary")?;
-    Ok(connect_or_start(&socket()?, &exe).await?)
+    let client = connect_or_start(&socket()?, &exe).await?;
+    warn_of_other_version(&client);
+    Ok(client)
+}
+
+/// Tells on stderr, so output for scripts stays as it is, when the daemon
+/// runs another version than this kprtfwd.
+fn warn_of_other_version(client: &Client) {
+    if let Some(hint) = other_version(&client.daemon_version) {
+        eprintln!("kprtfwd: {hint}");
+    }
 }
 
 async fn status(all: bool, json: bool) -> Result<ExitCode> {
@@ -571,6 +582,7 @@ async fn daemon_status() -> Result<ExitCode> {
                 client.daemon_pid,
                 socket.display()
             );
+            warn_of_other_version(&client);
             Ok(ExitCode::SUCCESS)
         }
         Err(ClientError::NotRunning(_)) => {

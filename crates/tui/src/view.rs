@@ -5,7 +5,7 @@ use std::time::SystemTime;
 
 use kprtfwd_core::clock::local_time;
 use kprtfwd_core::{ContextState, ForwardId, ForwardState};
-use kprtfwd_proto::{EventEntry, Snapshot};
+use kprtfwd_proto::{EventEntry, Snapshot, VERSION};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -167,11 +167,23 @@ fn header_line(snapshot: &Snapshot, width: u16) -> Line<'static> {
             Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
         ));
     }
-    let version = format!("kprtfwd {} ", snapshot.daemon_version);
+    // A daemon of another version is served, but runs its own code until
+    // it is restarted.
+    let version = if snapshot.daemon_version == VERSION {
+        Span::styled(format!("kprtfwd {VERSION} "), dim())
+    } else {
+        Span::styled(
+            format!(
+                "kprtfwd {VERSION}, daemon {}: kprtfwd daemon restart ",
+                snapshot.daemon_version
+            ),
+            Style::new().fg(Color::Yellow),
+        )
+    };
     let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let gap = usize::from(width).saturating_sub(used + version.len());
+    let gap = usize::from(width).saturating_sub(used + version.content.chars().count());
     spans.push(Span::raw(" ".repeat(gap)));
-    spans.push(Span::styled(version, dim()));
+    spans.push(version);
     Line::from(spans)
 }
 
@@ -672,6 +684,21 @@ mod tests {
     }
 
     #[test]
+    fn a_daemon_of_another_version_shows_how_to_restart_it() {
+        let mut snap = snapshot();
+        snap.daemon_version = "1.9.0".into();
+        let app = App::new(snap);
+        let mut terminal = Terminal::new(TestBackend::new(100, 6)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let header: String = (0..100).map(|x| buffer[(x, 0)].symbol()).collect();
+        let hint = format!("kprtfwd {VERSION}, daemon 1.9.0: kprtfwd daemon restart");
+        assert!(header.trim_end().ends_with(&hint), "{header}");
+        let at = header.find(&hint).unwrap() as u16;
+        assert_eq!(buffer[(at, 0)].fg, Color::Yellow);
+    }
+
+    #[test]
     fn shows_contexts_list_and_reasons() {
         let mut snap = snapshot();
         snap.contexts = vec![
@@ -696,7 +723,11 @@ mod tests {
             "{}",
             screen[0]
         );
-        assert!(screen[0].ends_with("kprtfwd 2.0.0-test"), "{}", screen[0]);
+        assert!(
+            screen[0].ends_with(&format!("kprtfwd {VERSION}")),
+            "{}",
+            screen[0]
+        );
         assert_eq!(screen[1], " / filter");
         assert!(
             screen[2].contains("STATE") && screen[2].contains("INFO"),

@@ -262,8 +262,11 @@ Main dependencies:
   once the socket is bound, also when the start fails (a failed take-over
   of `~/.kprtfwd`, a database that cannot be opened).
 - **Upgrade.** Clients compare versions in the handshake. A daemon of another
-  version is reported with the hint `kprtfwd daemon restart`; the desired state
-  is persisted, so forwards come back on their own. The daemon writes its PID to
+  protocol is refused with the hint `kprtfwd daemon restart`. One of another
+  version that speaks the same protocol is served, but runs its own code until
+  it is restarted, so the TUI's header and every CLI command (on stderr) show
+  the same hint. The desired state is persisted, so forwards come back on
+  their own. The daemon writes its PID to
   `daemon.pid` as soon as it has bound the socket, so `daemon stop` can end a
   daemon it cannot talk to: one of another protocol by the PID in its
   welcome, one whose answer is no welcome, or that does not answer within
@@ -576,7 +579,9 @@ them itself:
 - **Handshake.** The client sends `Hello { protocol, client_version }`, the daemon
   answers `Welcome { protocol, daemon_version, pid }`. Different protocol numbers
   mean the client asks the user to restart the daemon; so does an answer that is
-  no welcome, or a closed connection. A client waits at most 5 s for the
+  no welcome, or a closed connection. Different versions with the same
+  protocol are served, with a hint to restart the daemon (section 6.1). The
+  daemon does not check `client_version`. A client waits at most 5 s for the
   welcome, except one that has just started the daemon, which waits for the
   start (10 s).
 - **Requests.** `{"id": 7, "request": {"type": "set_enabled", ...}}`; the response
@@ -727,7 +732,9 @@ Layout:
 ```
 
 - **Header line:** the state of every context with enabled forwards; idle contexts
-  are listed last.
+  are listed last. On the right, this kprtfwd's version; a daemon of another
+  version that speaks the same protocol adds `daemon <version>: kprtfwd daemon
+  restart`, in yellow.
 - **A lost daemon** replaces the header with `lost the daemon: <reason>;
   reconnecting` in red, on as many lines as the reason needs; for a daemon of
   another version it ends with the hint `kprtfwd daemon restart`. The reason

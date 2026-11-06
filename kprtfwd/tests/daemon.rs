@@ -196,6 +196,8 @@ async fn daemons_started_at_once_leave_one_running() {
 enum Speaks {
     /// As a daemon of another protocol, with its PID.
     AnotherProtocol,
+    /// As a daemon of this protocol but another version.
+    AnotherVersion,
     /// With a line that is no message.
     Garbage,
     /// Not at all: it never accepts the connection.
@@ -212,18 +214,17 @@ fn answer_hello(stream: UnixStream, speaks: Speaks, pid: u32) {
     let Ok(hello) = serde_json::from_str::<ClientMessage>(&hello) else {
         return;
     };
+    let welcome = |protocol| ServerMessage::Response {
+        id: hello.id,
+        response: Response::Welcome {
+            protocol,
+            daemon_version: "9.9.9".into(),
+            pid,
+        },
+    };
     let mut line = match speaks {
-        Speaks::AnotherProtocol => {
-            let welcome = ServerMessage::Response {
-                id: hello.id,
-                response: Response::Welcome {
-                    protocol: PROTOCOL_VERSION + 1,
-                    daemon_version: "9.9.9".into(),
-                    pid,
-                },
-            };
-            serde_json::to_vec(&welcome).unwrap()
-        }
+        Speaks::AnotherProtocol => serde_json::to_vec(&welcome(PROTOCOL_VERSION + 1)).unwrap(),
+        Speaks::AnotherVersion => serde_json::to_vec(&welcome(PROTOCOL_VERSION)).unwrap(),
         Speaks::Garbage | Speaks::Nothing => b"{\"type\":\"welcome\"}".to_vec(),
     };
     line.push(b'\n');
@@ -231,10 +232,12 @@ fn answer_hello(stream: UnixStream, speaks: Speaks, pid: u32) {
 }
 
 /// A process standing in for a daemon `daemon stop` cannot talk to. When
-/// the test ends, its PID file goes first, so that no later `daemon stop`
-/// kills that PID once it is free, and then the process is killed.
+/// the test ends, its PID file and socket go first, so that no later
+/// `daemon stop` kills that PID once it is free or waits for the socket to
+/// go, and then the process is killed.
 struct StandIn {
     pid_file: PathBuf,
+    socket: PathBuf,
     process: Children,
     /// Bound for one that never accepts.
     _listener: Option<UnixListener>,
@@ -243,6 +246,7 @@ struct StandIn {
 impl Drop for StandIn {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.pid_file);
+        let _ = std::fs::remove_file(&self.socket);
     }
 }
 
@@ -278,6 +282,7 @@ async fn stand_in(home: &Home, speaks: Speaks, pid_file: bool) -> StandIn {
     wait_until("trap set", || ready.exists()).await;
     StandIn {
         pid_file: home.pid_file(),
+        socket: home.socket(),
         process: Children(vec![shell]),
         _listener: listener,
     }
@@ -318,6 +323,24 @@ async fn stops_a_daemon_that_does_not_answer_by_its_pid() {
     let home = Home::new();
     let mut stand_in = stand_in(&home, Speaks::Nothing, true).await;
     stop_stand_in(&home, &mut stand_in).await;
+}
+
+/// A daemon of another version that speaks this protocol is served, with
+/// a hint on stderr to restart it.
+#[tokio::test]
+async fn a_daemon_of_another_version_comes_with_a_hint() {
+    let home = Home::new();
+    let _stand_in = stand_in(&home, Speaks::AnotherVersion, false).await;
+    let output = home.run(&["daemon", "status"]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("daemon 9.9.9 running"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let hint = format!(
+        "kprtfwd: the daemon runs kprtfwd 9.9.9, this is {}; restart it with `kprtfwd daemon restart`\n",
+        kprtfwd_proto::VERSION
+    );
+    assert_eq!(stderr, hint);
 }
 
 /// A daemon that binds the socket and then fails, here because it cannot

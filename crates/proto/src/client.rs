@@ -13,8 +13,8 @@ use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::{
-    ClientMessage, PROTOCOL_VERSION, Request, Response, ServerMessage, Snapshot, read_message,
-    write_message,
+    ClientMessage, PROTOCOL_VERSION, Request, Response, ServerMessage, Snapshot, VERSION,
+    read_message, write_message,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -104,7 +104,7 @@ impl Client {
         };
         let hello = Request::Hello {
             protocol: PROTOCOL_VERSION,
-            client_version: env!("CARGO_PKG_VERSION").to_owned(),
+            client_version: VERSION.to_owned(),
         };
         // A daemon that closes the connection, refuses the hello or answers
         // with something else than a welcome speaks another protocol.
