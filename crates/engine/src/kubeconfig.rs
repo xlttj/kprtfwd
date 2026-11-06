@@ -42,9 +42,12 @@ fn files_of(kubeconfig: Option<OsString>, home: Option<OsString>) -> Vec<PathBuf
     }
 }
 
-/// A hash per context over its context, cluster and user entries, to tell
-/// which contexts a change of the kubeconfig touched. Only the hash is kept,
-/// never the settings, which include credentials.
+/// A hash per context over what its client is built from, to tell which
+/// contexts a change of the kubeconfig touched: the names of its cluster and
+/// user and their entries. The context's default namespace and extensions do
+/// not count; forwards carry their own namespace, so `kubens` must not
+/// reconnect them. Only the hash is kept, never the settings, which include
+/// credentials.
 pub fn fingerprints() -> Result<HashMap<String, u64>, String> {
     fingerprints_of(&Kubeconfig::read().map_err(|err| describe(&err))?)
 }
@@ -53,11 +56,15 @@ fn fingerprints_of(config: &Kubeconfig) -> Result<HashMap<String, u64>, String> 
     let mut prints = HashMap::new();
     for named in &config.contexts {
         let context = named.context.as_ref();
-        let cluster = context.and_then(|c| config.clusters.iter().find(|cl| cl.name == c.cluster));
-        let user = context
-            .and_then(|c| c.user.as_ref())
-            .and_then(|user| config.auth_infos.iter().find(|a| &a.name == user));
-        let settings = serde_json::to_value((context, cluster, user))
+        let cluster_name = context.map(|c| &c.cluster);
+        let user_name = context.and_then(|c| c.user.as_ref());
+        let cluster = cluster_name
+            .and_then(|name| config.clusters.iter().find(|c| &c.name == name))
+            .and_then(|named| named.cluster.as_ref());
+        let user = user_name
+            .and_then(|name| config.auth_infos.iter().find(|a| &a.name == name))
+            .and_then(|named| named.auth_info.as_ref());
+        let settings = serde_json::to_value((cluster_name, user_name, cluster, user))
             .map_err(|err| format!("cannot read kubeconfig: {err}"))?;
         let mut hasher = DefaultHasher::new();
         hash_canonical(&settings, &mut hasher);
@@ -294,6 +301,33 @@ contexts:
         );
         // `kubectl config use-context` touches none.
         assert!(changed(&before, &prints(ONE, TOKEN, "c")).is_empty());
+    }
+
+    #[test]
+    fn the_default_namespace_and_extensions_do_not_count() {
+        let yaml = TEMPLATE
+            .replace("{one}", ONE)
+            .replace("{alice}", TOKEN)
+            .replace("{current}", "a");
+        let prints_of =
+            |yaml: &str| fingerprints_of(&Kubeconfig::from_yaml(yaml).unwrap()).unwrap();
+        let before = prints_of(&yaml);
+        // `kubens shop` on context a, and a tool that stamps the context.
+        let context_a = "    cluster: one\n    user: alice\n";
+        let after = yaml.replacen(
+            context_a,
+            &format!(
+                "{context_a}    namespace: shop\n    extensions:\n    - name: tool\n      extension:\n        last-update: 2026-11-06\n"
+            ),
+            1,
+        );
+        assert_ne!(after, yaml);
+        assert_eq!(prints_of(&after).len(), 3);
+        assert!(changed(&before, &prints_of(&after)).is_empty());
+
+        // The cluster or user a context names does count.
+        let other_user = yaml.replacen(context_a, "    cluster: one\n    user: bob\n", 1);
+        assert_eq!(changed(&before, &prints_of(&other_user)), ["a"]);
     }
 
     #[test]
