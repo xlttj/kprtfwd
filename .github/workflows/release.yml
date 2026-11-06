@@ -4,10 +4,14 @@ on:
   push:
     tags:
       - 'v*'
-  # Builds without releasing, so changes to this workflow are tested.
+  # Builds without releasing, so changes to this workflow are tested, and
+  # a dependency that breaks a release target shows up in its pull
+  # request rather than at the tag. CI builds only the runners' targets.
   pull_request:
     paths:
       - '.github/workflows/release.yml'
+      - 'Cargo.lock'
+      - '**/Cargo.toml'
 
 permissions:
   contents: read
