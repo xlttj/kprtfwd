@@ -187,3 +187,24 @@ async fn takes_over_the_old_directory() {
     assert!(legacy_db.exists(), "the old database is gone");
     assert!(home.data_dir().join("kprtfwd.db").exists());
 }
+
+#[test]
+fn a_failed_take_over_is_tried_again() {
+    let home = Home::new();
+    let legacy_db = home.legacy_dir().join("kprtfwd.db");
+    std::fs::create_dir_all(home.legacy_dir()).unwrap();
+    // SQLite refuses to read it, so the copy fails.
+    std::fs::write(&legacy_db, [0x55; 4096]).unwrap();
+
+    let output = home.run(&["status", "--json"]);
+    assert!(!output.status.success(), "{output:?}");
+    let db = home.data_dir().join("kprtfwd.db");
+    assert!(!db.exists(), "a failed copy looks like a database");
+
+    std::fs::remove_file(&legacy_db).unwrap();
+    database(&legacy_db);
+    let output = home.run(&["status", "--json"]);
+    let snapshot: Snapshot =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|err| panic!("{err}: {output:?}"));
+    assert_eq!(snapshot.forwards.len(), 1);
+}

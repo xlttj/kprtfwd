@@ -1,6 +1,8 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use kprtfwd_core::store::SCHEMA_VERSION;
 use kprtfwd_core::{Forward, ForwardId, Project, Store, StoreError, ValidationError};
@@ -186,6 +188,18 @@ fn fixture_projects() -> Vec<Project> {
     ]
 }
 
+/// Where a copy to `path` is written before it is renamed to `path`.
+fn temp(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
+/// A file SQLite refuses to read, so every copy of it fails.
+fn not_a_database(path: &Path) {
+    fs::write(path, [0x55; 4096]).unwrap();
+}
+
 fn mode(path: &Path) -> u32 {
     fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
@@ -234,6 +248,28 @@ fn writes_backup_before_migrating_and_only_once() {
     fs::remove_file(&backup).unwrap();
     drop(Store::open(&path).unwrap());
     assert!(!backup.exists());
+}
+
+/// A backup that cannot be written stops the migration, and the next open
+/// writes it and migrates.
+#[test]
+fn failed_backup_stops_the_migration_until_it_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = v1_database(dir.path());
+    let backup = dir.path().join("kprtfwd.db.v1-backup");
+    // A directory where the copy is written makes it fail.
+    fs::create_dir(temp(&backup)).unwrap();
+
+    assert!(Store::open(&path).is_err());
+    assert!(!backup.exists());
+    assert_eq!(raw_user_version(&path), 0, "migrated without a backup");
+
+    fs::remove_dir(temp(&backup)).unwrap();
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.forwards().unwrap(), fixture_forwards());
+    assert_eq!(raw_user_version(&backup), 0);
+    assert_eq!(mode(&backup), 0o600);
+    assert!(!temp(&backup).exists());
 }
 
 /// The rollback path: released v1 must keep working on a migrated database,
@@ -331,6 +367,71 @@ fn copies_a_database_without_changing_it() {
 
     // An existing database is never overwritten.
     assert!(Store::copy_file(&from, &to).is_err());
+}
+
+/// The take-over checks whether the target exists; after a failed copy it
+/// must not, so the next start copies again.
+#[test]
+fn failed_copy_leaves_nothing_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let broken = dir.path().join("broken.db");
+    not_a_database(&broken);
+    let to = dir.path().join(".config/kprtfwd/kprtfwd.db");
+
+    assert!(Store::copy_file(&broken, &to).is_err());
+    assert!(!to.exists());
+    assert!(!temp(&to).exists());
+
+    let from = v1_database(dir.path());
+    Store::copy_file(&from, &to).unwrap();
+    assert_eq!(
+        Store::snapshot(&to).unwrap().forwards().unwrap(),
+        fixture_forwards()
+    );
+}
+
+#[test]
+fn copy_replaces_what_an_interrupted_copy_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let from = v1_database(dir.path());
+    let to = dir.path().join(".config/kprtfwd/kprtfwd.db");
+    fs::create_dir_all(to.parent().unwrap()).unwrap();
+    not_a_database(&temp(&to));
+
+    Store::copy_file(&from, &to).unwrap();
+
+    assert!(!temp(&to).exists());
+    assert_eq!(mode(&to), 0o600);
+    assert_eq!(
+        Store::snapshot(&to).unwrap().forwards().unwrap(),
+        fixture_forwards()
+    );
+}
+
+/// v1 may be writing its file during the take-over: the copy waits for the
+/// write and includes it.
+#[test]
+fn copy_waits_for_a_v1_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let from = v1_database(dir.path());
+    let to = dir.path().join(".config/kprtfwd/kprtfwd.db");
+    let api = forward("staging.shop.api-80", "staging", "shop", "api", (80, 18091));
+    // In the rollback journal, an exclusive lock keeps readers out.
+    let v1 = v1_connection(&from);
+    v1.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    v1_add(&v1, &api);
+    let writer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        v1.execute_batch("COMMIT").unwrap();
+    });
+
+    let copied = Store::copy_file(&from, &to);
+
+    writer.join().unwrap();
+    copied.unwrap();
+    let forwards = Store::snapshot(&to).unwrap().forwards().unwrap();
+    assert_eq!(forwards.len(), 5);
+    assert!(forwards.contains(&api));
 }
 
 #[test]

@@ -193,8 +193,11 @@ Main dependencies:
 - **Moving from `~/.kprtfwd`.** If the directory has no database yet but
   `~/.kprtfwd/kprtfwd.db` exists, the daemon stops a daemon still running there
   (by its PID if it is another version) and copies the database with SQLite's
-  backup API. `~/.kprtfwd` stays as it is, so v1 keeps working on its own copy.
-  With `KPRTFWD_HOME` set, this step is skipped.
+  backup API. The copy goes to `kprtfwd.db.tmp` and is renamed to `kprtfwd.db`
+  once it is complete, so a failed or interrupted copy leaves no database
+  behind and the next start tries again; while v1 writes its file, the copy
+  waits up to 5 s. `~/.kprtfwd` stays as it is, so v1 keeps working on its own
+  copy. With `KPRTFWD_HOME` set, this step is skipped.
 - **Start on demand.** A client that finds no daemon runs `kprtfwd daemon run`
   in its own process group, with no terminal attached. If that process exits
   right away, the client reports it and names the log directory instead of
@@ -515,7 +518,9 @@ on or off with one request (`+` / `-`).
   additive:
   - **v2:** `port_forwards` gains `enabled INTEGER NOT NULL DEFAULT 0`. A new
     table `settings (key TEXT PRIMARY KEY, value TEXT)` holds `paused`.
-- **Backup.** The first migration copies the database to `kprtfwd.db.v1-backup`.
+- **Backup.** The first migration copies the database to `kprtfwd.db.v1-backup`,
+  through a temporary file like the take-over. If the copy fails, the database
+  is not migrated, and the next start tries both again.
 - **Rollback.** v1 keeps its own file in `~/.kprtfwd`, which v2 no longer
   changes; that is the rollback path, without the changes made in v2. v1 also
   works on a migrated database, because it always reads and writes explicit

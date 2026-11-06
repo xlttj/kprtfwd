@@ -583,8 +583,9 @@ impl Daemon {
 
 /// Takes over `~/.kprtfwd`, where kprtfwd v1 and the first v2 builds kept
 /// their data, while this directory has no database yet: stops a daemon still
-/// running there and copies its database. The old directory is left as it is,
-/// so kprtfwd v1 keeps working on it.
+/// running there and copies its database. The copy gets its final name only
+/// once it is complete, so after a failed one the next start tries again. The
+/// old directory is left as it is, so kprtfwd v1 keeps working on it.
 async fn adopt_legacy_dir(data_dir: &Path) -> Result<()> {
     let Some(legacy) = paths::legacy_dir() else {
         return Ok(());

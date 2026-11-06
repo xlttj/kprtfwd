@@ -3,7 +3,8 @@
 //! The schema extends v1's (`~/.kprtfwd/kprtfwd.db`). Changes are additive,
 //! so the v1 binary keeps working on a migrated file.
 
-use std::fs::{DirBuilder, OpenOptions};
+use std::fs::{self, DirBuilder, OpenOptions};
+use std::io;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -13,6 +14,10 @@ use rusqlite::{Connection, MAIN_DB, OpenFlags, OptionalExtension, Row, params};
 
 use crate::model::{Forward, ForwardId, Project};
 use crate::validate::{self, ValidationError};
+
+/// How long a connection waits for another process's lock, such as v1 writing
+/// the file.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Schema version this code reads and writes, kept in `PRAGMA user_version`.
 /// v1 never set it, so a v1 database reports 0.
@@ -84,7 +89,8 @@ impl Store {
     /// Opens the database file, creating it if needed, and migrates it to the
     /// current schema. Before an existing older database is migrated, a copy
     /// is written next to it (`kprtfwd.db.v1-backup`); an existing copy is
-    /// never overwritten.
+    /// never overwritten. If the copy fails, the database is not migrated and
+    /// the next open tries again.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
@@ -124,12 +130,15 @@ impl Store {
 
     /// Copies the database at `from` to `to`, which must not exist yet. The
     /// source is opened read-only and not changed; the copy is consistent even
-    /// while another process uses the source.
+    /// while another process uses the source, and waits up to 5 s for one
+    /// that writes it. `to` appears only once the copy is complete: a failed
+    /// or interrupted copy leaves nothing there.
     pub fn copy_file(from: &Path, to: &Path) -> Result<()> {
         let source = Connection::open_with_flags(
             from,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        source.busy_timeout(BUSY_TIMEOUT)?;
         if let Some(dir) = to.parent().filter(|d| !d.as_os_str().is_empty()) {
             DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
         }
@@ -391,7 +400,7 @@ fn configure(conn: &Connection) -> Result<()> {
     // Off by default per connection; without it the cascades are inert.
     conn.pragma_update(None, "foreign_keys", true)?;
     // v1 may hold the file open while v2 migrates it.
-    conn.busy_timeout(Duration::from_secs(5))?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     Ok(())
 }
 
@@ -440,16 +449,37 @@ fn backup_path(path: &Path, version: i64) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Copies the database of `conn` to `target`, unless `target` exists. The copy
+/// is written to `<target>.tmp` and renamed to `target` once it is complete,
+/// so a failed or interrupted copy never stands under the final name, and the
+/// next call starts over.
 fn write_backup(conn: &Connection, target: &Path) -> Result<()> {
     if target.exists() {
         return Ok(());
     }
+    let mut temp = target.as_os_str().to_owned();
+    temp.push(".tmp");
+    let temp = PathBuf::from(temp);
+    let result = write_complete_copy(conn, &temp).and_then(|()| Ok(fs::rename(&temp, target)?));
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+fn write_complete_copy(conn: &Connection, temp: &Path) -> Result<()> {
+    // Left over from an interrupted copy.
+    match fs::remove_file(temp) {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err.into()),
+        _ => {}
+    }
     // Create it owner-only first; SQLite keeps the permissions of an existing file.
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(target)?;
-    conn.backup(MAIN_DB, target, None::<fn(Progress)>)?;
+        .open(temp)?;
+    conn.backup(MAIN_DB, temp, None::<fn(Progress)>)?;
+    file.sync_all()?;
     Ok(())
 }
