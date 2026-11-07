@@ -786,7 +786,20 @@ Principles:
   INFO column. There is no detail pane.
 - **One key per action.** Nothing asks for confirmation except deleting a forward.
 - **Nothing fancy.** No mouse, no command palette, no notifications, no Unicode
-  symbols. Colour is only used in the STATE column.
+  symbols. Colour marks states and trouble, nothing else:
+  - the STATE column: `ready` green, `waiting` yellow, `error` red, `paused`
+    magenta, `off` grey;
+  - the header: a context's state green when `ok`, yellow while `logging in`,
+    red when it is unreachable, needs a login or has a kubeconfig error, grey
+    when idle or connecting; `PAUSED` after the contexts in bold magenta while
+    everything is paused; the hint for a daemon of another version in yellow;
+  - errors in red: a lost daemon, an error in the message line, a form's
+    error and a failed discovery;
+  - in discovery, the note on skipped namespaces in yellow.
+
+  Key hints, placeholders, column headers, separators, a version the daemon
+  shares and services in discovery that already have a forward are grey;
+  the selected row is reversed and the focused form field bold.
 
 Layout:
 

@@ -1,4 +1,4 @@
-//! Drawing. Colour only in the STATE column (and red for errors), no
+//! Drawing. Colour only for states and trouble, as docs §10 lists it; no
 //! symbols, no decoration.
 
 use std::time::SystemTime;
