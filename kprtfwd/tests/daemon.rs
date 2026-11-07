@@ -529,6 +529,31 @@ async fn a_relative_kprtfwd_home_stays_where_it_was() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "daemon stopped\n");
 }
 
+/// The client checks the socket path the daemon will bind: for a relative
+/// `KPRTFWD_HOME` in a deep directory the absolute one is too long, so no
+/// daemon is started that could only fail.
+#[test]
+fn a_relative_kprtfwd_home_is_checked_as_absolute() {
+    let home = Home::new();
+    let deep = home.path().join("d".repeat(100));
+    std::fs::create_dir(&deep).unwrap();
+    let output = home
+        .command(&["status"])
+        .env("KPRTFWD_HOME", "kh")
+        .env(IDLE_EXIT, "2000")
+        .current_dir(&deep)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let socket = deep.join("kh/daemon.sock");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("the socket path {} is too long", socket.display())),
+        "{stderr}"
+    );
+    assert!(!deep.join("kh").exists(), "a daemon was started");
+}
+
 /// Shortens the daemon's idle exit, in milliseconds.
 const IDLE_EXIT: &str = "KPRTFWD_IDLE_EXIT_MS";
 

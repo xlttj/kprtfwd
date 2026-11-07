@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 /// kprtfwd's directory for its settings, database, socket and logs:
 /// `$KPRTFWD_HOME` if set, else `$XDG_CONFIG_HOME/kprtfwd`, else
-/// `~/.config/kprtfwd`.
+/// `~/.config/kprtfwd`. A relative `KPRTFWD_HOME` is made absolute against
+/// the current directory, so the paths a client checks and shows are the
+/// ones the daemon it starts uses, which runs elsewhere.
 ///
 /// Returns `None` if neither `KPRTFWD_HOME` nor `HOME` is set.
 pub fn data_dir() -> Option<PathBuf> {
@@ -28,8 +30,8 @@ fn choose_dir(
     xdg_config_home: Option<OsString>,
     home: Option<OsString>,
 ) -> Option<PathBuf> {
-    if let Some(dir) = kprtfwd_home {
-        return Some(PathBuf::from(dir));
+    if let Some(dir) = kprtfwd_home.map(PathBuf::from) {
+        return Some(std::path::absolute(&dir).unwrap_or(dir));
     }
     // The XDG spec says to ignore relative paths.
     if let Some(dir) = xdg_config_home
@@ -105,6 +107,11 @@ mod tests {
         assert_eq!(
             dir(Some("/test"), Some("/xdg"), Some("/home/me")),
             path("/test")
+        );
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            dir(Some("kh"), Some("/xdg"), Some("/home/me")),
+            Some(cwd.join("kh"))
         );
         assert_eq!(dir(None, None, None), None);
     }
