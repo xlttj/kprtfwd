@@ -55,6 +55,15 @@ impl NetCause {
             Self::Other(_) => "error",
         }
     }
+
+    /// The error text of a TLS or unclassified failure, which
+    /// [`NetCause::short`] leaves out; the other causes say it all there.
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Tls(text) | Self::Other(text) if !text.is_empty() => Some(text),
+            _ => None,
+        }
+    }
 }
 
 impl ContextState {
@@ -72,6 +81,18 @@ impl ContextState {
             Self::Unreachable { cause, .. } => format!("unreachable ({})", cause.short()),
             Self::AuthFailed { .. } => "login needed".into(),
             Self::ConfigError { .. } => "kubeconfig error".into(),
+        }
+    }
+
+    /// What the summary leaves out: the error text of a TLS or unclassified
+    /// failure, or why the login failed. For the log, the context's events
+    /// and `kprtfwd status`; the header line and the INFO column keep to the
+    /// summary.
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Unreachable { cause, .. } => cause.detail(),
+            Self::AuthFailed { message, .. } if !message.is_empty() => Some(message),
+            _ => None,
         }
     }
 }
@@ -390,6 +411,33 @@ mod tests {
             "port busy: mysqld (pid 812)"
         );
         assert_eq!(unreachable.summary(), "unreachable (DNS)");
+    }
+
+    #[test]
+    fn detail_keeps_what_the_summary_leaves_out() {
+        let down = |cause| ContextState::Unreachable {
+            since: SystemTime::UNIX_EPOCH,
+            cause,
+        };
+        let expired = "invalid peer certificate: Expired";
+        let tls = down(NetCause::Tls(expired.into()));
+        assert_eq!(tls.summary(), "unreachable (TLS)");
+        assert_eq!(tls.detail(), Some(expired));
+        let reset = down(NetCause::Other("connection reset".into()));
+        assert_eq!(reset.detail(), Some("connection reset"));
+        let auth = ContextState::AuthFailed {
+            since: SystemTime::UNIX_EPOCH,
+            message: "login timed out".into(),
+        };
+        assert_eq!(auth.detail(), Some("login timed out"));
+        for state in [
+            down(NetCause::Dns),
+            down(NetCause::Other(String::new())),
+            ContextState::Connecting,
+            healthy(),
+        ] {
+            assert_eq!(state.detail(), None, "{state:?}");
+        }
     }
 
     #[test]

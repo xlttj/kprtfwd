@@ -594,7 +594,8 @@ them itself:
   (`2026-11-07 09:15:02`), and the TUI's event view the time, with the date
   for events not from today: events live as long as the daemon, which may
   be days. Events include:
-  - state changes,
+  - state changes; a context's with the error text of a TLS or unknown
+    failure, or why its login failed,
   - refused connections and why,
   - pod switches,
   - errors from the error channel,
@@ -900,7 +901,7 @@ Internal structure:
 | Command | Purpose |
 |---|---|
 | `kprtfwd` | TUI; starts the daemon if needed |
-| `kprtfwd status [--all] [--json]` | contexts and enabled forwards (with `--all` every forward) with their state; `--json` in the format below |
+| `kprtfwd status [--all] [--json]` | contexts and enabled forwards (with `--all` every forward) with their state, and below the contexts the error of a context whose state is too short to say it (a TLS or unknown failure, a failed login); `--json` in the format below |
 | `kprtfwd up <project or words>...` / `down ...` | enable or disable a project, or every forward the words match (as in the TUI filter); `down --all` disables all. Both need words, and an empty word, as an unset variable in a script gives, is wrong usage: it would match every forward |
 | `kprtfwd switch <project>` | enable the project, disable everything else |
 | `kprtfwd pause` / `resume` | global pause |
@@ -946,6 +947,14 @@ These are shown in the INFO column and by `kprtfwd status`.
 | service gone | `service not found (prune?)` |
 | no ready endpoints | `0/2 pods ready` |
 | error channel message | the kubelet's text, e.g. `pod refused connection on 3000` |
+
+The error text of a TLS or unknown failure and why a login failed do not fit
+the column. They are in the context's events (`l`, `kprtfwd logs`), the
+daemon's log, and below the contexts in `kprtfwd status`, e.g. `staging:
+client error (Connect): invalid peer certificate: Expired`. An API error with
+another status than 401, 403 or 404 reads as its status line and the
+server's message, e.g. `500 Internal Server Error: etcdserver: leader
+changed`.
 
 ## 13. Testing
 

@@ -292,8 +292,17 @@ impl Context {
                 format!("login needed: {message}")
             }
             other => {
-                warn!(context = %self.name, state = %other.summary(), "API server not usable");
-                format!("API server {}", other.summary())
+                let state = other.summary();
+                match other.detail() {
+                    Some(cause) => {
+                        warn!(context = %self.name, %state, %cause, "API server not usable");
+                        format!("API server {state}: {cause}")
+                    }
+                    None => {
+                        warn!(context = %self.name, %state, "API server not usable");
+                        format!("API server {state}")
+                    }
+                }
             }
         };
         self.events.push(event);
@@ -1171,6 +1180,30 @@ contexts:
             );
             assert_eq!(state, unreachable(10, cause));
         }
+    }
+
+    /// The event of an outage carries the error text of a TLS or unknown
+    /// failure, which the summary leaves out.
+    #[tokio::test]
+    async fn the_event_of_an_outage_says_why() {
+        let config = Config::new("http://127.0.0.1:1".parse().unwrap());
+        let context = Context::fake(Client::try_from(config).unwrap(), healthy());
+        let expired = "invalid peer certificate: Expired";
+        context.force_state(unreachable(10, NetCause::Tls(expired.into())));
+        context.force_state(unreachable(10, NetCause::Dns));
+        let events: Vec<String> = context
+            .events
+            .entries()
+            .into_iter()
+            .map(|event| event.message)
+            .collect();
+        assert_eq!(
+            events,
+            [
+                format!("API server unreachable (TLS): {expired}"),
+                "API server unreachable (DNS)".to_owned(),
+            ]
+        );
     }
 
     #[test]

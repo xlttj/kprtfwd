@@ -215,7 +215,10 @@ where
 /// A failure as a sentence for the user.
 pub fn describe(failure: &Failure, context: &str) -> String {
     match failure {
-        Failure::Net(cause) => format!("API server unreachable ({})", cause.short()),
+        Failure::Net(cause) => match cause.detail() {
+            Some(detail) => format!("API server unreachable ({}): {detail}", cause.short()),
+            None => format!("API server unreachable ({})", cause.short()),
+        },
         Failure::Auth(_) => format!("login needed: kubectl --context {context} get ns"),
         Failure::Forbidden(message) => format!("forbidden: {message}"),
         Failure::NotFound(message) | Failure::Other(message) => message.clone(),
@@ -469,7 +472,8 @@ mod tests {
             ),
             (
                 Reply::Json(500, status(500, "etcdserver: leader changed")),
-                "shop-b: ApiError: etcdserver: leader changed",
+                // Without kube's dump of the whole status.
+                "shop-b: 500 Internal Server Error: etcdserver: leader changed",
             ),
         ] {
             let reply = Arc::new(std::sync::Mutex::new(Some(reply)));
@@ -481,7 +485,7 @@ mod tests {
             let err = list_services(&api.client(), "staging", "shop-*")
                 .await
                 .unwrap_err();
-            assert!(err.starts_with(expected), "{err}");
+            assert_eq!(err, expected);
         }
     }
 
@@ -506,6 +510,10 @@ mod tests {
     fn describes_each_failure() {
         let cases = [
             (Failure::Net(NetCause::Dns), "API server unreachable (DNS)"),
+            (
+                Failure::Net(NetCause::Tls("invalid peer certificate: Expired".into())),
+                "API server unreachable (TLS): invalid peer certificate: Expired",
+            ),
             (
                 Failure::Auth("token expired".into()),
                 "login needed: kubectl --context staging get ns",

@@ -26,12 +26,14 @@ pub fn classify(err: &(dyn Error + 'static)) -> Failure {
         if let Some(kube_err) = current.downcast_ref::<kube::Error>() {
             match kube_err {
                 kube::Error::Auth(_) => return Failure::Auth(text),
-                kube::Error::Api(status) => match status.code {
-                    401 => return Failure::Auth(status.message.clone()),
-                    403 => return Failure::Forbidden(status.message.clone()),
-                    404 => return Failure::NotFound(status.message.clone()),
-                    _ => {}
-                },
+                kube::Error::Api(status) => {
+                    return match status.code {
+                        401 => Failure::Auth(status.message.clone()),
+                        403 => Failure::Forbidden(status.message.clone()),
+                        404 => Failure::NotFound(status.message.clone()),
+                        _ => Failure::Other(api_text(status)),
+                    };
+                }
                 _ => {}
             }
         }
@@ -80,6 +82,25 @@ pub fn classify(err: &(dyn Error + 'static)) -> Failure {
     }
 }
 
+/// The text of an API error with an unclassified status: its HTTP status
+/// and the server's message. kube's own text adds the whole status in debug
+/// format; a body that was no status, such as a proxy's error page, which
+/// kube takes as the message, is left out.
+fn api_text(status: &kube::core::Status) -> String {
+    let line = match hyper::StatusCode::from_u16(status.code)
+        .ok()
+        .and_then(|code| code.canonical_reason())
+    {
+        Some(reason) => format!("{} {reason}", status.code),
+        None => format!("HTTP {}", status.code),
+    };
+    if status.message.is_empty() || status.reason == "Failed to parse error data" {
+        line
+    } else {
+        format!("{line}: {}", status.message)
+    }
+}
+
 /// A network failure that one error of a chain tells by its type.
 enum Cause {
     Refused,
@@ -108,10 +129,14 @@ fn net_cause(err: &(dyn Error + 'static)) -> Option<Cause> {
 }
 
 /// The error and all its sources, joined with ": ", without repeats (many
-/// wrappers repeat their source's text).
+/// wrappers repeat their source's text) and without the names kube puts
+/// before the errors of its HTTP stack.
 pub fn chain(err: &(dyn Error + 'static)) -> String {
     let mut parts: Vec<String> = Vec::new();
     for current in errors(err) {
+        if let Some(kube::Error::Service(_) | kube::Error::HyperError(_)) = current.downcast_ref() {
+            continue;
+        }
         let text = current.to_string();
         if !parts.iter().any(|part| part.contains(&text)) {
             parts.push(text);
@@ -213,6 +238,29 @@ mod tests {
         assert_eq!(classify(&status(401)), Failure::Auth("nope".into()));
         assert_eq!(classify(&status(403)), Failure::Forbidden("nope".into()));
         assert_eq!(classify(&status(404)), Failure::NotFound("nope".into()));
+        // Others by their status line and message, without kube's dump of
+        // the whole status.
+        assert_eq!(
+            classify(&status(500)),
+            Failure::Other("500 Internal Server Error: nope".into())
+        );
+    }
+
+    /// An error page instead of a status, as a proxy may send, is not shown.
+    #[tokio::test]
+    async fn an_api_error_without_a_status_shows_its_status_line() {
+        let page = "<html><body>bad gateway</body></html>";
+        let api = FakeApi::start(move |_| Reply::Json(502, page.into())).await;
+        let err = api.client().apiserver_version().await.unwrap_err();
+        assert_eq!(classify(&err), Failure::Other("502 Bad Gateway".into()));
+
+        let api =
+            FakeApi::start(|_| Reply::Json(500, status(500, "etcdserver: leader changed"))).await;
+        let err = api.client().apiserver_version().await.unwrap_err();
+        assert_eq!(
+            classify(&err),
+            Failure::Other("500 Internal Server Error: etcdserver: leader changed".into())
+        );
     }
 
     fn client(url: &str) -> kube::Client {
@@ -300,7 +348,10 @@ mod tests {
             .await
             .unwrap_err();
         let text = chain(&plain);
-        assert!(text.contains("corrupt message"), "{plain}");
+        assert!(
+            text.starts_with("client error (Connect): received corrupt message"),
+            "{text}"
+        );
         assert_eq!(classify(&plain), Failure::Net(NetCause::Tls(text)));
     }
 

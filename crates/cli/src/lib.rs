@@ -706,20 +706,33 @@ async fn daemon_stop() -> Result<ExitCode> {
 }
 
 fn print_contexts(snapshot: &Snapshot) {
-    let mut parts: Vec<(bool, String)> = snapshot
-        .contexts
-        .iter()
-        .map(|c| {
-            let idle = c.state == kprtfwd_core::ContextState::Idle;
-            (idle, format!("{} {}", c.name, c.state.summary()))
-        })
-        .collect();
-    // Contexts in use first; idle ones last.
-    parts.sort_by_key(|(idle, _)| *idle);
-    let line: Vec<String> = parts.into_iter().map(|(_, text)| text).collect();
-    if !line.is_empty() {
-        println!("{}\n", line.join(" · "));
+    let lines = context_lines(snapshot);
+    if !lines.is_empty() {
+        println!("{}\n", lines.join("\n"));
     }
+}
+
+/// The contexts with their state in one line, as in the TUI's header, then
+/// one line for each that says why it is not usable where its state is too
+/// short for that: the error of a TLS or unknown failure, or of the login.
+fn context_lines(snapshot: &Snapshot) -> Vec<String> {
+    let mut contexts: Vec<_> = snapshot.contexts.iter().collect();
+    if contexts.is_empty() {
+        return Vec::new();
+    }
+    // Contexts in use first; idle ones last.
+    contexts.sort_by_key(|c| c.state == ContextState::Idle);
+    let states: Vec<String> = contexts
+        .iter()
+        .map(|c| format!("{} {}", c.name, c.state.summary()))
+        .collect();
+    let mut lines = vec![states.join(" · ")];
+    lines.extend(
+        contexts
+            .iter()
+            .filter_map(|c| Some(format!("{}: {}", c.name, c.state.detail()?))),
+    );
+    lines
 }
 
 fn print_forwards(snapshot: &Snapshot, views: &[&ForwardView]) {
@@ -1026,6 +1039,49 @@ mod tests {
     }
   ]
 }"#
+        );
+    }
+
+    #[test]
+    fn status_says_why_a_context_is_not_usable() {
+        let mut snapshot = snapshot();
+        assert!(context_lines(&snapshot).is_empty());
+        let context = |name: &str, state| kprtfwd_proto::ContextView {
+            name: name.into(),
+            state,
+        };
+        let expired = "client error (Connect): invalid peer certificate: Expired";
+        snapshot.contexts = vec![
+            context("orbstack", ContextState::Idle),
+            context(
+                "staging",
+                ContextState::Unreachable {
+                    since: SystemTime::UNIX_EPOCH,
+                    cause: kprtfwd_core::state::NetCause::Tls(expired.into()),
+                },
+            ),
+            context(
+                "production",
+                ContextState::AuthFailed {
+                    since: SystemTime::UNIX_EPOCH,
+                    message: "login timed out".into(),
+                },
+            ),
+            context(
+                "dev",
+                ContextState::Unreachable {
+                    since: SystemTime::UNIX_EPOCH,
+                    cause: kprtfwd_core::state::NetCause::Dns,
+                },
+            ),
+        ];
+        assert_eq!(
+            context_lines(&snapshot),
+            [
+                "staging unreachable (TLS) · production login needed · dev unreachable (DNS) · orbstack idle".to_owned(),
+                format!("staging: {expired}"),
+                "production: login timed out".to_owned(),
+            ]
         );
     }
 
