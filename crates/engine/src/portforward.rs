@@ -141,7 +141,12 @@ where
             let mut buf = vec![0u8; 32 * 1024];
             let mut sent = 0u64;
             loop {
-                let n = local_read.read(&mut buf).await?;
+                let n = match local_read.read(&mut buf).await {
+                    Ok(n) => n,
+                    // Ends the stream as a close does.
+                    Err(err) if client_gone(&err) => 0,
+                    Err(err) => return Err(err.into()),
+                };
                 if n == 0 {
                     break;
                 }
@@ -166,8 +171,11 @@ where
                 match message {
                     Ok(Message::Binary(frame)) => {
                         if let Frame::Data(data) = read_frame(port, &mut initialized, &frame)? {
-                            local_write.write_all(data).await?;
-                            received += data.len() as u64;
+                            match local_write.write_all(data).await {
+                                Ok(()) => received += data.len() as u64,
+                                Err(err) if client_gone(&err) => break,
+                                Err(err) => return Err(err.into()),
+                            }
                         }
                     }
                     Ok(Message::Close(_)) => break,
@@ -236,6 +244,17 @@ fn read_frame<'a>(
         ));
     }
     Ok(Frame::Data(payload))
+}
+
+/// Errors of the local socket that only mean the client went away: it reset
+/// the connection, as a client does that closes with data unread (a browser
+/// tab closed during a download) or is killed. Not an error of the forward.
+fn client_gone(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        err.kind(),
+        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe
+    )
 }
 
 /// Errors that only mean the stream is over. A peer that drops the connection
@@ -335,6 +354,19 @@ mod tests {
         app.read_to_end(&mut received).await.unwrap();
         assert_eq!(received, b"bye");
         assert_eq!(pump.await.unwrap().unwrap().received, 3);
+    }
+
+    /// A client that went away is the end of the stream, not an error,
+    /// also while the pod still sends.
+    #[tokio::test]
+    async fn ends_quietly_when_the_client_is_gone() {
+        let (pf, mut kubelet) = pair().await;
+        send_headers(&mut kubelet).await;
+        kubelet.send(frame(DATA, b"late")).await.unwrap();
+        let (app, local) = tokio::io::duplex(1024);
+        drop(app);
+        let transfer = pf.pump(local).await.unwrap();
+        assert_eq!(transfer, Transfer::default());
     }
 
     #[tokio::test]

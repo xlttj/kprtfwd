@@ -454,7 +454,10 @@ maximum age, the keepalive and the context's health probe. WebSocket pings are
 not used.
 
 **Close.** The protocol has no half-close. When either side ends, the WebSocket is
-closed, as in kubectl's WebSocket mode and in kube-rs.
+closed, as in kubectl's WebSocket mode and in kube-rs. A client that goes away
+with a reset or a broken pipe, as one that is killed or closes with data
+unread does, ends its connection the same way; that is no error of the
+forward, so it is neither an event nor its last error.
 
 **Reference.** kube-rs `src/api/portforward.rs` (under 400 lines) and the spike.
 

@@ -1238,6 +1238,31 @@ mod tests {
         assert!(shared.warm.lock().unwrap().is_none());
     }
 
+    /// A client that resets its connection, as one that is killed or closes
+    /// with data unread does, ends it without an error of the forward.
+    #[tokio::test]
+    async fn a_client_that_resets_its_connection_is_no_error() {
+        let test = Test::start("db", 5432, &[("db-0", true)], echo).await;
+        let mut socket = TcpStream::connect(("127.0.0.1", test.port)).await.unwrap();
+        socket.write_all(b"a").await.unwrap();
+        assert_eq!(read_answer(&mut socket, "a").await, "db-0#1:a");
+        socket.set_zero_linger().unwrap();
+        drop(socket);
+        test.wait("no connection", |t| {
+            t.observe().active_conns == 0 && t.open_streams().is_empty()
+        })
+        .await;
+        assert_eq!(test.handle.last_error(), None);
+        assert!(
+            !test
+                .events()
+                .iter()
+                .any(|event| event.starts_with("connection failed")),
+            "{:?}",
+            test.events()
+        );
+    }
+
     #[tokio::test]
     async fn the_error_channel_becomes_the_last_error() {
         let text = "error forwarding port 8080 to pod db-0: connection refused";
