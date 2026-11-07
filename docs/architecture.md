@@ -945,17 +945,25 @@ These are shown in the INFO column and by `kprtfwd status`.
 
 | Cause | Message |
 |---|---|
-| DNS lookup of the API host fails | `API unreachable (DNS)`; header: `staging unreachable (DNS, VPN?)` |
-| refused or timed out | `API unreachable (timeout)` |
+| DNS lookup of the API host fails | `API unreachable (DNS)`; header: `staging unreachable (DNS)` |
+| API server refuses the connection | `API unreachable (refused)` |
+| TLS fails, e.g. an expired or unknown certificate | `API unreachable (TLS)` |
+| probes time out, twice in a row while healthy | `API unreachable (timeout)` |
+| probes fail with a reset or an unknown error, twice in a row while healthy | `API unreachable (error)` |
+| context starting its client, first probe pending | `connecting` |
 | exec plugin logging in, no accepted token yet | `logging in` |
 | login failed or rejected (401) | TUI: `login needed: reconnect (r) to log in`; `kprtfwd status`: `login needed: kprtfwd reconnect staging to log in` |
+| context missing from the kubeconfig, or the kubeconfig unreadable | `kubeconfig: ` and why |
 | 403 on port-forward | `forbidden: port-forward in namespace X`; kube drops the API server's text there |
 | 403 on a watch | `forbidden: ` and the API server's text, e.g. `forbidden: services is forbidden: User "dev" cannot list resource "services" ...` |
 | `EADDRINUSE` | `port busy: mysqld (pid 812)` |
 | another bind error, e.g. a port below 1024 on Linux | `cannot listen: Permission denied (os error 13)` |
-| service gone | `service not found (prune?)` |
+| listener or watch cache not ready yet | `starting` |
+| service gone | `service not found` |
+| port not on the service | `port not on service` |
 | no ready endpoints | `0/2 pods ready` |
-| error channel message | the kubelet's text, e.g. `pod refused connection on 3000` |
+| a connection failed, e.g. with the kubelet's error text; on a ready forward for a minute | the error, e.g. `error forwarding port 3000 to pod web-0 ...: connection refused` |
+| no file descriptor left, on a ready forward while it lasts | `cannot accept connections: too many open files` |
 
 The error text of a TLS or unknown failure and why a login failed do not fit
 the column. They are in the context's events (`l`, `kprtfwd logs`), the
