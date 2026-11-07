@@ -18,6 +18,12 @@ the git history.
 
 ## Install
 
+**Homebrew** on macOS and Linux:
+
+```bash
+brew install xlttj/tap/kprtfwd
+```
+
 **Release binaries** for macOS (arm64, x86_64) and Linux (x86_64, arm64) are
 attached to the [GitHub releases](https://github.com/xlttj/kprtfwd/releases)
 from version 2.0.0 on; earlier releases contain version 1. Download the one
@@ -47,8 +53,6 @@ xattr -d com.apple.quarantine kprtfwd-darwin-arm64
 ```bash
 cargo install --locked --git https://github.com/xlttj/kprtfwd kprtfwd
 ```
-
-The Homebrew tap `xlttj/kprtfwd` still installs version 1.
 
 kprtfwd reads the kubeconfig like `kubectl` does (`KUBECONFIG` or
 `~/.kube/config`). `kubectl` itself is only needed if your kubeconfig logs in

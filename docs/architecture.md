@@ -1133,7 +1133,9 @@ changed`.
   `curl` download and the `xattr` command for browser downloads (decided
   2026-11-06).
 - Release profile: `strip = true`, `lto = "thin"`.
-- The Homebrew tap formula `kprtfwd` switches to the v2 binaries with 2.0.0.
+- The formula `kprtfwd` in the Homebrew tap `xlttj/tap` (repository
+  `xlttj/homebrew-tap`) installs the release binaries on macOS and Linux from
+  2.0.0 on. It is updated by hand after each release.
 
 ## 15. Delivery plan
 
@@ -1172,8 +1174,11 @@ stopped by its PID and its database copied.
 
 On 2026-10-31 the daemon took over running exec plugins (section 6.7), and
 phase 3 began: the Go code and the spike were removed, the workspace moved to
-the repository root, and the release workflow builds the Rust binaries. 2.0.0
-is not tagged yet, and the Homebrew tap still installs v1.
+the repository root, and the release workflow builds the Rust binaries.
+
+On 2026-11-06 a review of the whole codebase led to 20 blocks of fixes, all
+done by 2026-11-07. 2.0.0 was released on 2026-11-07, after eight days
+of daily use instead of the planned two weeks; the Homebrew tap installs it.
 
 ## 16. Decisions, risks, open questions
 

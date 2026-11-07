@@ -1201,7 +1201,7 @@ dependencies = [
 
 [[package]]
 name = "kprtfwd"
-version = "2.0.0-dev"
+version = "2.0.0"
 dependencies = [
  "clap",
  "kprtfwd-cli",
@@ -1218,7 +1218,7 @@ dependencies = [
 
 [[package]]
 name = "kprtfwd-cli"
-version = "2.0.0-dev"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1233,7 +1233,7 @@ dependencies = [
 
 [[package]]
 name = "kprtfwd-core"
-version = "2.0.0-dev"
+version = "2.0.0"
 dependencies = [
  "jiff",
  "rusqlite",
@@ -1246,7 +1246,7 @@ dependencies = [
 
 [[package]]
 name = "kprtfwd-daemon"
-version = "2.0.0-dev"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "kprtfwd-core",
@@ -1262,7 +1262,7 @@ dependencies = [
 
 [[package]]
 name = "kprtfwd-engine"
-version = "2.0.0-dev"
+version = "2.0.0"
 dependencies = [
  "futures",
  "http-body-util",
@@ -1287,7 +1287,7 @@ dependencies = [
 
 [[package]]
 name = "kprtfwd-proto"
-version = "2.0.0-dev"
+version = "2.0.0"
 dependencies = [
  "kprtfwd-core",
  "serde",
@@ -1299,7 +1299,7 @@ dependencies = [
 
 [[package]]
 name = "kprtfwd-tui"
-version = "2.0.0-dev"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "kprtfwd-core",
