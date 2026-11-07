@@ -4,85 +4,166 @@ on:
   push:
     tags:
       - 'v*'
+  # Builds without releasing, so changes to this workflow are tested, and
+  # a dependency that breaks a release target shows up in its pull
+  # request rather than at the tag. CI builds only the runners' targets.
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'Cargo.lock'
+      - '**/Cargo.toml'
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-release:
+  # A v2.0.0 tag on a commit that still says 2.0.0-dev would ship
+  # binaries that report 2.0.0-dev.
+  version:
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v5
-    
-    - name: Set up Go
-      uses: actions/setup-go@v6
-      with:
-        go-version-file: go.mod
-    
-    - name: Get the version
-      id: get_version
-      run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-    
-    - name: Build for macOS (Intel)
-      run: |
-        GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o kprtfwd-darwin-amd64 main.go
-        
-    - name: Build for macOS (Apple Silicon)
-      run: |
-        GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o kprtfwd-darwin-arm64 main.go
-        
-    - name: Build for Linux (amd64)
-      run: |
-        GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o kprtfwd-linux-amd64 main.go
-        
-    - name: Build for Linux (arm64)
-      run: |
-        GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o kprtfwd-linux-arm64 main.go
-        
-    - name: Build for Windows
-      run: |
-        GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o kprtfwd-windows-amd64.exe main.go
-    
-    - name: Calculate checksums
-      run: |
-        sha256sum kprtfwd-* > checksums.txt
-        cat checksums.txt
-    
-    - name: Create Release
-      uses: softprops/action-gh-release@v2
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        name: Release ${{ steps.get_version.outputs.VERSION }}
-        draft: false
-        prerelease: false
-        files: |
-          kprtfwd-darwin-amd64
-          kprtfwd-darwin-arm64
-          kprtfwd-linux-amd64
-          kprtfwd-linux-arm64
-          kprtfwd-windows-amd64.exe
-          checksums.txt
-        body: |
-          ## Changes
-          
-          * Please see the git log for detailed changes
-          
-          ## Installation
-          
-          ### Homebrew (macOS)
-          ```bash
-          brew tap xlttj/kprtfwd
-          brew install kprtfwd
-          ```
-          
-          ### Manual Installation
-          1. Download the appropriate binary for your system
-          2. Make it executable: `chmod +x kprtfwd-*`
-          3. Move to your PATH: `mv kprtfwd-* /usr/local/bin/kprtfwd`
-          
-          ### Go Install
-          ```bash
-          go install github.com/xlttj/kprtfwd@${{ steps.get_version.outputs.VERSION }}
-          ```
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Check that the tag is the crate version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "kprtfwd") | .version')
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::The tag ${GITHUB_REF_NAME} differs from the crate version ${version}; set version = \"${GITHUB_REF_NAME#v}\" in Cargo.toml and tag that commit."
+            exit 1
+          fi
+          echo "Tag ${GITHUB_REF_NAME} matches the crate version."
+
+  # The whole CI (fmt, clippy, tests, audit, cluster tests) on the tagged
+  # commit, so a tag cannot ship untested code. Pull requests run ci.yml
+  # on their own.
+  ci:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: [version, ci]
+    # Pull requests skip the release checks above and build anyway.
+    if: ${{ !cancelled() && !failure() }}
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            asset: kprtfwd-darwin-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            asset: kprtfwd-darwin-amd64
+          # Static musl binaries run on every Linux, whatever its glibc.
+          # Each is built on a runner of its architecture, which runs it.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            asset: kprtfwd-linux-amd64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            asset: kprtfwd-linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }} --no-self-update
+          rustup default stable
+
+      # The C parts (bundled SQLite, ring) must be compiled against musl
+      # as well. cc picks no musl compiler by itself for aarch64.
+      - name: Set up musl
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
+          echo "TARGET_CC=musl-gcc" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --locked -p kprtfwd --target ${{ matrix.target }}
+
+      - name: Name the binary
+        run: cp target/${{ matrix.target }}/release/kprtfwd ${{ matrix.asset }}
+
+      - name: Check that the binary is static
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          file ${{ matrix.asset }}
+          ldd ${{ matrix.asset }} || true
+          if ! file ${{ matrix.asset }} | grep -Eq '(statically|static-pie) linked'; then
+            echo "::error::${{ matrix.asset }} is not statically linked"
+            exit 1
+          fi
+          if ldd ${{ matrix.asset }} 2>&1 | grep -q '=>'; then
+            echo "::error::${{ matrix.asset }} needs shared libraries"
+            exit 1
+          fi
+          ./${{ matrix.asset }} --version
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    # Without a status function, this also requires every job in needs
+    # to have succeeded.
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [version, ci, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          merge-multiple: true
+
+      - name: Calculate checksums
+        run: |
+          sha256sum kprtfwd-* > checksums.txt
+          cat checksums.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          name: Release ${{ github.ref_name }}
+          files: |
+            kprtfwd-*
+            checksums.txt
+          body: |
+            ## Changes
+
+            See the git log for details.
+
+            ## Installation
+
+            Download the binary for your system (`kprtfwd-darwin-arm64`, `kprtfwd-darwin-amd64`, `kprtfwd-linux-amd64` or `kprtfwd-linux-arm64`), make it executable and put it on your `PATH`, for example:
+
+            ```bash
+            curl -fLO https://github.com/xlttj/kprtfwd/releases/download/${{ github.ref_name }}/kprtfwd-darwin-arm64
+            chmod +x kprtfwd-darwin-arm64
+            mv kprtfwd-darwin-arm64 /usr/local/bin/kprtfwd
+            ```
+
+            The Linux binaries are static and run on any distribution.
+
+            The macOS binaries are not signed. macOS blocks a binary downloaded with a browser when it first starts; a download with `curl` is not affected. After a browser download, remove the quarantine flag before the first start:
+
+            ```bash
+            xattr -d com.apple.quarantine kprtfwd-darwin-arm64
+            ```
+
+            `checksums.txt` lists the SHA-256 checksum of every binary.
+
+            ### From source
+
+            ```bash
+            cargo install --locked --git https://github.com/xlttj/kprtfwd --tag ${{ github.ref_name }} kprtfwd
+            ```

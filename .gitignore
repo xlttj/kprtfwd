@@ -1,16 +1,5 @@
-# Binaries
-kprtfwd
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-
-# Test binary, built with `go test -c`
-*.test
-
-# Output of the go coverage tool, specifically when used with LiteIDE
-*.out
+# Build output
+/target/
 
 # Logs
 *.log
@@ -25,6 +14,3 @@ kprtfwd
 # OS files
 .DS_Store
 Thumbs.db
-
-# Config files (user-specific)
-config.yaml

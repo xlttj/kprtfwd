@@ -1,0 +1,35 @@
+[package]
+name = "kprtfwd-engine"
+description = "Kubernetes access and port-forwarding for the kprtfwd daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kprtfwd-core.workspace = true
+futures.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-timeout.workspace = true
+hyper-util.workspace = true
+jiff.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tower.workspace = true
+tracing.workspace = true
+# Only for its error type, to tell TLS failures by type; the features match
+# what kube already builds.
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

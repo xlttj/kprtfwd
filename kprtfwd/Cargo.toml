@@ -1,0 +1,25 @@
+[package]
+name = "kprtfwd"
+description = "Kubernetes port-forward manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kprtfwd-cli.workspace = true
+kprtfwd-daemon.workspace = true
+kprtfwd-tui.workspace = true
+clap.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+kprtfwd-core.workspace = true
+kprtfwd-proto.workspace = true
+rusqlite.workspace = true
+rustix = { workspace = true, features = ["process"] }
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

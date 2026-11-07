@@ -1,0 +1,1045 @@
+//! The daemon through the real binary: switching the forwards off when the
+//! last TUI quits, taking over `~/.kprtfwd`, one daemon per directory, every
+//! way it exits, watching the kubeconfig, a login that waits for the user,
+//! discovery, and what adding, editing and deleting forwards keep.
+//!
+//! Every command runs in a home directory of its own; see `common`.
+
+mod common;
+
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+
+use common::{
+    Children, Home, NOT_FOUND, database, enabled, fake_api, forward, wait_until, write_database,
+};
+use kprtfwd_core::config::TEMPLATE;
+use kprtfwd_core::{Forward, ForwardId, Project, Store};
+use kprtfwd_proto::{
+    Client, ClientError, ClientMessage, MAX_FRAME, PROTOCOL_VERSION, Request, Response,
+    ServerMessage,
+};
+
+#[tokio::test]
+async fn quitting_the_last_tui_switches_the_forwards_off() {
+    let home = Home::new();
+    let db = home.data_dir().join("kprtfwd.db");
+    database(&db);
+    home.start_daemon();
+
+    let first = home.attach().await;
+    let mut second = home.attach().await;
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let snapshot = second.snapshot().await.expect("daemon still there");
+    assert!(snapshot.forwards[0].forward.enabled);
+
+    drop(second);
+    wait_until("stopped", || gone(&home)).await;
+    let store = Store::snapshot(&db).unwrap();
+    assert!(!store.forwards().unwrap()[0].enabled);
+    assert!(!store.paused().unwrap(), "the pause stays on");
+    assert_eq!(
+        std::fs::read_to_string(home.data_dir().join("config.toml")).unwrap(),
+        TEMPLATE
+    );
+}
+
+/// While the daemon exits after the last TUI quit, a client is told at once
+/// that no daemon runs, so it starts the next one, which waits for the lock.
+/// It must not wait on a socket nobody accepts on and then read "another
+/// version". Here switching the forwards off waits for the database, which
+/// the test holds.
+#[tokio::test]
+async fn a_client_during_the_exit_finds_no_daemon() {
+    let home = Home::new();
+    database(&home.db());
+    home.start_daemon();
+    let tui = home.attach().await;
+    let sql = rusqlite::Connection::open(home.db()).unwrap();
+    sql.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    drop(tui);
+    let exiting = || daemon_log(&home).contains("switching all forwards off");
+    wait_until("exiting", exiting).await;
+    let socket = home.socket();
+    let connect = Client::connect(&socket);
+    match tokio::time::timeout(Duration::from_secs(2), connect).await {
+        Ok(Err(ClientError::NotRunning(_))) => {}
+        Ok(Ok(_)) => panic!("served while exiting"),
+        Ok(Err(err)) => panic!("{err}"),
+        Err(_) => panic!("no answer while the daemon exits"),
+    }
+
+    sql.execute_batch("COMMIT").unwrap();
+    wait_until("stopped", || gone(&home)).await;
+    assert!(!enabled(&home.db()));
+}
+
+#[tokio::test]
+async fn other_clients_and_the_setting_keep_forwards_running() {
+    let home = Home::new();
+    let db = home.data_dir().join("kprtfwd.db");
+    database(&db);
+    std::fs::write(
+        home.data_dir().join("config.toml"),
+        "keep_forwards_running = true\n",
+    )
+    .unwrap();
+    // `daemon restart` connects without attaching, and leaves the daemon running.
+    home.start_daemon();
+
+    drop(home.attach().await);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut client = Client::connect(&home.socket())
+        .await
+        .expect("daemon still there");
+    client.snapshot().await.unwrap();
+    assert!(enabled(&db));
+}
+
+#[tokio::test]
+async fn takes_over_the_old_directory() {
+    let home = Home::new();
+    let legacy_db = home.legacy_dir().join("kprtfwd.db");
+    database(&legacy_db);
+    // A daemon still running in the old directory, as after an upgrade.
+    let output = home
+        .command(&["daemon", "restart"])
+        .env("KPRTFWD_HOME", home.legacy_dir())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let legacy_socket = home.legacy_dir().join("daemon.sock");
+    assert!(legacy_socket.exists());
+
+    let status = status_json(&home);
+    assert_eq!(status["forwards"].as_array().unwrap().len(), 1, "{status}");
+    assert_eq!(status["forwards"][0]["enabled"], true);
+    assert_eq!(status["paused"], true);
+    assert!(!legacy_socket.exists(), "the old daemon still runs");
+    assert!(legacy_db.exists(), "the old database is gone");
+    assert!(home.data_dir().join("kprtfwd.db").exists());
+}
+
+#[test]
+fn a_failed_take_over_is_tried_again() {
+    let home = Home::new();
+    let legacy_db = home.legacy_dir().join("kprtfwd.db");
+    std::fs::create_dir_all(home.legacy_dir()).unwrap();
+    // SQLite refuses to read it, so the copy fails.
+    std::fs::write(&legacy_db, [0x55; 4096]).unwrap();
+
+    let output = home.run(&["status", "--json"]);
+    assert!(!output.status.success(), "{output:?}");
+    let db = home.data_dir().join("kprtfwd.db");
+    assert!(!db.exists(), "a failed copy looks like a database");
+    assert!(!home.socket().exists(), "the failed daemon left its socket");
+    assert!(!home.pid_file().exists());
+
+    std::fs::remove_file(&legacy_db).unwrap();
+    database(&legacy_db);
+    let status = status_json(&home);
+    assert_eq!(status["forwards"].as_array().unwrap().len(), 1, "{status}");
+}
+
+/// `status --json --all`: the state with every forward.
+fn status_json(home: &Home) -> serde_json::Value {
+    let output = home.run(&["status", "--json", "--all"]);
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|err| panic!("{err}: {output:?}"))
+}
+
+/// A crashed daemon leaves its socket behind; the next start replaces it.
+#[tokio::test]
+async fn a_stale_socket_is_replaced() {
+    let home = Home::new();
+    home.stale_socket();
+
+    let output = home.run(&["status", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    Client::connect(&home.socket())
+        .await
+        .expect("daemon serves");
+}
+
+/// Clients started together after a crash each start a daemon; one serves
+/// and the others give way, so no daemon runs unreachable on the database.
+#[tokio::test]
+async fn daemons_started_at_once_leave_one_running() {
+    let home = Home::new();
+    home.stale_socket();
+
+    let mut daemons = Children((0..8).map(|_| home.spawn_daemon()).collect());
+    let pid = home.connect_once_up().await.daemon_pid;
+    let serving = daemons.0.iter().position(|d| d.id() == pid);
+    let serving = serving.expect("the daemon that serves is one of ours");
+    for index in 0..daemons.0.len() {
+        if index != serving {
+            let status = daemons.exit_status(index).await;
+            assert!(status.success(), "a daemon that gave way: {status}");
+        }
+    }
+    assert!(daemons.0[serving].try_wait().unwrap().is_none(), "exited");
+    let written = std::fs::read_to_string(home.pid_file()).unwrap();
+    assert_eq!(written.trim(), pid.to_string());
+
+    let output = home.run(&["daemon", "stop"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(daemons.exit_status(serving).await.success());
+}
+
+/// How a stand-in for a daemon answers a client's hello.
+#[derive(Clone, Copy)]
+enum Speaks {
+    /// As a daemon of another protocol, with its PID.
+    AnotherProtocol,
+    /// As a daemon of this protocol but another version.
+    AnotherVersion,
+    /// With a line that is no message.
+    Garbage,
+    /// Not at all: it never accepts the connection.
+    Nothing,
+}
+
+/// Answers a client's hello as `speaks` says, for a daemon `pid`.
+fn answer_hello(stream: UnixStream, speaks: Speaks, pid: u32) {
+    let mut hello = String::new();
+    let mut reader = BufReader::new(&stream);
+    if reader.read_line(&mut hello).is_err() {
+        return;
+    }
+    let Ok(hello) = serde_json::from_str::<ClientMessage>(&hello) else {
+        return;
+    };
+    let welcome = |protocol| ServerMessage::Response {
+        id: hello.id,
+        response: Response::Welcome {
+            protocol,
+            daemon_version: "9.9.9".into(),
+            pid,
+        },
+    };
+    let mut line = match speaks {
+        Speaks::AnotherProtocol => serde_json::to_vec(&welcome(PROTOCOL_VERSION + 1)).unwrap(),
+        Speaks::AnotherVersion => serde_json::to_vec(&welcome(PROTOCOL_VERSION)).unwrap(),
+        Speaks::Garbage | Speaks::Nothing => b"{\"type\":\"welcome\"}".to_vec(),
+    };
+    line.push(b'\n');
+    let _ = (&stream).write_all(&line);
+}
+
+/// A process standing in for a daemon `daemon stop` cannot talk to. When
+/// the test ends, its PID file and socket go first, so that no later
+/// `daemon stop` kills that PID once it is free or waits for the socket to
+/// go, and then the process is killed.
+struct StandIn {
+    pid_file: PathBuf,
+    socket: PathBuf,
+    process: Children,
+    /// Bound for one that never accepts.
+    _listener: Option<UnixListener>,
+}
+
+impl Drop for StandIn {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.pid_file);
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+/// The test answers on the socket as `speaks` says; the PID is a shell's
+/// that, like a daemon, removes the socket and the PID file when terminated.
+/// With `pid_file`, the PID is written to `daemon.pid`.
+async fn stand_in(home: &Home, speaks: Speaks, pid_file: bool) -> StandIn {
+    std::fs::create_dir_all(home.data_dir()).unwrap();
+    let listener = UnixListener::bind(home.socket()).unwrap();
+    let ready = home.path().join("ready");
+    let script = r#"trap 'rm -f "$0" "$1"; exit 0' TERM; : > "$2"; while :; do sleep 0.05; done"#;
+    let shell = Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .args([home.socket(), home.pid_file(), ready.clone()])
+        .spawn()
+        .unwrap();
+    let pid = shell.id();
+    if pid_file {
+        std::fs::write(home.pid_file(), format!("{pid}\n")).unwrap();
+    }
+    let listener = match speaks {
+        Speaks::Nothing => Some(listener),
+        _ => {
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    answer_hello(stream, speaks, pid);
+                }
+            });
+            None
+        }
+    };
+    wait_until("trap set", || ready.exists()).await;
+    StandIn {
+        pid_file: home.pid_file(),
+        socket: home.socket(),
+        process: Children(vec![shell]),
+        _listener: listener,
+    }
+}
+
+/// `daemon stop` stops a daemon it cannot talk to by its PID, and returns
+/// once it is gone.
+async fn stop_stand_in(home: &Home, stand_in: &mut StandIn) {
+    let output = home.run(&["daemon", "stop"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "daemon stopped\n");
+    assert!(stand_in.process.exit_status(0).await.success());
+    assert!(gone(home));
+}
+
+/// A daemon of another protocol is stopped by the PID in its welcome, also
+/// without `daemon.pid`.
+#[tokio::test]
+async fn stops_a_daemon_of_another_version_by_its_pid() {
+    let home = Home::new();
+    let mut stand_in = stand_in(&home, Speaks::AnotherProtocol, false).await;
+    stop_stand_in(&home, &mut stand_in).await;
+}
+
+/// A welcome that cannot be read comes from a daemon of another version,
+/// which is stopped by the PID in `daemon.pid`.
+#[tokio::test]
+async fn stops_a_daemon_that_answers_garbage_by_its_pid() {
+    let home = Home::new();
+    let mut stand_in = stand_in(&home, Speaks::Garbage, true).await;
+    stop_stand_in(&home, &mut stand_in).await;
+}
+
+/// A daemon that does not answer is given up after a few seconds, and
+/// stopped by the PID in `daemon.pid`.
+#[tokio::test]
+async fn stops_a_daemon_that_does_not_answer_by_its_pid() {
+    let home = Home::new();
+    let mut stand_in = stand_in(&home, Speaks::Nothing, true).await;
+    stop_stand_in(&home, &mut stand_in).await;
+}
+
+/// A daemon of another version that speaks this protocol is served, with
+/// a hint on stderr to restart it.
+#[tokio::test]
+async fn a_daemon_of_another_version_comes_with_a_hint() {
+    let home = Home::new();
+    let _stand_in = stand_in(&home, Speaks::AnotherVersion, false).await;
+    let output = home.run(&["daemon", "status"]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("daemon 9.9.9 running"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let hint = format!(
+        "kprtfwd: the daemon runs kprtfwd 9.9.9, this is {}; restart it with `kprtfwd daemon restart`\n",
+        kprtfwd_proto::VERSION
+    );
+    assert_eq!(stderr, hint);
+}
+
+/// A daemon that binds the socket and then fails, here because it cannot
+/// stop the daemon of the old directory, which does not answer, is reported
+/// as failed to start, not as a daemon of another version.
+#[tokio::test]
+async fn a_daemon_that_fails_after_binding_is_reported_as_failed() {
+    let home = Home::new();
+    database(&home.legacy_dir().join("kprtfwd.db"));
+    let _silent = UnixListener::bind(home.legacy_dir().join("daemon.sock")).unwrap();
+
+    let output = home.run(&["status"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    assert!(stderr.contains("exited right after starting"), "{stderr}");
+    assert!(stderr.contains("log: "), "{stderr}");
+    assert!(daemon_log(&home).contains("does not answer"));
+    assert!(gone(&home));
+}
+
+/// Input that is no request is answered with an error, and the connection
+/// stays: closing a TUI's connection would switch the forwards off.
+#[tokio::test]
+async fn bad_input_is_answered_and_keeps_the_connection() {
+    let home = Home::new();
+    database(&home.db());
+    home.start_daemon();
+    let stream = UnixStream::connect(home.socket()).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut ask = |line: &[u8]| -> ServerMessage {
+        (&stream).write_all(line).unwrap();
+        (&stream).write_all(b"\n").unwrap();
+        let mut answer = String::new();
+        reader.read_line(&mut answer).unwrap();
+        serde_json::from_str(&answer).unwrap()
+    };
+    let hello = format!(
+        r#"{{"id":1,"request":{{"type":"hello","protocol":{PROTOCOL_VERSION},"client_version":"test"}}}}"#
+    );
+    assert!(matches!(
+        ask(hello.as_bytes()),
+        ServerMessage::Response { id: 1, .. }
+    ));
+    let attached = ask(br#"{"id":2,"request":{"type":"attach"}}"#);
+    assert!(matches!(attached, ServerMessage::Response { id: 2, .. }));
+
+    let refused = |answer: ServerMessage| match answer {
+        ServerMessage::Error { id, message } => (id, message),
+        other => panic!("{other:?}"),
+    };
+    let (id, message) = refused(ask(b"garbage"));
+    assert_eq!(id, 0);
+    assert!(message.starts_with("cannot read the request"), "{message}");
+    let (id, message) = refused(ask(br#"{"id":3,"request":{"type":"fly"}}"#));
+    assert_eq!(id, 3);
+    assert!(message.contains("unknown variant `fly`"), "{message}");
+    let (id, message) = refused(ask(&vec![b'x'; MAX_FRAME + 1]));
+    assert_eq!(id, 0);
+    assert!(
+        message.ends_with(&format!("longer than {MAX_FRAME} bytes")),
+        "{message}"
+    );
+
+    let snapshot = ask(br#"{"id":4,"request":{"type":"snapshot"}}"#);
+    assert!(matches!(snapshot, ServerMessage::Response { id: 4, .. }));
+    assert!(enabled(&home.db()), "the TUI counted as gone");
+    // Now the TUI quits.
+    stream.shutdown(std::net::Shutdown::Both).unwrap();
+    wait_until("stopped", || gone(&home)).await;
+    assert!(!enabled(&home.db()));
+}
+
+/// An error before the daemon's log is open goes to `logs/daemon.stderr`,
+/// which the client names. Here the log file cannot be created: the log
+/// directory is read-only, but `daemon.stderr` exists and is writable.
+#[tokio::test]
+async fn an_error_before_the_log_is_open_is_kept() {
+    let home = Home::new();
+    let logs = home.data_dir().join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let stderr_file = logs.join("daemon.stderr");
+    std::fs::write(&stderr_file, "").unwrap();
+    std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let output = home.run(&["status"]);
+    std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("exited right after starting"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("log: {}", logs.display())),
+        "{stderr}"
+    );
+    let kept = std::fs::read_to_string(&stderr_file).unwrap();
+    assert!(
+        kept.starts_with("kprtfwd daemon: open log directory"),
+        "{kept}"
+    );
+}
+
+/// The daemon narrows a data directory others can reach to 0700, and its
+/// socket is 0600.
+#[tokio::test]
+async fn the_data_directory_and_socket_are_the_users_only() {
+    let home = Home::new();
+    std::fs::create_dir_all(home.data_dir()).unwrap();
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    std::fs::set_permissions(home.data_dir(), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    home.start_daemon();
+    assert_eq!(mode(&home.data_dir()), 0o700);
+    assert_eq!(mode(&home.socket()), 0o600);
+    assert!(daemon_log(&home).contains("data directory narrowed to 700"));
+    Client::connect(&home.socket())
+        .await
+        .expect("serves its user");
+}
+
+/// The working directory of the process `pid`, a daemon of this test.
+fn cwd_of(pid: u32) -> PathBuf {
+    if cfg!(target_os = "linux") {
+        return std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap();
+    }
+    let lsof = Command::new("lsof")
+        .args(["-a", "-d", "cwd", "-Fn", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&lsof.stdout);
+    let name = text.lines().find_map(|line| line.strip_prefix('n'));
+    PathBuf::from(name.unwrap_or_else(|| panic!("{lsof:?}")))
+}
+
+/// A daemon started on demand runs in a session of its own, so it has no
+/// terminal (one that shares the terminal is stopped as soon as an exec
+/// plugin reads from it), and in the data directory, so it keeps no other
+/// busy. Relative entries of `KUBECONFIG` still name the files they named
+/// for the client.
+#[tokio::test]
+async fn a_daemon_started_on_demand_is_detached() {
+    let mut home = Home::new();
+    home.set_kubeconfig("apiVersion: v1\nkind: Config\n");
+    home.set_kubeconfig_files(&[PathBuf::from("kubeconfig")]);
+
+    let output = home
+        .command(&["status"])
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    let kubeconfig = home.kubeconfig_file().display().to_string();
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        out.ends_with(&format!("\nkubeconfig: {kubeconfig}\n")),
+        "{output:?}"
+    );
+
+    let pid = Client::connect(&home.socket()).await.unwrap().daemon_pid;
+    let raw = i32::try_from(pid).unwrap();
+    let session = rustix::process::getsid(rustix::process::Pid::from_raw(raw)).unwrap();
+    assert_eq!(session.as_raw_nonzero().get(), raw, "no session of its own");
+    let data_dir = home.data_dir().canonicalize().unwrap();
+    assert_eq!(cwd_of(pid).canonicalize().unwrap(), data_dir);
+}
+
+/// A relative `KPRTFWD_HOME` names the same directory for the daemon, which
+/// runs elsewhere, as for the client.
+#[tokio::test]
+async fn a_relative_kprtfwd_home_stays_where_it_was() {
+    let home = Home::new();
+    let run = |args: &[&str]| {
+        home.command(args)
+            .env("KPRTFWD_HOME", "kh")
+            .env(IDLE_EXIT, "5000")
+            .current_dir(home.path())
+            .output()
+            .unwrap()
+    };
+    let output = run(&["status"]);
+    assert!(output.status.success(), "{output:?}");
+    let data_dir = home.path().join("kh");
+    assert!(data_dir.join("daemon.sock").exists());
+    assert!(!data_dir.join("kh").exists());
+    let output = run(&["daemon", "stop"]);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "daemon stopped\n");
+}
+
+/// The client checks the socket path the daemon will bind: for a relative
+/// `KPRTFWD_HOME` in a deep directory the absolute one is too long, so no
+/// daemon is started that could only fail.
+#[test]
+fn a_relative_kprtfwd_home_is_checked_as_absolute() {
+    let home = Home::new();
+    let deep = home.path().join("d".repeat(100));
+    std::fs::create_dir(&deep).unwrap();
+    let output = home
+        .command(&["status"])
+        .env("KPRTFWD_HOME", "kh")
+        .env(IDLE_EXIT, "2000")
+        .current_dir(&deep)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let socket = deep.join("kh/daemon.sock");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("the socket path {} is too long", socket.display())),
+        "{stderr}"
+    );
+    assert!(!deep.join("kh").exists(), "a daemon was started");
+}
+
+/// Shortens the daemon's idle exit, in milliseconds.
+const IDLE_EXIT: &str = "KPRTFWD_IDLE_EXIT_MS";
+
+fn start_daemon_idle_after(home: &Home, milliseconds: &str) {
+    let output = home
+        .command(&["daemon", "restart"])
+        .env(IDLE_EXIT, milliseconds)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
+fn gone(home: &Home) -> bool {
+    !home.socket().exists() && !home.pid_file().exists()
+}
+
+/// Whether the process `pid`, a daemon of this test, still runs.
+fn alive(pid: u32) -> bool {
+    let probe = Command::new("kill").args(["-0", &pid.to_string()]).output();
+    probe.unwrap().status.success()
+}
+
+/// Without enabled forwards and clients the daemon exits after a while,
+/// here 400 ms, and removes its socket and PID file.
+#[tokio::test]
+async fn an_idle_daemon_exits_once_no_client_is_connected() {
+    let home = Home::new();
+    start_daemon_idle_after(&home, "400");
+    let client = Client::connect(&home.socket()).await.expect("connect");
+
+    // Several idle times: a connected client keeps it.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(home.socket().exists(), "exited with a client connected");
+
+    drop(client);
+    wait_until("exited", || gone(&home)).await;
+    assert!(daemon_log(&home).contains("nothing to do, exiting"));
+}
+
+/// A store that cannot be read makes the idle check count the daemon as
+/// busy; the read failing must not end a daemon that may run forwards.
+#[tokio::test]
+async fn a_failed_read_does_not_end_an_idle_daemon() {
+    let home = Home::new();
+    write_database(&home.db(), &[forward("test", "shop", "api", false)], false);
+    start_daemon_idle_after(&home, "400");
+    // Busy while the table goes away, so the idle time starts afterwards.
+    let client = Client::connect(&home.socket()).await.expect("connect");
+    let sql = rusqlite::Connection::open(home.db()).unwrap();
+    sql.execute_batch("ALTER TABLE port_forwards RENAME TO moved")
+        .unwrap();
+    drop(client);
+
+    // Eight checks, 200 ms more than the idle time.
+    let failed = || {
+        daemon_log(&home)
+            .matches("cannot read the forwards")
+            .count()
+    };
+    wait_until("failed reads", || failed() >= 8).await;
+    assert!(!gone(&home), "a failed read ended the daemon");
+
+    sql.execute_batch("ALTER TABLE moved RENAME TO port_forwards")
+        .unwrap();
+    wait_until("exited", || gone(&home)).await;
+}
+
+/// SIGTERM and `daemon stop` end the daemon without switching the forwards
+/// off, and it removes its socket and PID file.
+#[tokio::test]
+async fn sigterm_and_daemon_stop_clean_up() {
+    let home = Home::new();
+    database(&home.db());
+    home.start_daemon();
+    let pid = Client::connect(&home.socket()).await.unwrap().daemon_pid;
+    let written = std::fs::read_to_string(home.pid_file()).unwrap();
+    assert_eq!(written.trim(), pid.to_string());
+
+    let kill = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status();
+    assert!(kill.unwrap().success());
+    wait_until("terminated", || gone(&home)).await;
+    wait_until("exited", || !alive(pid)).await;
+    assert!(daemon_log(&home).contains("terminated"));
+    assert!(enabled(&home.db()), "SIGTERM switched the forwards off");
+
+    home.start_daemon();
+    let output = home.run(&["daemon", "stop"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "daemon stopped\n");
+    // `daemon stop` returns once the daemon released its lock.
+    assert!(gone(&home), "daemon stop returned early");
+    assert!(enabled(&home.db()), "daemon stop switched the forwards off");
+}
+
+const VERSION: &str = r#"{"major":"1","minor":"33","gitVersion":"v1.33.0","gitCommit":"","gitTreeState":"","buildDate":"","goVersion":"","compiler":"","platform":""}"#;
+
+/// An API server that answers `GET /version` only.
+fn version_api() -> u16 {
+    fake_api(|path| {
+        if path == "/version" {
+            ("200 OK", VERSION)
+        } else {
+            NOT_FOUND
+        }
+    })
+}
+
+/// An exec plugin that appends a line to `$RUNS` for every login.
+fn plugin(dir: &Path) -> std::path::PathBuf {
+    let path = dir.join("plugin");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+echo login >> "$RUNS"
+echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"good","expirationTimestamp":"2999-01-01T00:00:00Z"}}'
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// Contexts `test` and `other` on the API server at `port`, both with a user
+/// that logs in through `plugin` and has env entries; `extra` goes into the
+/// context `test`.
+fn exec_kubeconfig(home: &Home, plugin: &Path, port: u16, current: &str, extra: &str) -> String {
+    format!(
+        r#"apiVersion: v1
+kind: Config
+current-context: {current}
+clusters:
+- name: test
+  cluster:
+    server: http://127.0.0.1:{port}
+users:
+- name: test
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1
+      command: {plugin}
+      env:
+      - name: RUNS
+        value: {runs}
+      - name: PROFILE
+        value: shop
+      - name: REGION
+        value: eu
+contexts:
+- name: test
+  context:
+    cluster: test
+    user: test{extra}
+- name: other
+  context:
+    cluster: test
+    user: test
+"#,
+        plugin = plugin.display(),
+        runs = home.path().join("runs").display(),
+    )
+}
+
+/// All of the daemon's log files.
+fn daemon_log(home: &Home) -> String {
+    let mut files: Vec<_> = std::fs::read_dir(home.data_dir().join("logs"))
+        .map(|dir| {
+            dir.filter_map(|entry| entry.ok().map(|e| e.path()))
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+        .iter()
+        .filter_map(|file| std::fs::read_to_string(file).ok())
+        .collect()
+}
+
+#[tokio::test]
+async fn only_new_client_settings_reconnect_a_context() {
+    let mut home = Home::new();
+    let plugin = plugin(home.path());
+    let first = version_api();
+    home.set_kubeconfig(&exec_kubeconfig(&home, &plugin, first, "test", ""));
+    write_database(&home.db(), &[forward("test", "shop", "api", true)], false);
+    let output = home
+        .command(&["daemon", "restart"])
+        .env("KPRTFWD_LOG", "info,kprtfwd_engine::kubeconfig=debug")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let logins = || {
+        std::fs::read_to_string(home.path().join("runs"))
+            .map(|runs| runs.lines().count())
+            .unwrap_or(0)
+    };
+    let count = |text: &str| daemon_log(&home).matches(text).count();
+    wait_until("watching", || count("watching kubeconfig") == 1).await;
+    wait_until("logged in", || logins() == 1).await;
+
+    // `kubectl config use-context`, `kubens` and a rewrite of the user with
+    // its env entries: the same client, so no reconnect and no login.
+    let file = home.kubeconfig_file();
+    let kubens = "\n    namespace: web";
+    let same = exec_kubeconfig(&home, &plugin, first, "other", kubens);
+    std::fs::write(&file, same).unwrap();
+    wait_until("read", || count("kubeconfig read") == 1).await;
+
+    // A moved cluster reconnects the context, which logs in again.
+    let second = version_api();
+    let moved = exec_kubeconfig(&home, &plugin, second, "other", kubens);
+    std::fs::write(&file, moved).unwrap();
+    wait_until("read again", || count("kubeconfig read") == 2).await;
+    wait_until("logged in again", || logins() >= 2).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(count("kubeconfig changed, reconnecting"), 1);
+    assert_eq!(logins(), 2);
+}
+
+/// While the exec plugin waits for the user, `status` shows the context and
+/// its forward logging in; once the plugin is done, the context is ok.
+#[tokio::test]
+async fn status_shows_a_login_that_waits() {
+    let mut home = Home::new();
+    let plugin = home.path().join("plugin");
+    std::fs::write(
+        &plugin,
+        r#"#!/bin/sh
+echo login >> "$RUNS"
+while [ ! -e "$0.gate" ]; do sleep 0.02; done
+echo '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"good","expirationTimestamp":"2999-01-01T00:00:00Z"}}'
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    home.set_kubeconfig(&exec_kubeconfig(&home, &plugin, version_api(), "test", ""));
+    write_database(&home.db(), &[forward("test", "shop", "api", true)], false);
+    home.start_daemon();
+
+    let status = || String::from_utf8_lossy(&home.run(&["status"]).stdout).into_owned();
+    wait_until("logging in", || status().starts_with("test logging in")).await;
+    let rows = status();
+    let row = rows.lines().find(|line| line.contains("shop/api:80"));
+    assert!(
+        row.is_some_and(|row| row.starts_with("waiting") && row.ends_with("logging in")),
+        "{rows}"
+    );
+
+    std::fs::write(plugin.with_extension("gate"), "").unwrap();
+    wait_until("logged in", || status().starts_with("test ok")).await;
+}
+
+/// One service, shop/api with port 80, across the cluster.
+const SERVICES: &str = r#"{"kind":"ServiceList","apiVersion":"v1","metadata":{"resourceVersion":"1"},"items":[{"metadata":{"name":"api","namespace":"shop"},"spec":{"ports":[{"name":"http","port":80,"protocol":"TCP"}]}}]}"#;
+
+/// Discovery proposes 10000 + 80 for the service's port 80 unless that is in
+/// use, also when only ::1 is: `localhost` may resolve to ::1 first.
+#[tokio::test]
+async fn discovery_does_not_propose_a_port_in_use_on_ipv6() {
+    let Ok(holder) = std::net::TcpListener::bind("[::1]:10080") else {
+        return; // no IPv6 here, or the port is taken anyway
+    };
+    let mut home = Home::new();
+    let api = fake_api(|path| {
+        if path.starts_with("/api/v1/services") {
+            ("200 OK", SERVICES)
+        } else {
+            NOT_FOUND
+        }
+    });
+    home.set_kubeconfig(&format!(
+        r#"apiVersion: v1
+kind: Config
+clusters:
+- name: test
+  cluster:
+    server: http://127.0.0.1:{api}
+users:
+- name: test
+  user: {{}}
+contexts:
+- name: test
+  context:
+    cluster: test
+    user: test
+"#
+    ));
+    home.start_daemon();
+
+    let mut client = Client::connect(&home.socket()).await.expect("connect");
+    let discover = Request::Discover {
+        context: "test".into(),
+        namespace_filter: String::new(),
+    };
+    let Response::Discovered { ports, .. } = client.request(discover.clone()).await.unwrap() else {
+        panic!("no discovery answer");
+    };
+    assert_eq!(ports.len(), 1, "{ports:?}");
+    assert_ne!(ports[0].local_port, 10080, "{ports:?}");
+    assert_ne!(ports[0].local_port, 0, "{ports:?}");
+
+    // Once free, it is proposed. A process this test process started just
+    // as it bound the port may have inherited the socket and keep it.
+    drop(holder);
+    let free = |address: &str| std::net::TcpListener::bind(address).is_ok();
+    if free("127.0.0.1:10080") && free("[::1]:10080") {
+        let Response::Discovered { ports, .. } = client.request(discover).await.unwrap() else {
+            panic!("no discovery answer");
+        };
+        assert_eq!(ports[0].local_port, 10080, "{ports:?}");
+    }
+}
+
+/// A macOS terminal starts with a soft limit of 256 open files, which a few
+/// dozen forwards with their connections reach; the daemon raises its own.
+#[tokio::test]
+async fn the_daemon_raises_its_limit_of_open_files() {
+    let home = Home::new();
+    let output = home
+        .command_after("ulimit -Sn 256", &["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let raised = || {
+        daemon_log(&home)
+            .lines()
+            .find(|line| line.contains("open files limit raised"))
+            .map(str::to_owned)
+    };
+    wait_until("raised", || raised().is_some()).await;
+    let line = raised().unwrap();
+    assert!(line.contains("from=256"), "{line}");
+    assert!(!line.contains("to=256"), "{line}");
+}
+
+/// The messages of the events of forward `id`, without its context's.
+async fn own_events(client: &mut Client, id: &ForwardId) -> Vec<String> {
+    let request = Request::Events {
+        ids: vec![id.clone()],
+    };
+    let Response::Events { entries } = client.request(request).await.unwrap() else {
+        panic!("no events answer");
+    };
+    entries
+        .into_iter()
+        .filter(|entry| entry.source == id.as_str())
+        .map(|entry| entry.message)
+        .collect()
+}
+
+/// A forward deleted and added again, as discovery gives the same service
+/// the same ID, starts without the deleted one's events.
+#[tokio::test]
+async fn a_forward_added_again_starts_without_old_events() {
+    let home = Home::new();
+    let api = forward("test", "shop", "api", true);
+    write_database(&home.db(), std::slice::from_ref(&api), false);
+    home.start_daemon();
+    let mut client = Client::connect(&home.socket()).await.expect("connect");
+    let started = std::time::Instant::now();
+    while !own_events(&mut client, &api.id)
+        .await
+        .contains(&"started".to_owned())
+    {
+        assert!(started.elapsed() < Duration::from_secs(10), "not started");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let id = api.id.clone();
+    client.act(Request::DeleteForward { id }).await.unwrap();
+    let again = Forward {
+        enabled: false,
+        ..api.clone()
+    };
+    client
+        .act(Request::AddForwards {
+            forwards: vec![again],
+        })
+        .await
+        .unwrap();
+    assert_eq!(own_events(&mut client, &api.id).await, Vec::<String>::new());
+}
+
+/// A TUI edits a forward while the CLI switches it on: the edit keeps the
+/// switch. Both add the same service: the second add fails instead of
+/// replacing the first.
+#[tokio::test]
+async fn an_edit_keeps_a_switch_and_an_add_replaces_nothing() {
+    let home = Home::new();
+    let api = forward("test", "shop", "api", false);
+    write_database(&home.db(), std::slice::from_ref(&api), false);
+    home.start_daemon();
+    let mut tui = Client::connect(&home.socket()).await.expect("connect");
+    let mut cli = Client::connect(&home.socket()).await.expect("connect");
+
+    // The form opens with the forward off; then the CLI switches it on.
+    let mut settings = tui.snapshot().await.unwrap().forwards[0].forward.settings();
+    let ids = vec![api.id.clone()];
+    cli.act(Request::SetEnabled { ids, enabled: true })
+        .await
+        .unwrap();
+    settings.local_port = forward("test", "shop", "api", false).local_port;
+    let edit = Request::EditForward {
+        id: api.id.clone(),
+        settings: settings.clone(),
+    };
+    let Response::Saved { id } = tui.request(edit).await.unwrap() else {
+        panic!("no saved answer");
+    };
+    assert_eq!(id, api.id);
+    let snapshot = cli.snapshot().await.unwrap();
+    let [saved] = snapshot.forwards.as_slice() else {
+        panic!("{:?}", snapshot.forwards);
+    };
+    assert!(saved.forward.enabled, "the CLI's switch stays");
+    assert_eq!(saved.forward.settings(), settings);
+
+    let web = forward("test", "shop", "web", false);
+    let add = |forward: &Forward| Request::AddForwards {
+        forwards: vec![forward.clone()],
+    };
+    tui.act(add(&web)).await.unwrap();
+    let same = forward("test", "shop", "web", false);
+    let Err(ClientError::Daemon(message)) = cli.act(add(&same)).await else {
+        panic!("the second add of {} went through", same.id);
+    };
+    assert_eq!(message, "forward test.shop.web-80 already exists");
+    let snapshot = cli.snapshot().await.unwrap();
+    let stored: Vec<&Forward> = snapshot.forwards.iter().map(|v| &v.forward).collect();
+    assert_eq!(stored, [&saved.forward, &web]);
+}
+
+/// An edit that moves a running forward to another namespace gives it the
+/// ID a new forward there would get; it stays on, in its project, and its
+/// events go on under the new ID.
+#[tokio::test]
+async fn an_edit_of_the_target_moves_the_id_with_projects_and_events() {
+    let home = Home::new();
+    let api = forward("test", "shop", "api", true);
+    write_database(&home.db(), std::slice::from_ref(&api), false);
+    home.start_daemon();
+    let mut client = Client::connect(&home.socket()).await.expect("connect");
+    let project = Project {
+        name: "shop".into(),
+        forwards: vec![api.id.clone()],
+    };
+    client
+        .act(Request::UpsertProject { project })
+        .await
+        .unwrap();
+    let starts_and_stops = async |client: &mut Client, id: &ForwardId| -> Vec<String> {
+        let mut events = own_events(client, id).await;
+        events.retain(|message| message == "started" || message == "stopped");
+        events
+    };
+    let started = std::time::Instant::now();
+    while starts_and_stops(&mut client, &api.id).await.is_empty() {
+        assert!(started.elapsed() < Duration::from_secs(10), "not started");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let mut settings = api.settings();
+    settings.namespace = "web".into();
+    let edit = Request::EditForward {
+        id: api.id.clone(),
+        settings,
+    };
+    let Response::Saved { id } = client.request(edit).await.unwrap() else {
+        panic!("no saved answer");
+    };
+    assert_eq!(id.as_str(), "test.web.api-80");
+    let snapshot = client.snapshot().await.unwrap();
+    let ids: Vec<&ForwardId> = snapshot.forwards.iter().map(|v| &v.forward.id).collect();
+    assert_eq!(ids, [&id]);
+    assert!(snapshot.forwards[0].forward.enabled);
+    assert_eq!(snapshot.projects[0].forwards, std::slice::from_ref(&id));
+    assert_eq!(
+        starts_and_stops(&mut client, &id).await,
+        ["started", "stopped", "started"]
+    );
+    let old = Request::Events {
+        ids: vec![api.id.clone()],
+    };
+    let Err(ClientError::Daemon(message)) = client.request(old).await else {
+        panic!("the old ID still has events");
+    };
+    assert_eq!(message, "unknown forward test.shop.api-80");
+}
