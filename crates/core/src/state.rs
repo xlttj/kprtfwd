@@ -122,7 +122,9 @@ impl ForwardState {
     }
 
     /// The INFO column: why the forward is not ready; empty if it is.
-    pub fn info(&self, context: &ContextState) -> String {
+    /// `reconnect` says how the user reconnects the forward's context in the
+    /// frontend that shows the text, such as `reconnect (r)` in the TUI.
+    pub fn info(&self, context: &ContextState, reconnect: &str) -> String {
         match self {
             Self::Disabled | Self::Paused | Self::Ready { .. } => String::new(),
             Self::Starting => "starting".into(),
@@ -135,7 +137,7 @@ impl ForwardState {
                     format!("API unreachable ({})", cause.short())
                 }
                 ContextState::LoggingIn => "logging in".into(),
-                ContextState::AuthFailed { .. } => "login needed: reconnect (r) to log in".into(),
+                ContextState::AuthFailed { .. } => format!("login needed: {reconnect} to log in"),
                 ContextState::ConfigError { message } => format!("kubeconfig: {message}"),
                 ContextState::Idle | ContextState::Connecting => "connecting".into(),
                 ContextState::Healthy { .. } => String::new(),
@@ -352,7 +354,7 @@ mod tests {
             cause: NetCause::Dns,
         };
         assert_eq!(
-            ForwardState::WaitingForContext.info(&unreachable),
+            ForwardState::WaitingForContext.info(&unreachable, "reconnect (r)"),
             "API unreachable (DNS)"
         );
         let auth = ContextState::AuthFailed {
@@ -360,27 +362,31 @@ mod tests {
             message: "exec plugin failed".into(),
         };
         assert_eq!(
-            ForwardState::WaitingForContext.info(&auth),
+            ForwardState::WaitingForContext.info(&auth, "reconnect (r)"),
             "login needed: reconnect (r) to log in"
         );
         assert_eq!(
-            ForwardState::WaitingForContext.info(&ContextState::Connecting),
+            ForwardState::WaitingForContext.info(&auth, "kprtfwd reconnect staging"),
+            "login needed: kprtfwd reconnect staging to log in"
+        );
+        assert_eq!(
+            ForwardState::WaitingForContext.info(&ContextState::Connecting, ""),
             "connecting"
         );
         assert_eq!(
-            ForwardState::WaitingForContext.info(&ContextState::LoggingIn),
+            ForwardState::WaitingForContext.info(&ContextState::LoggingIn, ""),
             "logging in"
         );
         assert_eq!(ContextState::LoggingIn.summary(), "logging in");
         assert_eq!(
-            ForwardState::WaitingForPods { ready: 0, total: 2 }.info(&healthy()),
+            ForwardState::WaitingForPods { ready: 0, total: 2 }.info(&healthy(), ""),
             "0/2 pods ready"
         );
         assert_eq!(
             ForwardState::PortBusy {
                 holder: Some("mysqld (pid 812)".into())
             }
-            .info(&healthy()),
+            .info(&healthy(), ""),
             "port busy: mysqld (pid 812)"
         );
         assert_eq!(unreachable.summary(), "unreachable (DNS)");

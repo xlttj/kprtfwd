@@ -936,7 +936,7 @@ These are shown in the INFO column and by `kprtfwd status`.
 | DNS lookup of the API host fails | `API unreachable (DNS)`; header: `staging unreachable (DNS, VPN?)` |
 | refused or timed out | `API unreachable (timeout)` |
 | exec plugin logging in, no accepted token yet | `logging in` |
-| login failed or rejected (401) | `login needed: reconnect (r) to log in` |
+| login failed or rejected (401) | TUI: `login needed: reconnect (r) to log in`; `kprtfwd status`: `login needed: kprtfwd reconnect staging to log in` |
 | 403 on watch or port-forward | `forbidden: port-forward in namespace X` |
 | `EADDRINUSE` | `port busy: mysqld (pid 812)` |
 | service gone | `service not found (prune?)` |

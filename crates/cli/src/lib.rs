@@ -752,8 +752,9 @@ fn print_forwards(snapshot: &Snapshot, views: &[&ForwardView]) {
 }
 
 /// Why a forward is not ready, or its last error if that is recent.
-fn info(view: &ForwardView, context: &kprtfwd_core::ContextState) -> String {
-    let text = view.state.info(context);
+fn info(view: &ForwardView, context: &ContextState) -> String {
+    let reconnect = format!("kprtfwd reconnect {}", view.forward.context);
+    let text = view.state.info(context, &reconnect);
     if !text.is_empty() {
         return text;
     }
@@ -1025,6 +1026,21 @@ mod tests {
     }
   ]
 }"#
+        );
+    }
+
+    /// The CLI has no keys: a needed login points at the command.
+    #[test]
+    fn a_needed_login_points_at_kprtfwd_reconnect() {
+        let mut waiting = view("stg-api", "staging", "api");
+        waiting.state = ForwardState::WaitingForContext;
+        let auth = ContextState::AuthFailed {
+            since: SystemTime::UNIX_EPOCH,
+            message: "token expired".into(),
+        };
+        assert_eq!(
+            info(&waiting, &auth),
+            "login needed: kprtfwd reconnect staging to log in"
         );
     }
 

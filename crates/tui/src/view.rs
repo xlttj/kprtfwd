@@ -320,7 +320,7 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Why a forward is not ready, or its last error if that is recent.
 fn info(view: &kprtfwd_proto::ForwardView, context: &ContextState) -> String {
-    let text = view.state.info(context);
+    let text = view.state.info(context, "reconnect (r)");
     if !text.is_empty() {
         return text;
     }
@@ -755,6 +755,26 @@ mod tests {
         let waiting = screen.iter().find(|line| line.contains("waiting")).unwrap();
         assert!(waiting.contains("API unreachable (DNS)"), "{waiting}");
         assert!(screen[7].contains("space on/off"), "{}", screen[7]);
+    }
+
+    /// The TUI's way to log in again is its key.
+    #[test]
+    fn a_needed_login_points_at_r() {
+        let mut snap = snapshot();
+        snap.contexts = vec![ContextView {
+            name: "staging".into(),
+            state: ContextState::AuthFailed {
+                since: SystemTime::UNIX_EPOCH,
+                message: "token expired".into(),
+            },
+        }];
+        snap.forwards[2].state = ForwardState::WaitingForContext;
+        let screen = render(&App::new(snap), 100, 8);
+        let waiting = screen.iter().find(|line| line.contains("waiting")).unwrap();
+        assert!(
+            waiting.ends_with("login needed: reconnect (r) to log in"),
+            "{waiting}"
+        );
     }
 
     #[test]
