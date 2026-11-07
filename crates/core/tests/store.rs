@@ -647,6 +647,131 @@ fn an_edit_keeps_the_stored_flag() {
     ));
 }
 
+/// The ID says what a forward reaches (the filter matches it too), so an
+/// edit of the target gives it a new ID; flag and projects stay with it.
+#[test]
+fn an_edit_of_the_target_gives_a_fitting_id_and_keeps_projects() {
+    let mut store = Store::in_memory().unwrap();
+    let api = forward("staging.shop.api-80", "staging", "shop", "api", (80, 18091));
+    let web = forward("staging.shop.web-80", "staging", "shop", "web", (80, 18092));
+    store.add_forwards(&[api.clone(), web.clone()]).unwrap();
+    let shop = |members: &[&str]| Project {
+        name: "shop".into(),
+        forwards: members.iter().copied().map(id).collect(),
+    };
+    store
+        .upsert_project(&shop(&["staging.shop.api-80", "staging.shop.web-80"]))
+        .unwrap();
+    store
+        .set_enabled(std::slice::from_ref(&api.id), true)
+        .unwrap();
+
+    let moved = kprtfwd_core::ForwardSettings {
+        namespace: "web".into(),
+        ..api.settings()
+    };
+    let saved = store.edit_forward(&api.id, &moved).unwrap();
+    assert_eq!(saved, id("staging.web.api-80"));
+    assert_eq!(store.forward(&api.id).unwrap(), None);
+    let stored = store.forward(&saved).unwrap().unwrap();
+    assert_eq!(stored.settings(), moved);
+    assert!(stored.enabled);
+    assert_eq!(
+        store.projects().unwrap(),
+        [shop(&["staging.shop.web-80", "staging.web.api-80"])]
+    );
+
+    // Only the local port: the ID stays.
+    let port = kprtfwd_core::ForwardSettings {
+        local_port: 18099,
+        ..moved.clone()
+    };
+    assert_eq!(store.edit_forward(&saved, &port).unwrap(), saved);
+
+    // Onto the target of another forward: the next free suffix. Back to
+    // its own: the old ID, which is free again.
+    let onto_web = kprtfwd_core::ForwardSettings {
+        namespace: "shop".into(),
+        service: "web".into(),
+        ..port.clone()
+    };
+    let doubled = store.edit_forward(&saved, &onto_web).unwrap();
+    assert_eq!(doubled, id("staging.shop.web-80-2"));
+    let back = store.edit_forward(&doubled, &api.settings()).unwrap();
+    assert_eq!(back, api.id);
+    assert_eq!(
+        store.projects().unwrap(),
+        [shop(&["staging.shop.api-80", "staging.shop.web-80"])]
+    );
+    assert_eq!(store.forwards().unwrap().len(), 2);
+}
+
+/// An edit whose target gives the same ID, here because `.` and `_`
+/// sanitize alike, keeps it instead of taking a suffix.
+#[test]
+fn an_edit_that_fits_the_old_id_keeps_it() {
+    let mut store = Store::in_memory().unwrap();
+    let api = forward("a-b.shop.api-80", "a.b", "shop", "api", (80, 18091));
+    store.add_forward(&api).unwrap();
+    let renamed_context = kprtfwd_core::ForwardSettings {
+        context: "a_b".into(),
+        ..api.settings()
+    };
+    assert_eq!(
+        store.edit_forward(&api.id, &renamed_context).unwrap(),
+        api.id
+    );
+    assert_eq!(store.forward(&api.id).unwrap().unwrap().context, "a_b");
+}
+
+/// v1 keeps working after v2 gave a forward a new ID: it reads the forward
+/// and the membership under the new ID. A member v1 wrote for a forward
+/// that is gone does not pull a forward added later under that ID into its
+/// project.
+#[test]
+fn v1_reads_an_edited_id_and_new_forwards_skip_its_stale_members() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = v1_database(dir.path());
+    let mut store = Store::open(&path).unwrap();
+    let mysql = store.forward(&id("staging.mysql.shop")).unwrap().unwrap();
+    let saved = store
+        .edit_forward(
+            &mysql.id,
+            &kprtfwd_core::ForwardSettings {
+                remote_port: 3307,
+                ..mysql.settings()
+            },
+        )
+        .unwrap();
+    assert_eq!(saved, id("staging.shop.mysql-3307"));
+    drop(store);
+
+    let mut v1 = v1_connection(&path);
+    let ids = v1_forward_ids(&v1);
+    assert!(ids.contains(&saved.to_string()), "{ids:?}");
+    assert!(!ids.contains(&mysql.id.to_string()), "{ids:?}");
+    let shop = v1_projects(&v1)
+        .into_iter()
+        .find(|(name, _)| name == "shop")
+        .unwrap();
+    assert!(shop.1.contains(&saved.to_string()), "{shop:?}");
+    assert!(!shop.1.contains(&mysql.id.to_string()), "{shop:?}");
+    // v1 saves a project from memory, with a member that is gone.
+    v1_create_project(&mut v1, "old", &["staging.shop.api-80"]);
+    drop(v1);
+
+    let mut store = Store::open(&path).unwrap();
+    let api = forward("staging.shop.api-80", "staging", "shop", "api", (80, 18091));
+    store.add_forward(&api).unwrap();
+    let old = store
+        .projects()
+        .unwrap()
+        .into_iter()
+        .find(|p| p.name == "old")
+        .unwrap();
+    assert!(old.forwards.is_empty(), "{old:?}");
+}
+
 #[test]
 fn set_enabled_changes_all_or_nothing() {
     let mut store = Store::in_memory().unwrap();

@@ -3,6 +3,7 @@
 //! The schema extends v1's (`~/.kprtfwd/kprtfwd.db`). Schema changes are
 //! additive, so the v1 binary keeps working on a migrated file.
 
+use std::collections::HashSet;
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -13,6 +14,7 @@ use rusqlite::backup::Progress;
 use rusqlite::{Connection, MAIN_DB, OpenFlags, OptionalExtension, Row, params};
 
 use crate::model::{Forward, ForwardId, ForwardSettings, Project};
+use crate::naming;
 use crate::validate::{self, ValidationError};
 
 /// How long a connection waits for another process's lock, such as v1 writing
@@ -180,15 +182,7 @@ impl Store {
     }
 
     pub fn forward(&self, id: &ForwardId) -> Result<Option<Forward>> {
-        self.conn
-            .query_row(
-                &format!("{SELECT_FORWARD} WHERE id = ?1"),
-                [id.as_str()],
-                ForwardRow::read,
-            )
-            .optional()?
-            .map(ForwardRow::into_forward)
-            .transpose()
+        read_forward(&self.conn, id)
     }
 
     /// Adds a new forward; see [`Store::add_forwards`].
@@ -211,30 +205,65 @@ impl Store {
     }
 
     /// Changes the settings of forward `id`. Its enabled flag stays as
-    /// stored, whatever a client read before. Returns the forward's ID.
+    /// stored, whatever a client read before. A changed context, namespace,
+    /// service or remote port gives it the ID a new forward with these
+    /// settings would get, counting its old ID as free, and its project
+    /// memberships follow. Returns the ID it is saved under.
     pub fn edit_forward(
         &mut self,
         id: &ForwardId,
         settings: &ForwardSettings,
     ) -> Result<ForwardId> {
         validate::validate_settings(settings)?;
-        let changed = self.conn.execute(
-            "UPDATE port_forwards
-             SET context = ?2, namespace = ?3, service = ?4, port_remote = ?5, port_local = ?6
-             WHERE id = ?1",
-            params![
-                id.as_str(),
-                settings.context,
-                settings.namespace,
-                settings.service,
+        let tx = self.conn.transaction()?;
+        let current =
+            read_forward(&tx, id)?.ok_or_else(|| StoreError::UnknownForward(id.clone()))?;
+        let same_target = current.context == settings.context
+            && current.namespace == settings.namespace
+            && current.service == settings.service
+            && current.remote_port == settings.remote_port;
+        let saved = if same_target {
+            id.clone()
+        } else {
+            let mut taken = forward_ids(&tx)?;
+            taken.remove(id);
+            naming::forward_id(
+                &settings.context,
+                &settings.namespace,
+                &settings.service,
                 settings.remote_port,
-                settings.local_port,
-            ],
-        )?;
-        if changed == 0 {
-            return Err(StoreError::UnknownForward(id.clone()));
+                &taken,
+            )
+        };
+        if saved == *id {
+            tx.execute(
+                "UPDATE port_forwards
+                 SET context = ?2, namespace = ?3, service = ?4, port_remote = ?5, port_local = ?6
+                 WHERE id = ?1",
+                params![
+                    id.as_str(),
+                    settings.context,
+                    settings.namespace,
+                    settings.service,
+                    settings.remote_port,
+                    settings.local_port,
+                ],
+            )?;
+        } else {
+            // Under foreign keys a referenced ID cannot change in place:
+            // the new row comes first, then the memberships move to it.
+            let renamed = settings
+                .clone()
+                .into_forward(saved.clone(), current.enabled);
+            insert_forward(&tx, &renamed)?;
+            tx.execute(
+                "UPDATE project_port_forwards SET port_forward_id = ?2 WHERE port_forward_id = ?1",
+                [id.as_str(), saved.as_str()],
+            )?;
+            tx.execute("DELETE FROM port_forwards WHERE id = ?1", [id.as_str()])?;
         }
-        Ok(id.clone())
+        tx.commit()?;
+        Ok(saved)
     }
 
     /// Deletes the forward and its project memberships. Returns whether it
@@ -372,6 +401,25 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+fn read_forward(conn: &Connection, id: &ForwardId) -> Result<Option<Forward>> {
+    conn.query_row(
+        &format!("{SELECT_FORWARD} WHERE id = ?1"),
+        [id.as_str()],
+        ForwardRow::read,
+    )
+    .optional()?
+    .map(ForwardRow::into_forward)
+    .transpose()
+}
+
+fn forward_ids(conn: &Connection) -> Result<HashSet<ForwardId>> {
+    let mut stmt = conn.prepare("SELECT id FROM port_forwards")?;
+    let ids = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(ids
+        .map(|id| id.map(ForwardId::new))
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 /// Inserts a forward whose ID must be free. Memberships v1 left for the ID,

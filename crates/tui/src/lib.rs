@@ -642,8 +642,8 @@ mod tests {
     use std::sync::{Arc, Mutex, MutexGuard};
     use std::time::SystemTime;
 
+    use kprtfwd_core::ForwardId;
     use kprtfwd_core::svctype::ServiceType;
-    use kprtfwd_core::{Forward, ForwardId};
     use kprtfwd_proto::{DiscoveredPort, EventEntry};
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyEvent, KeyEventState};
@@ -840,15 +840,8 @@ mod tests {
                     let saved = state.saved_as.clone().unwrap_or_else(|| id.clone());
                     for view in &mut state.snapshot.forwards {
                         if view.forward.id == id {
-                            view.forward = Forward {
-                                id: saved.clone(),
-                                enabled: view.forward.enabled,
-                                context: settings.context.clone(),
-                                namespace: settings.namespace.clone(),
-                                service: settings.service.clone(),
-                                remote_port: settings.remote_port,
-                                local_port: settings.local_port,
-                            };
+                            let enabled = view.forward.enabled;
+                            view.forward = settings.clone().into_forward(saved.clone(), enabled);
                         }
                     }
                     Response::Saved { id: saved }
@@ -976,6 +969,30 @@ mod tests {
             ("saved prd-web", false)
         );
         assert_eq!(app.snapshot.forwards[0].forward.local_port, 10081);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_edit_to_another_namespace_keeps_the_cursor_on_its_new_id() {
+        let fake = FakeDaemon::new();
+        let renamed = ForwardId::new("production.web.frontend-80");
+        fake.state().saved_as = Some(renamed.clone());
+        let mut app = App::new(snapshot());
+        run_loop(&fake, &mut app, async |keys| {
+            keys.send(char_key('e')).await;
+            for _ in 0..3 {
+                keys.send(key(KeyCode::Up)).await;
+            }
+            keys.send(ctrl('u')).await;
+            keys.type_text("web").await;
+            keys.send(key(KeyCode::Enter)).await;
+        })
+        .await;
+
+        assert_eq!(app.snapshot.forwards[0].forward.id, renamed);
+        assert_eq!(app.snapshot.forwards[0].forward.namespace, "web");
+        assert_eq!(app.selected, Some(renamed));
+        let message = app.message.as_ref().unwrap();
+        assert_eq!(message.text, "saved production.web.frontend-80");
     }
 
     #[tokio::test(start_paused = true)]

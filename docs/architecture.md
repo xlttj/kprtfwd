@@ -576,7 +576,8 @@ them itself:
 - The engine keeps the last 100 events of each forward and each context; they
   survive switching a forward off and on, but not a daemon restart. Deleting
   a forward (also by prune) drops its events, so a forward added later under
-  the same ID starts without them. The TUI's
+  the same ID starts without them; an edit that gives a forward a new ID
+  takes its events along. The TUI's
   event view (`l`) shows a forward's events merged with its context's;
   `kprtfwd logs <project or words>` does the same for any set of forwards, and
   `kprtfwd logs` without arguments shows the daemon's log file. Both follow
@@ -699,7 +700,16 @@ services the user may not list (section 9).
 - **IDs.** IDs are opaque and kept as they are. The current database holds two
   historic shapes: 21 IDs with three parts and 42 with four. New IDs are
   `<context>.<namespace>.<service>-<port>`, sanitized as in v1, with a numeric
-  suffix on collision.
+  suffix on collision. An edit that changes the context, namespace, service or
+  remote port gives the forward the ID a new forward with these settings would
+  get (its old ID counts as free), because the filter matches IDs and should
+  not find a forward by where it used to point. In one transaction the new row
+  is inserted, the project memberships move to it and the old row is deleted;
+  its enabled flag and its events (section 6.8) go along. An edit of the local
+  port keeps the ID. The schema stays as it is, so v1 reads the new ID like
+  any other. A forward stored under a new ID first drops memberships that v1
+  left for that ID (it saves projects from memory, with members deleted
+  meanwhile), so it joins no project by accident.
 
 ## 9. Discovery
 
@@ -830,7 +840,10 @@ with the context as a column and a filter over everything, groups only add keys.
 The forms are plain line-based dialogs, with `tab` to move between fields, `enter`
 to save and `esc` to cancel. They are:
 
-- **Edit/add:** context, namespace, service, remote port, local port.
+- **Edit/add:** context, namespace, service, remote port, local port. An
+  edit leaves the forward on or off as the daemon holds it, and changing
+  anything but the local port gives it a new ID (section 8); the cursor
+  follows it.
 - **Discovery:**
   1. choose a context (the current one is preselected);
   2. enter a namespace filter (`*` wildcards, empty for all);

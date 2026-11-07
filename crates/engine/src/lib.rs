@@ -178,6 +178,17 @@ impl Engine {
         self.forward_events.remove(id);
     }
 
+    /// Moves a forward's events to the new ID an edit gave it, so they go
+    /// on as for an edit that keeps the ID, and the old ID is left without
+    /// any. Called before the next reconcile, which stops the forward under
+    /// its old ID and starts it under the new one.
+    pub fn rename(&mut self, from: &ForwardId, to: &ForwardId) {
+        match self.forward_events.remove(from) {
+            Some(events) => self.forward_events.insert(to.clone(), events),
+            None => self.forward_events.remove(to),
+        };
+    }
+
     /// A forward's events, oldest first. They outlive stopping the forward,
     /// but not deleting it ([`Engine::forget`]).
     pub fn forward_events(&self, id: &ForwardId) -> Vec<Event> {
@@ -374,6 +385,36 @@ contexts:
         // Forgetting another forward leaves this one's events.
         engine.forget(&ForwardId::new("staging.shop.web-80"));
         assert_eq!(starts_and_stops(&engine, &api.id), ["started"]);
+    }
+
+    #[tokio::test]
+    async fn the_events_of_a_forward_follow_its_new_id() {
+        let mut engine = Engine::with_kubeconfig(kubeconfig());
+        let api = forward("staging", "shop", "api");
+        engine.reconcile(std::slice::from_ref(&api)).await;
+
+        // An edit moved it to another namespace, which gave it a new ID.
+        let moved = Forward {
+            id: ForwardId::new("staging.web.api-80"),
+            namespace: "web".into(),
+            ..api.clone()
+        };
+        engine.rename(&api.id, &moved.id);
+        engine.reconcile(std::slice::from_ref(&moved)).await;
+        assert_eq!(
+            starts_and_stops(&engine, &moved.id),
+            ["started", "stopped", "started"]
+        );
+        assert!(engine.forward_events(&api.id).is_empty());
+        assert!(engine.observe(&api.id).is_none());
+        assert!(engine.observe(&moved.id).is_some());
+
+        // A forward that never ran takes no events along, and none that
+        // were left under its new ID stay.
+        engine.reconcile(&[]).await;
+        let web = ForwardId::new("staging.shop.web-80");
+        engine.rename(&web, &moved.id);
+        assert!(engine.forward_events(&moved.id).is_empty());
     }
 
     #[tokio::test]

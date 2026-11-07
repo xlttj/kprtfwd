@@ -842,22 +842,14 @@ impl App {
             .iter()
             .map(|v| v.forward.id.clone())
             .collect();
-        let ForwardSettings {
-            context,
-            namespace,
-            service,
-            remote_port,
-            local_port,
-        } = settings;
-        let forward = Forward {
-            id: forward_id(&context, &namespace, &service, remote_port, &taken),
-            context,
-            namespace,
-            service,
-            remote_port,
-            local_port,
-            enabled: false,
-        };
+        let id = forward_id(
+            &settings.context,
+            &settings.namespace,
+            &settings.service,
+            settings.remote_port,
+            &taken,
+        );
+        let forward = settings.into_forward(id, false);
         Ok(Cmd::Request {
             success: format!("added {}", forward.id),
             request: Request::AddForwards {
@@ -1541,6 +1533,32 @@ pub(crate) mod tests {
         assert!(matches!(app.mode, Mode::List));
         assert_eq!(message(&app), ("saved prd-web", false));
         assert_eq!(app.selected, Some(id));
+    }
+
+    #[test]
+    fn the_cursor_follows_an_edited_forward_to_its_new_id() {
+        let mut app = App::new(snapshot());
+        assert_eq!(app.selected, Some(ForwardId::new("prd-web")));
+        app.update(key(KeyCode::Char('e')));
+        let new = ForwardId::new("production.web.frontend-80");
+        app.update(Msg::Saved {
+            id: ForwardId::new("prd-web"),
+            result: Ok(new.clone()),
+        });
+        assert_eq!(message(&app), ("saved production.web.frontend-80", false));
+        assert_eq!(app.selected, Some(new.clone()));
+        let mut renamed = snapshot();
+        renamed.forwards[0].forward.id = new.clone();
+        app.update(Msg::Snapshot(renamed));
+        assert_eq!(app.selected, Some(new));
+
+        // Saved while the cursor is on another forward, it stays there.
+        app.update(key(KeyCode::Char('j')));
+        app.update(Msg::Saved {
+            id: ForwardId::new("stg-web"),
+            result: Ok(ForwardId::new("staging.web.frontend-80")),
+        });
+        assert_eq!(app.selected, Some(ForwardId::new("stg-db")));
     }
 
     #[test]

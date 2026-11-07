@@ -18,7 +18,7 @@ use common::{
     Children, Home, NOT_FOUND, database, enabled, fake_api, forward, wait_until, write_database,
 };
 use kprtfwd_core::config::TEMPLATE;
-use kprtfwd_core::{Forward, ForwardId, Store};
+use kprtfwd_core::{Forward, ForwardId, Project, Store};
 use kprtfwd_proto::{
     Client, ClientError, ClientMessage, MAX_FRAME, PROTOCOL_VERSION, Request, Response,
     ServerMessage,
@@ -960,4 +960,61 @@ async fn an_edit_keeps_a_switch_and_an_add_replaces_nothing() {
     let snapshot = cli.snapshot().await.unwrap();
     let stored: Vec<&Forward> = snapshot.forwards.iter().map(|v| &v.forward).collect();
     assert_eq!(stored, [&saved.forward, &web]);
+}
+
+/// An edit that moves a running forward to another namespace gives it the
+/// ID a new forward there would get; it stays on, in its project, and its
+/// events go on under the new ID.
+#[tokio::test]
+async fn an_edit_of_the_target_moves_the_id_with_projects_and_events() {
+    let home = Home::new();
+    let api = forward("test", "shop", "api", true);
+    write_database(&home.db(), std::slice::from_ref(&api), false);
+    home.start_daemon();
+    let mut client = Client::connect(&home.socket()).await.expect("connect");
+    let project = Project {
+        name: "shop".into(),
+        forwards: vec![api.id.clone()],
+    };
+    client
+        .act(Request::UpsertProject { project })
+        .await
+        .unwrap();
+    let starts_and_stops = async |client: &mut Client, id: &ForwardId| -> Vec<String> {
+        let mut events = own_events(client, id).await;
+        events.retain(|message| message == "started" || message == "stopped");
+        events
+    };
+    let started = std::time::Instant::now();
+    while starts_and_stops(&mut client, &api.id).await.is_empty() {
+        assert!(started.elapsed() < Duration::from_secs(10), "not started");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let mut settings = api.settings();
+    settings.namespace = "web".into();
+    let edit = Request::EditForward {
+        id: api.id.clone(),
+        settings,
+    };
+    let Response::Saved { id } = client.request(edit).await.unwrap() else {
+        panic!("no saved answer");
+    };
+    assert_eq!(id.as_str(), "test.web.api-80");
+    let snapshot = client.snapshot().await.unwrap();
+    let ids: Vec<&ForwardId> = snapshot.forwards.iter().map(|v| &v.forward.id).collect();
+    assert_eq!(ids, [&id]);
+    assert!(snapshot.forwards[0].forward.enabled);
+    assert_eq!(snapshot.projects[0].forwards, std::slice::from_ref(&id));
+    assert_eq!(
+        starts_and_stops(&mut client, &id).await,
+        ["started", "stopped", "started"]
+    );
+    let old = Request::Events {
+        ids: vec![api.id.clone()],
+    };
+    let Err(ClientError::Daemon(message)) = client.request(old).await else {
+        panic!("the old ID still has events");
+    };
+    assert_eq!(message, "unknown forward test.shop.api-80");
 }

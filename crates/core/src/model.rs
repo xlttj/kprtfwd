@@ -76,6 +76,20 @@ pub struct ForwardSettings {
     pub local_port: u16,
 }
 
+impl ForwardSettings {
+    pub fn into_forward(self, id: ForwardId, enabled: bool) -> Forward {
+        Forward {
+            id,
+            context: self.context,
+            namespace: self.namespace,
+            service: self.service,
+            remote_port: self.remote_port,
+            local_port: self.local_port,
+            enabled,
+        }
+    }
+}
+
 /// A named set of forwards that can be switched on and off together.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {

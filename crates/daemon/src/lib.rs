@@ -729,8 +729,11 @@ impl Daemon {
             Request::EditForward { id, settings } => {
                 validate_settings(&settings).map_err(|err| format!("{id}: {err}"))?;
                 let saved = self.store.edit_forward(&id, &settings).map_err(text)?;
+                if saved != id {
+                    self.engine.rename(&id, &saved);
+                }
                 self.apply().await.map_err(text)?;
-                info!(%id, "forward edited");
+                info!(%id, %saved, "forward edited");
                 return Ok(Response::Saved { id: saved });
             }
             Request::DeleteForward { id } => {
