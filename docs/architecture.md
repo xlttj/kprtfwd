@@ -309,10 +309,14 @@ credentials.
   the API server is reachable, which decides whether the actor may log in.
 - The spike used exactly this probe, against staging (k3s 1.33) and orbstack.
 - Timeout 3 s. The probe runs every 5 s while healthy and every 2 s while not.
-- A healthy context turns unreachable only after two timeouts in a row; a single
-  slow answer over VPN is not an outage. DNS and refused connections count at
-  once.
-- Failures are classified as DNS, refused, timeout, TLS, or auth.
+- A healthy context turns unreachable only after two failed probes in a row
+  that may pass by themselves: timeouts, resets and failures without a known
+  cause, such as a keep-alive connection the server had just closed. A single
+  slow answer or reset over VPN is not an outage. DNS, refused connections and
+  TLS errors count at once.
+- Failures are classified as DNS, refused, timeout, TLS, auth, or other: by
+  kube's status codes, the kinds of I/O errors and rustls's errors in the
+  error's source chain, and by its text where no type tells (DNS).
 
 **Watches.** The actor watches EndpointSlices and Services per namespace, only for
 namespaces with enabled forwards. The watches are reference-counted and start and

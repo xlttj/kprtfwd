@@ -25,10 +25,11 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 tower.workspace = true
 tracing.workspace = true
+# Only for its error type, to tell TLS failures by type; the features match
+# what kube already builds.
+rustls = { version = "0.23", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-# Only for its error types; the features match what kube already builds.
-rustls = { version = "0.23", default-features = false, features = ["std"] }
 tempfile.workspace = true
 
 [lints]

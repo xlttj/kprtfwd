@@ -16,12 +16,13 @@ pub enum Failure {
     Other(String),
 }
 
-/// Classifies an error by its kube error variants and status codes, then by
-/// the text of its source chain (network errors arrive as nested I/O errors).
+/// Classifies an error by the types in its source chain: kube's error
+/// variants and status codes, the kinds of I/O errors and rustls errors.
+/// Then by the chain's text, for errors that carry no telling type, such as
+/// a failed DNS lookup.
 pub fn classify(err: &(dyn Error + 'static)) -> Failure {
     let text = chain(err);
-    let mut source: Option<&(dyn Error + 'static)> = Some(err);
-    while let Some(current) = source {
+    for current in errors(err) {
         if let Some(kube_err) = current.downcast_ref::<kube::Error>() {
             match kube_err {
                 kube::Error::Auth(_) => return Failure::Auth(text),
@@ -34,7 +35,14 @@ pub fn classify(err: &(dyn Error + 'static)) -> Failure {
                 _ => {}
             }
         }
-        source = current.source();
+        if let Some(cause) = net_cause(current) {
+            return Failure::Net(match cause {
+                Cause::Refused => NetCause::Refused,
+                Cause::Timeout => NetCause::Timeout,
+                Cause::Tls => NetCause::Tls(text),
+                Cause::Other => NetCause::Other(text),
+            });
+        }
     }
 
     let lower = text.to_lowercase();
@@ -65,7 +73,6 @@ pub fn classify(err: &(dyn Error + 'static)) -> Failure {
         "broken pipe",
         "network is unreachable",
         "no route to host",
-        "error trying to connect",
     ]) {
         Failure::Net(NetCause::Other(text))
     } else {
@@ -73,19 +80,61 @@ pub fn classify(err: &(dyn Error + 'static)) -> Failure {
     }
 }
 
+/// A network failure that one error of a chain tells by its type.
+enum Cause {
+    Refused,
+    Timeout,
+    Tls,
+    Other,
+}
+
+/// What `err` itself says about the network, without its sources.
+fn net_cause(err: &(dyn Error + 'static)) -> Option<Cause> {
+    use std::io::ErrorKind;
+    if err.is::<rustls::Error>() {
+        return Some(Cause::Tls);
+    }
+    match err.downcast_ref::<std::io::Error>()?.kind() {
+        ErrorKind::ConnectionRefused => Some(Cause::Refused),
+        ErrorKind::TimedOut => Some(Cause::Timeout),
+        ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::BrokenPipe
+        | ErrorKind::NetworkUnreachable
+        | ErrorKind::HostUnreachable
+        | ErrorKind::NetworkDown => Some(Cause::Other),
+        _ => None,
+    }
+}
+
 /// The error and all its sources, joined with ": ", without repeats (many
 /// wrappers repeat their source's text).
 pub fn chain(err: &(dyn Error + 'static)) -> String {
     let mut parts: Vec<String> = Vec::new();
-    let mut source: Option<&(dyn Error + 'static)> = Some(err);
-    while let Some(current) = source {
+    for current in errors(err) {
         let text = current.to_string();
         if !parts.iter().any(|part| part.contains(&text)) {
             parts.push(text);
         }
-        source = current.source();
     }
     parts.join(": ")
+}
+
+/// `err` and its sources. An I/O error that wraps another error gives that
+/// error's source as its own and skips the error itself, which is how TLS
+/// errors arrive (rustls's inside tokio-rustls's inside hyper-rustls's I/O
+/// error); here the wrapped error comes next.
+fn errors<'a>(err: &'a (dyn Error + 'static)) -> impl Iterator<Item = &'a (dyn Error + 'static)> {
+    std::iter::successors(
+        Some(err),
+        |&current: &&'a (dyn Error + 'static)| match current
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+        {
+            Some(inner) => Some(inner as &(dyn Error + 'static)),
+            None => current.source(),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -114,6 +163,38 @@ mod tests {
         assert_eq!(classify(&refused), Failure::Net(NetCause::Refused));
         let other = io(std::io::ErrorKind::Other, "something odd");
         assert_eq!(classify(&other), Failure::Other("something odd".into()));
+    }
+
+    /// I/O errors tell by their kind, also inside another I/O error, as
+    /// hyper-rustls wraps the errors of a connection.
+    #[test]
+    fn classifies_network_errors_by_kind() {
+        use std::io::ErrorKind;
+        let cases = [
+            (
+                ErrorKind::ConnectionRefused,
+                Failure::Net(NetCause::Refused),
+            ),
+            (ErrorKind::TimedOut, Failure::Net(NetCause::Timeout)),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(classify(&io(kind, "odd")), expected, "{kind:?}");
+        }
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkDown,
+        ] {
+            let wrapped = std::io::Error::other(io(kind, "odd"));
+            assert_eq!(
+                classify(&wrapped),
+                Failure::Net(NetCause::Other("odd".into())),
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]
@@ -195,8 +276,8 @@ mod tests {
         );
     }
 
-    /// TLS failures as rustls words them. A handshake with a server that does
-    /// not speak TLS is not recognised as TLS yet (it ends as Other).
+    /// TLS failures are rustls errors, whatever their words, inside the
+    /// I/O errors of tokio-rustls and hyper-rustls.
     #[tokio::test]
     async fn classifies_tls_errors() {
         use rustls::{CertificateError, Error as Tls};
@@ -204,19 +285,23 @@ mod tests {
             Tls::InvalidCertificate(CertificateError::UnknownIssuer),
             Tls::InvalidCertificate(CertificateError::Expired),
             Tls::InvalidCertificate(CertificateError::NotValidForName),
+            Tls::AlertReceived(rustls::AlertDescription::ProtocolVersion),
         ] {
             let text = error.to_string();
-            let err = std::io::Error::new(std::io::ErrorKind::InvalidData, error);
+            let err =
+                std::io::Error::other(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
             assert_eq!(classify(&err), Failure::Net(NetCause::Tls(text)));
         }
 
+        // A server that does not speak TLS.
         let addr = plain_http_server().await;
         let plain = client(&format!("https://{addr}"))
             .apiserver_version()
             .await
             .unwrap_err();
-        assert!(chain(&plain).contains("corrupt message"), "{plain}");
-        assert!(matches!(classify(&plain), Failure::Other(_)), "{plain}");
+        let text = chain(&plain);
+        assert!(text.contains("corrupt message"), "{plain}");
+        assert_eq!(classify(&plain), Failure::Net(NetCause::Tls(text)));
     }
 
     /// `portforward::open` fails with kube's upgrade error, which carries

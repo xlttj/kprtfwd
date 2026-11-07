@@ -33,10 +33,11 @@ use crate::kubeconfig;
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const PROBE_INTERVAL_HEALTHY: Duration = Duration::from_secs(5);
 const PROBE_INTERVAL_UNHEALTHY: Duration = Duration::from_secs(2);
-/// A healthy context counts as unreachable only after this many probe
-/// timeouts in a row: one slow answer is not an outage. Definite failures
-/// (DNS, refused) count at once.
-const TIMEOUTS_UNTIL_UNREACHABLE: u32 = 2;
+/// A healthy context counts as unreachable only after this many failed
+/// probes in a row that may pass by themselves: timeouts, resets and failures
+/// without a known cause. One slow answer or one reset over VPN is not an
+/// outage. Definite failures (DNS, refused, TLS) count at once.
+const FAILURES_UNTIL_UNREACHABLE: u32 = 2;
 
 /// How long a probe may take and how often it runs; shorter in tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -404,8 +405,8 @@ async fn probe_health(weak: Weak<Context>) {
 /// What the probe keeps from one probe to the next.
 #[derive(Debug, Default)]
 struct Probed {
-    /// Timeouts in a row; see [`next_state`].
-    timeouts: u32,
+    /// Failures in a row that may pass; see [`next_state`].
+    failures: u32,
     /// Set when a login succeeded, until the API server answers. If it
     /// rejects the new token, another login would only get the same.
     unverified: bool,
@@ -431,7 +432,7 @@ fn after_probe(
 ) -> (ContextState, bool) {
     let Some(login) = login.filter(|_| answered(&answer)) else {
         return (
-            next_state(previous, answer, &mut probed.timeouts, now),
+            next_state(previous, answer, &mut probed.failures, now),
             false,
         );
     };
@@ -444,7 +445,7 @@ fn after_probe(
         }
     }
     let log_in = !logging_in && login.needed();
-    let next = next_state(previous, answer, &mut probed.timeouts, now);
+    let next = next_state(previous, answer, &mut probed.failures, now);
     if (logging_in || log_in) && !login.has_token() {
         (ContextState::LoggingIn, log_in)
     } else {
@@ -503,31 +504,42 @@ pub(crate) fn answered(answer: &Result<String, Failure>) -> bool {
     !matches!(answer, Err(Failure::Net(_) | Failure::Other(_)))
 }
 
-/// The state after a probe at `now`.
+/// The state after a probe at `now`. `failures` counts the failures in a
+/// row that may pass by themselves (see [`FAILURES_UNTIL_UNREACHABLE`]).
 fn next_state(
     previous: &ContextState,
     answer: Result<String, Failure>,
-    timeouts: &mut u32,
+    failures: &mut u32,
     now: SystemTime,
 ) -> ContextState {
     match answer {
         Ok(server_version) => {
-            *timeouts = 0;
+            *failures = 0;
             ContextState::Healthy { server_version }
         }
-        Err(Failure::Net(NetCause::Timeout)) => {
-            *timeouts += 1;
-            if previous.is_healthy() && *timeouts < TIMEOUTS_UNTIL_UNREACHABLE {
+        Err(failure) if may_pass(&failure) => {
+            *failures += 1;
+            if previous.is_healthy() && *failures < FAILURES_UNTIL_UNREACHABLE {
                 previous.clone()
             } else {
-                failed(previous, Failure::Net(NetCause::Timeout), now)
+                failed(previous, failure, now)
             }
         }
         Err(failure) => {
-            *timeouts = 0;
+            *failures = 0;
             failed(previous, failure, now)
         }
     }
+}
+
+/// Whether a failed probe may be a blip: a timeout, a reset or a failure
+/// without a known cause, such as a keep-alive connection the server had
+/// just closed.
+fn may_pass(failure: &Failure) -> bool {
+    matches!(
+        failure,
+        Failure::Net(NetCause::Timeout | NetCause::Other(_)) | Failure::Other(_)
+    )
 }
 
 /// The state after a probe failed at `now`. Keeps the time the outage
@@ -1067,41 +1079,78 @@ contexts:
 
     #[test]
     fn a_healthy_context_turns_unreachable_after_two_timeouts_in_a_row() {
-        let mut timeouts = 0;
-        let state = next_state(&healthy(), timeout(), &mut timeouts, at(10));
+        let mut failures = 0;
+        let state = next_state(&healthy(), timeout(), &mut failures, at(10));
         assert_eq!(state, healthy(), "one slow answer is no outage");
-        let state = next_state(&state, timeout(), &mut timeouts, at(15));
+        let state = next_state(&state, timeout(), &mut failures, at(15));
         assert_eq!(state, unreachable(15, NetCause::Timeout));
-        assert_eq!(timeouts, 2);
+        assert_eq!(failures, 2);
 
         // An answer in between starts the count again.
-        let mut timeouts = 0;
-        let state = next_state(&healthy(), timeout(), &mut timeouts, at(10));
-        let state = next_state(&state, Ok("v1.33.0".into()), &mut timeouts, at(15));
-        assert_eq!(timeouts, 0);
-        let state = next_state(&state, timeout(), &mut timeouts, at(20));
+        let mut failures = 0;
+        let state = next_state(&healthy(), timeout(), &mut failures, at(10));
+        let state = next_state(&state, Ok("v1.33.0".into()), &mut failures, at(15));
+        assert_eq!(failures, 0);
+        let state = next_state(&state, timeout(), &mut failures, at(20));
         assert_eq!(state, healthy());
         // So does a definite failure.
         let state = next_state(
             &state,
             Err(Failure::Net(NetCause::Dns)),
-            &mut timeouts,
+            &mut failures,
             at(25),
         );
-        assert_eq!(timeouts, 0);
+        assert_eq!(failures, 0);
         assert_eq!(state, unreachable(25, NetCause::Dns));
+    }
+
+    /// A reset or an error without a known cause may pass like a timeout:
+    /// a healthy context stays healthy after one of them. The second in a
+    /// row, of any of these kinds, makes it unreachable with its cause.
+    #[test]
+    fn resets_and_unknown_errors_count_like_timeouts() {
+        let reset = || Err(Failure::Net(NetCause::Other("connection reset".into())));
+        let odd = || Err(Failure::Other("connection closed".into()));
+        for (first, second, cause) in [
+            (reset(), reset(), NetCause::Other("connection reset".into())),
+            (odd(), odd(), NetCause::Other("connection closed".into())),
+            (
+                timeout(),
+                odd(),
+                NetCause::Other("connection closed".into()),
+            ),
+            (reset(), timeout(), NetCause::Timeout),
+        ] {
+            let mut failures = 0;
+            let state = next_state(&healthy(), first, &mut failures, at(10));
+            assert_eq!(state, healthy());
+            let state = next_state(&state, second, &mut failures, at(15));
+            assert_eq!(state, unreachable(15, cause));
+        }
     }
 
     #[test]
     fn definite_failures_and_timeouts_of_an_unhealthy_context_count_at_once() {
         for previous in [ContextState::Connecting, unreachable(1, NetCause::Dns)] {
-            let mut timeouts = 0;
-            let state = next_state(&previous, timeout(), &mut timeouts, at(10));
+            let mut failures = 0;
+            let state = next_state(&previous, timeout(), &mut failures, at(10));
             assert!(
                 matches!(
                     state,
                     ContextState::Unreachable {
                         cause: NetCause::Timeout,
+                        ..
+                    }
+                ),
+                "{previous:?}: {state:?}"
+            );
+            let odd = Err(Failure::Other("odd".into()));
+            let state = next_state(&previous, odd, &mut failures, at(10));
+            assert!(
+                matches!(
+                    state,
+                    ContextState::Unreachable {
+                        cause: NetCause::Other(_),
                         ..
                     }
                 ),
@@ -1113,11 +1162,11 @@ contexts:
             NetCause::Refused,
             NetCause::Tls("bad certificate".into()),
         ] {
-            let mut timeouts = 0;
+            let mut failures = 0;
             let state = next_state(
                 &healthy(),
                 Err(Failure::Net(cause.clone())),
-                &mut timeouts,
+                &mut failures,
                 at(10),
             );
             assert_eq!(state, unreachable(10, cause));
@@ -1160,12 +1209,12 @@ contexts:
 
     #[test]
     fn an_outage_keeps_the_time_it_started() {
-        let mut timeouts = 0;
+        let mut failures = 0;
         let previous = unreachable(5, NetCause::Timeout);
         let state = next_state(
             &previous,
             Err(Failure::Net(NetCause::Refused)),
-            &mut timeouts,
+            &mut failures,
             at(20),
         );
         assert_eq!(state, unreachable(5, NetCause::Refused));
@@ -1182,11 +1231,11 @@ contexts:
         assert_eq!(state, unreachable(5, NetCause::Dns));
 
         // A recovery ends it; the next outage has its own start.
-        let state = next_state(&state, Ok("v1.33.0".into()), &mut timeouts, at(50));
+        let state = next_state(&state, Ok("v1.33.0".into()), &mut failures, at(50));
         let state = next_state(
             &state,
             Err(Failure::Net(NetCause::Dns)),
-            &mut timeouts,
+            &mut failures,
             at(60),
         );
         assert_eq!(state, unreachable(60, NetCause::Dns));
