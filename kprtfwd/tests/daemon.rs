@@ -1,7 +1,7 @@
 //! The daemon through the real binary: switching the forwards off when the
 //! last TUI quits, taking over `~/.kprtfwd`, one daemon per directory, every
 //! way it exits, watching the kubeconfig, a login that waits for the user,
-//! and discovery.
+//! discovery, and what adding, editing and deleting forwards keep.
 //!
 //! Every command runs in a home directory of its own; see `common`.
 
@@ -17,8 +17,8 @@ use std::time::Duration;
 use common::{
     Children, Home, NOT_FOUND, database, enabled, fake_api, forward, wait_until, write_database,
 };
-use kprtfwd_core::Store;
 use kprtfwd_core::config::TEMPLATE;
+use kprtfwd_core::{Forward, ForwardId, Store};
 use kprtfwd_proto::{
     Client, ClientError, ClientMessage, MAX_FRAME, PROTOCOL_VERSION, Request, Response,
     ServerMessage,
@@ -863,4 +863,52 @@ async fn the_daemon_raises_its_limit_of_open_files() {
     let line = raised().unwrap();
     assert!(line.contains("from=256"), "{line}");
     assert!(!line.contains("to=256"), "{line}");
+}
+
+/// The messages of the events of forward `id`, without its context's.
+async fn own_events(client: &mut Client, id: &ForwardId) -> Vec<String> {
+    let request = Request::Events {
+        ids: vec![id.clone()],
+    };
+    let Response::Events { entries } = client.request(request).await.unwrap() else {
+        panic!("no events answer");
+    };
+    entries
+        .into_iter()
+        .filter(|entry| entry.source == id.as_str())
+        .map(|entry| entry.message)
+        .collect()
+}
+
+/// A forward deleted and added again, as discovery gives the same service
+/// the same ID, starts without the deleted one's events.
+#[tokio::test]
+async fn a_forward_added_again_starts_without_old_events() {
+    let home = Home::new();
+    let api = forward("test", "shop", "api", true);
+    write_database(&home.db(), std::slice::from_ref(&api), false);
+    home.start_daemon();
+    let mut client = Client::connect(&home.socket()).await.expect("connect");
+    let started = std::time::Instant::now();
+    while !own_events(&mut client, &api.id)
+        .await
+        .contains(&"started".to_owned())
+    {
+        assert!(started.elapsed() < Duration::from_secs(10), "not started");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let id = api.id.clone();
+    client.act(Request::DeleteForward { id }).await.unwrap();
+    let again = Forward {
+        enabled: false,
+        ..api.clone()
+    };
+    client
+        .act(Request::UpsertForwards {
+            forwards: vec![again],
+        })
+        .await
+        .unwrap();
+    assert_eq!(own_events(&mut client, &api.id).await, Vec::<String>::new());
 }

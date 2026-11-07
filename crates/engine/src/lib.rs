@@ -171,7 +171,15 @@ impl Engine {
         self.forwards.get(id)?.last_error()
     }
 
-    /// A forward's events, oldest first. They outlive stopping the forward.
+    /// Drops the events of a forward that was deleted, so a forward added
+    /// later under its ID starts without them. Called once the forward is
+    /// stopped; a running one would go on writing to the log it holds.
+    pub fn forget(&mut self, id: &ForwardId) {
+        self.forward_events.remove(id);
+    }
+
+    /// A forward's events, oldest first. They outlive stopping the forward,
+    /// but not deleting it ([`Engine::forget`]).
     pub fn forward_events(&self, id: &ForwardId) -> Vec<Event> {
         self.forward_events
             .get(id)
@@ -347,6 +355,25 @@ contexts:
             starts_and_stops(&engine, &api.id),
             ["started", "stopped", "started", "stopped"]
         );
+    }
+
+    #[tokio::test]
+    async fn a_forward_added_after_a_delete_starts_without_old_events() {
+        let mut engine = Engine::with_kubeconfig(kubeconfig());
+        let api = forward("staging", "shop", "api");
+        engine.reconcile(std::slice::from_ref(&api)).await;
+        // Deleted: no longer wanted, then forgotten.
+        engine.reconcile(&[]).await;
+        assert_eq!(starts_and_stops(&engine, &api.id), ["started", "stopped"]);
+        engine.forget(&api.id);
+        assert!(engine.forward_events(&api.id).is_empty());
+
+        // A new forward with the same ID, as discovery gives it again.
+        engine.reconcile(std::slice::from_ref(&api)).await;
+        assert_eq!(starts_and_stops(&engine, &api.id), ["started"]);
+        // Forgetting another forward leaves this one's events.
+        engine.forget(&ForwardId::new("staging.shop.web-80"));
+        assert_eq!(starts_and_stops(&engine, &api.id), ["started"]);
     }
 
     #[tokio::test]

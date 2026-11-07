@@ -574,7 +574,9 @@ them itself:
   request logging is off: it logs every failed request as an error, while an
   outage should be reported once, by the context state.
 - The engine keeps the last 100 events of each forward and each context; they
-  survive switching a forward off and on, but not a daemon restart. The TUI's
+  survive switching a forward off and on, but not a daemon restart. Deleting
+  a forward (also by prune) drops its events, so a forward added later under
+  the same ID starts without them. The TUI's
   event view (`l`) shows a forward's events merged with its context's;
   `kprtfwd logs <project or words>` does the same for any set of forwards, and
   `kprtfwd logs` without arguments shows the daemon's log file. Both follow

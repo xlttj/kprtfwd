@@ -733,7 +733,10 @@ impl Daemon {
                 if !self.store.delete_forward(&id).map_err(text)? {
                     return Err(format!("unknown forward {id}"));
                 }
+                self.apply().await.map_err(text)?;
+                self.engine.forget(&id);
                 info!(%id, "forward deleted");
+                return Ok(Response::Done);
             }
             Request::UpsertProject { project } => {
                 self.store.upsert_project(&project).map_err(text)?;
@@ -1017,6 +1020,9 @@ async fn prune(
                 .map_err(|err| err.to_string())?;
         }
         daemon.apply().await.map_err(|err| err.to_string())?;
+        for forward in &gone {
+            daemon.engine.forget(&forward.id);
+        }
         info!(context, count = gone.len(), "pruned forwards");
     }
     Ok(Response::Pruned {
