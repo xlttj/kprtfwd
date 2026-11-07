@@ -1,4 +1,5 @@
 //! Services and EndpointSlices of one namespace, kept current by watches.
+//! Of each object the cache keeps only what lookups need.
 //!
 //! The cache object lives as long as forwards need the namespace. Its watches
 //! can be restarted (after an outage) and refill the same cache, so forwards
@@ -22,31 +23,180 @@ use crate::errors::{Failure, classify};
 /// The label that links an EndpointSlice to its Service.
 const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
 
-/// The objects of one kind in one namespace.
-struct Objects<K> {
+/// What the cache keeps of the objects of one kind in one namespace.
+#[derive(Default)]
+struct Objects<S> {
     /// The first full listing has arrived.
     ready: bool,
-    items: HashMap<String, Arc<K>>,
+    items: S,
     /// The last watch error, cleared by the next event that arrives.
     error: Option<Failure>,
 }
 
-impl<K> Default for Objects<K> {
-    fn default() -> Self {
-        Self {
-            ready: false,
-            items: HashMap::new(),
-            error: None,
+type Shared<S> = Arc<RwLock<Objects<S>>>;
+
+/// Keeps of each object of one kind only what lookups need, not the whole
+/// object with its managed fields and annotations.
+trait Store: Default + Send + Sync + 'static {
+    type Object: Resource<DynamicType = ()>
+        + Clone
+        + DeserializeOwned
+        + std::fmt::Debug
+        + Send
+        + Sync
+        + 'static;
+
+    /// Keeps what lookups need of `object`, instead of what it kept of the
+    /// object's earlier version.
+    fn apply(&mut self, object: Self::Object);
+
+    fn delete(&mut self, object: &Self::Object);
+}
+
+/// The ports of each Service, by its name.
+#[derive(Default)]
+struct Services(HashMap<String, Vec<ServicePort>>);
+
+/// A port of a Service.
+struct ServicePort {
+    port: i32,
+    /// Empty for a service's only, unnamed port.
+    name: String,
+}
+
+impl Services {
+    fn ports(&self, service: &str) -> Option<&[ServicePort]> {
+        self.0.get(service).map(Vec::as_slice)
+    }
+}
+
+impl Store for Services {
+    type Object = Service;
+
+    fn apply(&mut self, service: Service) {
+        let name = service.name_any();
+        let ports = service
+            .spec
+            .and_then(|spec| spec.ports)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|port| ServicePort {
+                port: port.port,
+                name: port.name.unwrap_or_default(),
+            })
+            .collect();
+        self.0.insert(name, ports);
+    }
+
+    fn delete(&mut self, service: &Service) {
+        self.0.remove(&service.name_any());
+    }
+}
+
+/// The EndpointSlices of each Service, so a lookup reads only those of the
+/// forwarded service.
+#[derive(Default)]
+struct Slices {
+    /// By service, then by the slice's name.
+    by_service: HashMap<String, HashMap<String, Slice>>,
+    /// The service of each slice, to find it again when it changes or goes.
+    service_of: HashMap<String, String>,
+}
+
+/// What an EndpointSlice says about the pods behind its service.
+struct Slice {
+    /// Container ports by the names of their service ports, as the slice
+    /// resolved them for its pods.
+    ports: Vec<(String, u16)>,
+    /// The pods, and whether each is ready.
+    pods: Vec<(String, bool)>,
+}
+
+impl Slice {
+    fn new(slice: EndpointSlice) -> Self {
+        let ports = slice
+            .ports
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|port| {
+                let number = u16::try_from(port.port?).ok()?;
+                Some((port.name.unwrap_or_default(), number))
+            })
+            .collect();
+        let pods = slice
+            .endpoints
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|endpoint| {
+                let pod = endpoint
+                    .target_ref
+                    .filter(|r| r.kind.as_deref() == Some("Pod"))?
+                    .name?;
+                // An unset "ready" means unknown, which counts as ready.
+                let ready = endpoint.conditions.and_then(|c| c.ready).unwrap_or(true);
+                Some((pod, ready))
+            })
+            .collect();
+        Self { ports, pods }
+    }
+
+    /// The container port for the service port named `name`.
+    fn port(&self, name: &str) -> Option<u16> {
+        self.ports
+            .iter()
+            .find(|(port_name, _)| port_name == name)
+            .map(|(_, port)| *port)
+    }
+}
+
+impl Slices {
+    /// The slices of `service`.
+    fn of(&self, service: &str) -> impl Iterator<Item = &Slice> {
+        self.by_service
+            .get(service)
+            .into_iter()
+            .flat_map(HashMap::values)
+    }
+
+    fn remove(&mut self, name: &str) {
+        let Some(service) = self.service_of.remove(name) else {
+            return;
+        };
+        if let Some(slices) = self.by_service.get_mut(&service) {
+            slices.remove(name);
+            if slices.is_empty() {
+                self.by_service.remove(&service);
+            }
         }
     }
 }
 
-type Shared<K> = Arc<RwLock<Objects<K>>>;
+impl Store for Slices {
+    type Object = EndpointSlice;
+
+    fn apply(&mut self, slice: EndpointSlice) {
+        let name = slice.name_any();
+        self.remove(&name);
+        // A slice without the label belongs to no service.
+        let Some(service) = slice.labels().get(SERVICE_NAME_LABEL).cloned() else {
+            return;
+        };
+        self.service_of.insert(name.clone(), service.clone());
+        self.by_service
+            .entry(service)
+            .or_default()
+            .insert(name, Slice::new(slice));
+    }
+
+    fn delete(&mut self, slice: &EndpointSlice) {
+        self.remove(&slice.name_any());
+    }
+}
 
 pub struct NamespaceCache {
     namespace: String,
-    services: Shared<Service>,
-    slices: Shared<EndpointSlice>,
+    services: Shared<Services>,
+    slices: Shared<Slices>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -117,64 +267,41 @@ impl NamespaceCache {
         let port_name = {
             let services = self.services.read().unwrap();
             check(&services)?;
-            let service = services.items.get(service).ok_or(Target::ServiceNotFound)?;
-            let port = service
-                .spec
-                .as_ref()
-                .and_then(|spec| spec.ports.as_ref())
-                .and_then(|ports| ports.iter().find(|p| p.port == i32::from(remote_port)))
+            let ports = services
+                .items
+                .ports(service)
+                .ok_or(Target::ServiceNotFound)?;
+            let port = ports
+                .iter()
+                .find(|p| p.port == i32::from(remote_port))
                 .ok_or(Target::PortNotOnService)?;
-            port.name.clone().unwrap_or_default()
+            port.name.clone()
         };
 
         let slices = self.slices.read().unwrap();
         check(&slices)?;
         let mut ready = Vec::new();
         let mut pods = Vec::new();
-        for slice in slices.items.values() {
-            if slice.labels().get(SERVICE_NAME_LABEL).map(String::as_str) != Some(service) {
-                continue;
-            }
+        for slice in slices.items.of(service) {
             // The slice lists ports by the service port's name, already
             // resolved to the container port; that covers named target ports.
-            let Some(port) = slice
-                .ports
-                .iter()
-                .flatten()
-                .find(|p| p.name.as_deref().unwrap_or_default() == port_name)
-                .and_then(|p| p.port)
-                .and_then(|p| u16::try_from(p).ok())
-            else {
+            let Some(port) = slice.port(&port_name) else {
                 continue;
             };
-            for endpoint in slice.endpoints.iter().flatten() {
-                let Some(pod) = endpoint
-                    .target_ref
-                    .as_ref()
-                    .filter(|r| r.kind.as_deref() == Some("Pod"))
-                    .and_then(|r| r.name.clone())
-                else {
-                    continue;
-                };
-                // An unset "ready" means unknown, which counts as ready.
-                let is_ready = endpoint
-                    .conditions
-                    .as_ref()
-                    .and_then(|c| c.ready)
-                    .unwrap_or(true);
-                if is_ready {
+            for (pod, is_ready) in &slice.pods {
+                if *is_ready {
                     ready.push(Endpoint {
                         pod: pod.clone(),
                         port,
                     });
                 }
-                pods.push(pod);
+                pods.push(pod.as_str());
             }
         }
         // Dual-stack clusters list each pod in an IPv4 and an IPv6 slice.
         ready.sort();
         ready.dedup();
-        pods.sort();
+        pods.sort_unstable();
         pods.dedup();
         Ok((ready, count(pods.len())))
     }
@@ -205,12 +332,13 @@ impl NamespaceCache {
 
 /// Replaces the objects, as a full listing does.
 #[cfg(test)]
-fn fill<K: Resource>(objects: &Shared<K>, items: Vec<K>) {
+fn fill<S: Store>(objects: &Shared<S>, items: Vec<S::Object>) {
+    let mut listing = S::default();
+    for object in items {
+        listing.apply(object);
+    }
     let mut objects = objects.write().unwrap();
-    objects.items = items
-        .into_iter()
-        .map(|object| (object.name_any(), Arc::new(object)))
-        .collect();
+    objects.items = listing;
     objects.ready = true;
     objects.error = None;
 }
@@ -225,7 +353,7 @@ fn count(n: usize) -> u16 {
 /// the context's probe does not see it, so the objects would go stale while
 /// the forward looks ready. Other failures of a listed watch keep what it
 /// has; the probe shows an outage, and the watcher retries the rest.
-fn check<K>(objects: &Objects<K>) -> Result<(), Target> {
+fn check<S>(objects: &Objects<S>) -> Result<(), Target> {
     match &objects.error {
         Some(Failure::Forbidden(message)) => Err(Target::Forbidden(message.clone())),
         _ if objects.ready => Ok(()),
@@ -234,7 +362,7 @@ fn check<K>(objects: &Objects<K>) -> Result<(), Target> {
 }
 
 /// Clears the error of `objects` once an event arrived.
-fn recovered<K>(objects: &mut Objects<K>, kind: &str) {
+fn recovered<S>(objects: &mut Objects<S>, kind: &str) {
     if objects.error.take().is_some() {
         info!(%kind, "watch recovered");
     }
@@ -244,27 +372,18 @@ fn recovered<K>(objects: &mut Objects<K>, kind: &str) {
 /// retries with backoff on its own: a failed listing with a new listing, a
 /// failed watch with a new watch from where it was, which shows only with
 /// the next event.
-async fn watch<K>(api: Api<K>, objects: Shared<K>)
-where
-    K: Resource<DynamicType = ()>
-        + Clone
-        + DeserializeOwned
-        + std::fmt::Debug
-        + Send
-        + Sync
-        + 'static,
-{
-    let kind = K::kind(&()).into_owned();
+async fn watch<S: Store>(api: Api<S::Object>, objects: Shared<S>) {
+    let kind = S::Object::kind(&()).into_owned();
     let mut events = watcher(api, watcher::Config::default())
         .default_backoff()
         .boxed();
-    let mut listing: Option<HashMap<String, Arc<K>>> = None;
+    let mut listing: Option<S> = None;
     while let Some(event) = events.next().await {
         match event {
-            Ok(watcher::Event::Init) => listing = Some(HashMap::new()),
+            Ok(watcher::Event::Init) => listing = Some(S::default()),
             Ok(watcher::Event::InitApply(object)) => {
                 if let Some(listing) = listing.as_mut() {
-                    listing.insert(object.name_any(), Arc::new(object));
+                    listing.apply(object);
                 }
             }
             Ok(watcher::Event::InitDone) => {
@@ -275,12 +394,12 @@ where
             }
             Ok(watcher::Event::Apply(object)) => {
                 let mut objects = objects.write().unwrap();
-                objects.items.insert(object.name_any(), Arc::new(object));
+                objects.items.apply(object);
                 recovered(&mut objects, &kind);
             }
             Ok(watcher::Event::Delete(object)) => {
                 let mut objects = objects.write().unwrap();
-                objects.items.remove(&object.name_any());
+                objects.items.delete(&object);
                 recovered(&mut objects, &kind);
             }
             Err(err) => {
@@ -502,6 +621,78 @@ mod tests {
         assert_eq!(cache.target("web", 80), Target::ServiceNotFound);
         assert_eq!(cache.endpoints("web", 80), Err(Target::ServiceNotFound));
         assert_eq!(cache.target("api", 8080), Target::PortNotOnService);
+    }
+
+    /// Watch events change what the cache keeps per service: a slice that
+    /// changes, moves to another service or goes, and a service that goes.
+    #[test]
+    fn events_update_the_slices_of_each_service() {
+        let cache = NamespaceCache::listed(
+            "shop",
+            vec![
+                service("api", &[("http", 80)]),
+                service("web", &[("http", 80)]),
+            ],
+            vec![slice(
+                "shared",
+                "api",
+                &[("http", 8080)],
+                &[("api-0", Some(true))],
+            )],
+        );
+        let apply = |slice: EndpointSlice| cache.slices.write().unwrap().items.apply(slice);
+        assert_eq!(cache.target("api", 80), ready_pods(1, 1));
+
+        apply(slice(
+            "shared",
+            "api",
+            &[("http", 8080)],
+            &[("api-0", Some(false)), ("api-1", Some(true))],
+        ));
+        assert_eq!(
+            cache.endpoints("api", 80),
+            Ok(vec![endpoint("api-1", 8080)])
+        );
+        assert_eq!(cache.target("api", 80), ready_pods(1, 2));
+
+        apply(slice(
+            "shared",
+            "web",
+            &[("http", 8080)],
+            &[("web-0", Some(true))],
+        ));
+        assert_eq!(cache.target("api", 80), ready_pods(0, 0));
+        assert_eq!(cache.target("web", 80), ready_pods(1, 1));
+
+        // Without the label it belongs to no service.
+        let mut unlabelled = slice("shared", "web", &[("http", 8080)], &[("web-0", Some(true))]);
+        unlabelled.metadata.labels = None;
+        apply(unlabelled.clone());
+        assert_eq!(cache.target("web", 80), ready_pods(0, 0));
+
+        // A deleted slice goes by its name, whatever its labels say.
+        apply(slice(
+            "shared",
+            "web",
+            &[("http", 8080)],
+            &[("web-0", Some(true))],
+        ));
+        cache.slices.write().unwrap().items.delete(&unlabelled);
+        assert_eq!(cache.target("web", 80), ready_pods(0, 0));
+        {
+            let slices = cache.slices.read().unwrap();
+            assert!(slices.items.by_service.is_empty());
+            assert!(slices.items.service_of.is_empty());
+        }
+
+        cache
+            .services
+            .write()
+            .unwrap()
+            .items
+            .delete(&service("web", &[]));
+        assert_eq!(cache.target("web", 80), Target::ServiceNotFound);
+        assert_eq!(cache.target("api", 80), ready_pods(0, 0));
     }
 
     #[test]

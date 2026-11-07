@@ -320,7 +320,9 @@ credentials.
 
 **Watches.** The actor watches EndpointSlices and Services per namespace, only for
 namespaces with enabled forwards. The watches are reference-counted and start and
-stop as forwards are enabled and disabled.
+stop as forwards are enabled and disabled. The cache keeps only what lookups need:
+the ports of each Service, and the ports and pods of each EndpointSlice, grouped by
+service, so a lookup reads only the forwarded service's slices.
 
 A watch that fails after its first listing keeps what it listed, and the watcher
 retries with backoff. A 403 still shows on the namespace's forwards, as
@@ -1015,7 +1017,8 @@ changed`.
     per-namespace fallback; the error classification with the errors kube-rs,
     hyper-util and rustls really return;
   - the watch cache's lookup over hand-built Services and EndpointSlices
-    (several slices, dual stack, unknown readiness, named target ports), its
+    (several slices, dual stack, unknown readiness, named target ports, slices
+    that change, move to another service or go), its
     watch against the fake API server (a 403 after the first listing that
     shows until the next event), and
     the forward actor through a fake kubelet: pod choice and the move to
