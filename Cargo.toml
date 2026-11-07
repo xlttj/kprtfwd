@@ -16,7 +16,6 @@ kprtfwd-daemon = { path = "crates/daemon" }
 kprtfwd-cli = { path = "crates/cli" }
 kprtfwd-tui = { path = "crates/tui" }
 anyhow = "1.0.104"
-bytes = "1"
 clap = { version = "4.6.7", features = ["derive"] }
 futures = "0.3"
 jiff = "0.2"

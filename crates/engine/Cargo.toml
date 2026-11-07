@@ -8,7 +8,6 @@ repository.workspace = true
 
 [dependencies]
 kprtfwd-core.workspace = true
-bytes.workspace = true
 futures.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
