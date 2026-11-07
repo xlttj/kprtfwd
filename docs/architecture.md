@@ -832,7 +832,10 @@ together, then `p`:
 | `u` | set the project's members to the listed forwards |
 | `x` | delete the project (asks; its forwards stay) |
 
-`@name` works in every filter, also in `kprtfwd up @shop`.
+`@name` works in every filter, also in `kprtfwd up @shop`. Project names
+have no whitespace, so `@name` is always one word of the filter; v1 allowed
+spaces, and such a project can still be switched and deleted, but its members
+are not saved under that name again.
 
 There is no grouping and no collapsing. v1 grouped by context or service type;
 with the context as a column and a filter over everything, groups only add keys.

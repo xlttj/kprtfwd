@@ -38,16 +38,17 @@ pub fn validate_settings(settings: &ForwardSettings) -> Result<(), ValidationErr
 }
 
 pub fn validate_project(project: &Project) -> Result<(), ValidationError> {
-    if project.name.trim().is_empty() {
+    validate_project_name(&project.name)
+}
+
+/// One word: the filter splits on whitespace, so `@my shop` could never
+/// select a project named "my shop". v1 allowed spaces; such names stay
+/// readable, but are not written again.
+pub fn validate_project_name(name: &str) -> Result<(), ValidationError> {
+    if name.trim().is_empty() {
         return Err(ValidationError::Empty("project name"));
     }
-    if project.name.chars().any(char::is_control) {
-        return Err(ValidationError::InvalidCharacters {
-            field: "project name",
-            value: project.name.clone(),
-        });
-    }
-    Ok(())
+    validate_text("project name", name)
 }
 
 /// Non-empty, without whitespace or control characters. Used for IDs and
@@ -222,5 +223,28 @@ mod tests {
             forwards: vec![],
         };
         assert_eq!(validate_project(&p), Ok(()));
+        assert_eq!(validate_project_name("shop-2:eu/web@x"), Ok(()));
+
+        for name in [
+            "my shop",
+            " shop",
+            "shop ",
+            "my\u{a0}shop",
+            "tab\tbed",
+            "bell\u{7}",
+        ] {
+            assert_eq!(
+                validate_project_name(name),
+                Err(ValidationError::InvalidCharacters {
+                    field: "project name",
+                    value: name.into(),
+                }),
+                "{name:?}"
+            );
+        }
+        assert_eq!(
+            validate_project_name("my shop").unwrap_err().to_string(),
+            r#"project name "my shop" contains whitespace or control characters"#
+        );
     }
 }

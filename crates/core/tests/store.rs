@@ -847,6 +847,45 @@ fn projects_replace_members_and_follow_deletes() {
     );
 }
 
+/// `@name` is one word of the filter, so a project name has no whitespace.
+/// v1 allowed it: such a project stays readable and can be deleted, but
+/// its members are not written under that name again.
+#[test]
+fn project_names_have_no_whitespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = v1_database(dir.path());
+    v1_create_project(
+        &mut v1_connection(&path),
+        "my shop",
+        &["staging.mysql.shop"],
+    );
+    let mut store = Store::open(&path).unwrap();
+    let spaced = Project {
+        name: "my shop".into(),
+        forwards: vec![id("staging.mysql.shop")],
+    };
+    assert!(store.projects().unwrap().contains(&spaced));
+
+    for name in ["my shop", "new shop"] {
+        let result = store.upsert_project(&Project {
+            name: name.into(),
+            forwards: vec![],
+        });
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::Invalid(ValidationError::InvalidCharacters {
+                    field: "project name",
+                    ..
+                }))
+            ),
+            "{name}: {result:?}"
+        );
+    }
+    assert!(store.projects().unwrap().contains(&spaced), "unchanged");
+    assert!(store.delete_project("my shop").unwrap());
+}
+
 #[test]
 fn paused_round_trip() {
     let mut store = Store::in_memory().unwrap();
