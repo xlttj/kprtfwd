@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use kprtfwd_core::naming::forward_id;
 use kprtfwd_core::svctype::{ServiceType, classify};
-use kprtfwd_core::validate::validate_settings;
+use kprtfwd_core::validate::{validate_project_name, validate_settings};
 use kprtfwd_core::{Forward, ForwardId, ForwardSettings, Project, filter};
 use kprtfwd_proto::{DiscoveredPort, EventEntry, ForwardView, Request, Snapshot};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -123,8 +123,7 @@ pub enum Mode {
     Filter,
     Projects {
         selected: usize,
-        /// The name of a new project being typed.
-        naming: Option<String>,
+        naming: Option<Naming>,
     },
     Form(Form),
     Discovery(Discovery),
@@ -140,6 +139,19 @@ pub enum Mode {
         cmd: Cmd,
     },
     Help,
+}
+
+/// A project name being typed.
+pub struct Naming {
+    pub name: String,
+    /// The project being renamed; `None` for a new one.
+    pub renaming: Option<String>,
+}
+
+/// Whether a project's name, from v1, cannot be written again: it has
+/// spaces, so `@name` cannot select it.
+pub fn needs_rename(name: &str) -> bool {
+    validate_project_name(name).is_err()
 }
 
 pub const FORM_LABELS: [&str; 5] = [
@@ -687,50 +699,49 @@ impl App {
         Vec::new()
     }
 
-    fn projects_key(&mut self, key: KeyEvent, selected: usize, naming: Option<String>) -> Vec<Cmd> {
-        let listed = self.listed();
-        let projects = &self.snapshot.projects;
-
-        if let Some(mut name) = naming {
-            match plain(key) {
-                KeyCode::Esc => {}
-                KeyCode::Enter if !name.trim().is_empty() => {
-                    let name = name.trim().to_owned();
-                    self.mode = Mode::Projects {
-                        selected,
-                        naming: None,
-                    };
-                    return vec![Cmd::Request {
-                        success: format!("project {name}: {} forwards", listed.len()),
-                        request: Request::UpsertProject {
-                            project: Project {
-                                name,
-                                forwards: listed,
-                            },
-                        },
-                    }];
-                }
-                _ => {
-                    edit(&mut name, key, |_| true);
-                    self.mode = Mode::Projects {
-                        selected,
-                        naming: Some(name),
-                    };
-                    return Vec::new();
-                }
-            }
-            self.mode = Mode::Projects {
-                selected,
-                naming: None,
-            };
-            return Vec::new();
-        }
-
-        let last = projects.len().saturating_sub(1);
+    fn projects_key(&mut self, key: KeyEvent, selected: usize, naming: Option<Naming>) -> Vec<Cmd> {
         let stay = |selected| Mode::Projects {
             selected,
             naming: None,
         };
+        if let Some(mut naming) = naming {
+            match plain(key) {
+                KeyCode::Esc => self.mode = stay(selected),
+                KeyCode::Enter if !naming.name.trim().is_empty() => {
+                    let name = naming.name.trim().to_owned();
+                    let saved = match &naming.renaming {
+                        None => self.new_project(name),
+                        Some(old) => self.rename_project(old, name),
+                    };
+                    match saved {
+                        Ok(cmds) => {
+                            self.mode = stay(selected);
+                            return cmds;
+                        }
+                        // The line stays, so the name can be corrected.
+                        Err(err) => {
+                            self.error(err);
+                            self.mode = Mode::Projects {
+                                selected,
+                                naming: Some(naming),
+                            };
+                        }
+                    }
+                }
+                _ => {
+                    edit(&mut naming.name, key, |_| true);
+                    self.mode = Mode::Projects {
+                        selected,
+                        naming: Some(naming),
+                    };
+                }
+            }
+            return Vec::new();
+        }
+
+        let listed = self.listed();
+        let projects = &self.snapshot.projects;
+        let last = projects.len().saturating_sub(1);
         let name = projects.get(selected).map(|p| p.name.clone());
         match (plain(key), name) {
             (KeyCode::Esc | KeyCode::Char('q' | 'p'), _) => return Vec::new(),
@@ -739,7 +750,19 @@ impl App {
             (KeyCode::Char('n'), _) => {
                 self.mode = Mode::Projects {
                     selected,
-                    naming: Some(String::new()),
+                    naming: Some(Naming {
+                        name: String::new(),
+                        renaming: None,
+                    }),
+                };
+            }
+            (KeyCode::Char('r'), Some(name)) => {
+                self.mode = Mode::Projects {
+                    selected,
+                    naming: Some(Naming {
+                        name: name.clone(),
+                        renaming: Some(name),
+                    }),
                 };
             }
             (KeyCode::Enter, Some(name)) => {
@@ -770,11 +793,22 @@ impl App {
                 }];
             }
             (KeyCode::Char('f'), Some(name)) => {
-                self.filter = format!("@{name}");
-                self.keep_selection();
+                if needs_rename(&name) {
+                    self.error(format!(
+                        "@ cannot select {name:?}, a name with spaces; r renames it"
+                    ));
+                    self.mode = stay(selected);
+                } else {
+                    self.filter = format!("@{name}");
+                    self.keep_selection();
+                }
             }
             (KeyCode::Char('u'), Some(name)) => {
                 self.mode = stay(selected);
+                if let Err(err) = validate_project_name(&name) {
+                    self.error(format!("{err}; r renames it"));
+                    return Vec::new();
+                }
                 return vec![Cmd::Request {
                     success: format!("project {name}: {} forwards", listed.len()),
                     request: Request::UpsertProject {
@@ -797,6 +831,41 @@ impl App {
             _ => self.mode = stay(selected),
         }
         Vec::new()
+    }
+
+    /// What `n` sends: a new project of the listed forwards, or what is
+    /// wrong with its name.
+    fn new_project(&self, name: String) -> Result<Vec<Cmd>, String> {
+        validate_project_name(&name).map_err(|err| err.to_string())?;
+        let listed = self.listed();
+        Ok(vec![Cmd::Request {
+            success: format!("project {name}: {} forwards", listed.len()),
+            request: Request::UpsertProject {
+                project: Project {
+                    name,
+                    forwards: listed,
+                },
+            },
+        }])
+    }
+
+    /// What `r` sends: nothing for the same name, else the rename, or what
+    /// is wrong with the new name.
+    fn rename_project(&self, name: &str, to: String) -> Result<Vec<Cmd>, String> {
+        if to == name {
+            return Ok(Vec::new());
+        }
+        validate_project_name(&to).map_err(|err| err.to_string())?;
+        if self.snapshot.projects.iter().any(|p| p.name == to) {
+            return Err(format!("project {to} already exists"));
+        }
+        Ok(vec![Cmd::Request {
+            success: format!("renamed project {name} to {to}"),
+            request: Request::RenameProject {
+                name: name.to_owned(),
+                to,
+            },
+        }])
     }
 
     fn form_key(&mut self, key: KeyEvent, mut form: Form) -> Vec<Cmd> {
@@ -1746,7 +1815,9 @@ pub(crate) mod tests {
         app.update(key(KeyCode::Char('n')));
         type_text(&mut app, "apix");
         app.update(key(KeyCode::Backspace));
-        assert!(matches!(&app.mode, Mode::Projects { naming: Some(name), .. } if name == "api"));
+        assert!(
+            matches!(&app.mode, Mode::Projects { naming: Some(Naming { name, .. }), .. } if name == "api")
+        );
         // A blank name is not saved.
         let mut blank = App::new(snapshot());
         blank.update(key(KeyCode::Char('p')));
@@ -1758,6 +1829,78 @@ pub(crate) mod tests {
         assert!(matches!(app.mode, Mode::Projects { naming: None, .. }));
         app.update(key(KeyCode::Esc));
         assert!(matches!(app.mode, Mode::List));
+    }
+
+    /// The filter splits on whitespace, so a project name has none. A v1
+    /// project with spaces gets a hint, and r renames it.
+    #[test]
+    fn names_with_spaces_are_refused_and_old_ones_renamed() {
+        let mut app = App::new(snapshot());
+        app.update(key(KeyCode::Char('p')));
+        app.update(key(KeyCode::Char('n')));
+        type_text(&mut app, "my shop");
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        let refused = r#"project name "my shop" contains whitespace or control characters"#;
+        assert_eq!(message(&app), (refused, true));
+        assert!(
+            matches!(&app.mode, Mode::Projects { naming: Some(Naming { name, renaming: None }), .. } if name == "my shop"),
+            "the line stays for a correction"
+        );
+        app.update(key(KeyCode::Esc));
+
+        let mut old = snapshot();
+        old.projects.push(ProjectView {
+            name: "my shop".into(),
+            forwards: vec![ForwardId::new("stg-db")],
+            enabled: 0,
+        });
+        app.update(Msg::Snapshot(old));
+        app.update(key(KeyCode::Char('j')));
+        assert!(app.update(key(KeyCode::Char('u'))).is_empty());
+        assert_eq!(message(&app), (&*format!("{refused}; r renames it"), true));
+        assert!(app.update(key(KeyCode::Char('f'))).is_empty());
+        assert_eq!(
+            message(&app),
+            (
+                r#"@ cannot select "my shop", a name with spaces; r renames it"#,
+                true
+            )
+        );
+        assert_eq!(app.filter, "");
+        assert!(matches!(
+            app.mode,
+            Mode::Projects {
+                selected: 1,
+                naming: None
+            }
+        ));
+
+        // r starts from the old name.
+        app.update(key(KeyCode::Char('r')));
+        assert!(matches!(
+            &app.mode,
+            Mode::Projects { naming: Some(Naming { name, renaming: Some(old) }), .. }
+                if name == "my shop" && old == "my shop"
+        ));
+        // Unchanged, nothing is sent.
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        assert!(matches!(app.mode, Mode::Projects { naming: None, .. }));
+        // Not to another project's name.
+        app.update(key(KeyCode::Char('r')));
+        app.update(ctrl_key('u'));
+        type_text(&mut app, "web");
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        assert_eq!(message(&app), ("project web already exists", true));
+        app.update(ctrl_key('u'));
+        type_text(&mut app, "my-shop");
+        assert_eq!(
+            requested(&app.update(key(KeyCode::Enter))),
+            [Request::RenameProject {
+                name: "my shop".into(),
+                to: "my-shop".into(),
+            }]
+        );
+        assert!(matches!(app.mode, Mode::Projects { naming: None, .. }));
     }
 
     #[test]
@@ -2021,7 +2164,9 @@ pub(crate) mod tests {
         app.update(key(KeyCode::Char('n')));
         type_text(&mut app, "web shop");
         app.update(ctrl_key('w'));
-        assert!(matches!(&app.mode, Mode::Projects { naming: Some(name), .. } if name == "web "));
+        assert!(
+            matches!(&app.mode, Mode::Projects { naming: Some(Naming { name, .. }), .. } if name == "web ")
+        );
         app.update(key(KeyCode::Esc));
         app.update(key(KeyCode::Esc));
 

@@ -12,7 +12,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Row, Table, TableState};
 
-use crate::app::{App, Discovery, FORM_LABELS, Mode, Services, Shown};
+use crate::app::{App, Discovery, FORM_LABELS, Mode, Naming, Services, Shown, needs_rename};
 
 const KEYS: &str =
     "space on/off · / filter · +/- all listed · p projects · o open · y copy · ? keys";
@@ -66,7 +66,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match &app.mode {
         Mode::List | Mode::Filter => {}
         Mode::Projects { selected, naming } => {
-            draw_projects(frame, app, *selected, naming.as_deref())
+            draw_projects(frame, app, *selected, naming.as_ref())
         }
         Mode::Form(form) => {
             let title = if form.editing.is_some() {
@@ -373,14 +373,17 @@ fn draw_events(frame: &mut Frame, app: &App, id: &ForwardId, entries: &[EventEnt
     boxed(frame, area, &format!(" events: {id} "), lines);
 }
 
-fn draw_projects(frame: &mut Frame, app: &App, selected: usize, naming: Option<&str>) {
+fn draw_projects(frame: &mut Frame, app: &App, selected: usize, naming: Option<&Naming>) {
     let mut items: Vec<Line> = app
         .snapshot
         .projects
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            let text = format!("{:<24} {}/{}", p.name, p.enabled, p.forwards.len());
+            let mut text = format!("{:<24} {}/{}", p.name, p.enabled, p.forwards.len());
+            if needs_rename(&p.name) {
+                text.push_str("  has spaces: r renames it");
+            }
             if i == selected && naming.is_none() {
                 Line::styled(text, Style::new().add_modifier(Modifier::REVERSED))
             } else {
@@ -393,20 +396,30 @@ fn draw_projects(frame: &mut Frame, app: &App, selected: usize, naming: Option<&
     }
     let mut footer = vec![Line::raw("")];
     match naming {
-        Some(name) => {
+        Some(Naming {
+            name,
+            renaming: None,
+        }) => {
             let listed = app.visible().len();
             footer.push(Line::raw(format!(
                 "new project with the {listed} listed forwards: {name}_"
             )));
             footer.push(Line::styled("enter create · esc cancel", dim()));
         }
+        Some(Naming {
+            name,
+            renaming: Some(old),
+        }) => {
+            footer.push(Line::raw(format!("rename {old} to: {name}_")));
+            footer.push(Line::styled("enter rename · esc cancel", dim()));
+        }
         None => {
             footer.push(Line::styled(
-                "enter on · - off · s switch to · f show members",
+                "enter on · - off · s switch to · f show members · esc back",
                 dim(),
             ));
             footer.push(Line::styled(
-                "n new from list · u set to list · x delete · esc back",
+                "n new from list · u set to list · r rename · x delete",
                 dim(),
             ));
         }
@@ -662,7 +675,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 mod tests {
     use super::*;
     use crate::app::tests::{events, key, port, snapshot, view};
-    use crate::app::{Candidate, Msg};
+    use crate::app::{Candidate, Msg, Naming};
     use kprtfwd_proto::ContextView;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -999,6 +1012,42 @@ mod tests {
         let screen = render(&app, 100, 20);
         assert!(position(&screen, "project-29").1 < position(&screen, "x delete").1);
         assert!(!screen.iter().any(|line| line.contains("project-00")));
+    }
+
+    #[test]
+    fn a_project_name_with_spaces_gets_a_hint_and_r_names_the_old_name() {
+        let mut app = App::new(snapshot());
+        app.snapshot.projects.push(kprtfwd_proto::ProjectView {
+            name: "my shop".into(),
+            forwards: Vec::new(),
+            enabled: 0,
+        });
+        app.mode = Mode::Projects {
+            selected: 0,
+            naming: None,
+        };
+        let screen = render(&app, 100, 20);
+        let row = |screen: &[String], text: &str| {
+            screen
+                .iter()
+                .find(|line| line.contains(text))
+                .cloned()
+                .unwrap_or_else(|| panic!("no {text:?} in {screen:?}"))
+        };
+        assert!(row(&screen, "my shop").contains("0/0  has spaces: r renames it"));
+        assert!(!row(&screen, "web ").contains("has spaces"));
+        assert!(row(&screen, "u set to list").contains("r rename"));
+
+        app.mode = Mode::Projects {
+            selected: 1,
+            naming: Some(Naming {
+                name: "my-shop".into(),
+                renaming: Some("my shop".into()),
+            }),
+        };
+        let screen = render(&app, 100, 20);
+        row(&screen, "rename my shop to: my-shop_");
+        row(&screen, "enter rename · esc cancel");
     }
 
     #[test]

@@ -37,6 +37,8 @@ pub enum StoreError {
     UnknownForward(ForwardId),
     #[error("forward {0} already exists")]
     ForwardExists(ForwardId),
+    #[error("project {0} already exists")]
+    ProjectExists(String),
     #[error("forward {id}: {field} {value} is not a valid port")]
     BadPort {
         id: ForwardId,
@@ -370,6 +372,22 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Gives a project another name, which must be valid and free; its
+    /// members stay. Returns whether it existed.
+    pub fn rename_project(&mut self, name: &str, to: &str) -> Result<bool> {
+        validate::validate_project_name(to)?;
+        let tx = self.conn.transaction()?;
+        let taken = tx
+            .prepare("SELECT 1 FROM projects WHERE name = ?1")?
+            .exists([to])?;
+        if taken && to != name {
+            return Err(StoreError::ProjectExists(to.to_owned()));
+        }
+        let renamed = tx.execute("UPDATE projects SET name = ?2 WHERE name = ?1", [name, to])?;
+        tx.commit()?;
+        Ok(renamed > 0)
     }
 
     /// Deletes the project; its forwards stay. Returns whether it existed.

@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 pub use client::{Client, ClientError, connect_or_start, spawn_daemon, stop_daemon};
 
 /// Bumped on every incompatible change to the messages.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// This kprtfwd's version, which a client sends in its hello.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -112,6 +112,11 @@ pub enum Request {
     /// Creates a project or replaces its members.
     UpsertProject {
         project: Project,
+    },
+    /// Gives a project another name; its members stay.
+    RenameProject {
+        name: String,
+        to: String,
     },
     DeleteProject {
         name: String,
@@ -400,6 +405,10 @@ mod tests {
                     name: "shop".into(),
                     forwards: vec![id()],
                 },
+            },
+            Request::RenameProject {
+                name: "my shop".into(),
+                to: "shop".into(),
             },
             Request::DeleteProject {
                 name: "shop".into(),

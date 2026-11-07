@@ -886,6 +886,56 @@ fn project_names_have_no_whitespace() {
     assert!(store.delete_project("my shop").unwrap());
 }
 
+/// A project from v1 whose name has spaces gets a new name; its members
+/// stay, and v1 reads it under the new name.
+#[test]
+fn renaming_a_project_keeps_its_members() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = v1_database(dir.path());
+    v1_create_project(
+        &mut v1_connection(&path),
+        "my shop",
+        &["staging.mysql.shop"],
+    );
+    let mut store = Store::open(&path).unwrap();
+    assert!(store.rename_project("my shop", "my-shop").unwrap());
+    let projects = store.projects().unwrap();
+    assert!(
+        projects.contains(&Project {
+            name: "my-shop".into(),
+            forwards: vec![id("staging.mysql.shop")],
+        }),
+        "{projects:?}"
+    );
+    assert!(!projects.iter().any(|p| p.name == "my shop"));
+
+    assert!(store.rename_project("my-shop", "my-shop").unwrap());
+    assert!(!store.rename_project("gone", "other").unwrap());
+    let taken = store.rename_project("my-shop", "shop");
+    assert!(
+        matches!(&taken, Err(StoreError::ProjectExists(name)) if name == "shop"),
+        "{taken:?}"
+    );
+    assert_eq!(
+        taken.unwrap_err().to_string(),
+        "project shop already exists"
+    );
+    assert!(matches!(
+        store.rename_project("my-shop", "my shop"),
+        Err(StoreError::Invalid(
+            ValidationError::InvalidCharacters { .. }
+        ))
+    ));
+    assert_eq!(store.projects().unwrap(), projects, "unchanged");
+    drop(store);
+
+    let names: Vec<String> = v1_projects(&v1_connection(&path))
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(names, ["empty", "my-shop", "shop"]);
+}
+
 #[test]
 fn paused_round_trip() {
     let mut store = Store::in_memory().unwrap();

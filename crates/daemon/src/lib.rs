@@ -750,6 +750,13 @@ impl Daemon {
                 info!(project = %project.name, members = project.forwards.len(), "project saved");
                 return Ok(Response::Done);
             }
+            Request::RenameProject { name, to } => {
+                if !self.store.rename_project(&name, &to).map_err(text)? {
+                    return Err(format!("no project named {name:?}"));
+                }
+                info!(project = %name, %to, "project renamed");
+                return Ok(Response::Done);
+            }
             Request::DeleteProject { name } => {
                 if !self.store.delete_project(&name).map_err(text)? {
                     return Err(format!("no project named {name:?}"));

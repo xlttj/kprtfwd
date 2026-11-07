@@ -639,6 +639,7 @@ enum Request {
     EditForward { id: ForwardId, settings: ForwardSettings },   // all but ID and enabled flag
     DeleteForward { id: ForwardId },
     UpsertProject { project: Project },
+    RenameProject { name: String, to: String },
     DeleteProject { name: String },
     ListContexts,
     Discover { context: String, namespace_filter: String },
@@ -830,12 +831,16 @@ together, then `p`:
 | `f` | show its members: sets the filter to `@name` |
 | `n` | new project from the listed forwards |
 | `u` | set the project's members to the listed forwards |
+| `r` | rename the project |
 | `x` | delete the project (asks; its forwards stay) |
 
 `@name` works in every filter, also in `kprtfwd up @shop`. Project names
-have no whitespace, so `@name` is always one word of the filter; v1 allowed
-spaces, and such a project can still be switched and deleted, but its members
-are not saved under that name again.
+have no whitespace, so `@name` is always one word of the filter: `n` and `r`
+refuse a name with spaces and say why, and the line stays open for a
+correction. v1 allowed spaces; such a project can still be switched and
+deleted, but its members are not saved under that name again. The list
+marks it with `has spaces: r renames it`, and `u` and `f` refuse it with the
+same hint.
 
 There is no grouping and no collapsing. v1 grouped by context or service type;
 with the context as a column and a filter over everything, groups only add keys.
