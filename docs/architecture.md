@@ -322,6 +322,15 @@ credentials.
 namespaces with enabled forwards. The watches are reference-counted and start and
 stop as forwards are enabled and disabled.
 
+A watch that fails after its first listing keeps what it listed, and the watcher
+retries with backoff. A 403 still shows on the namespace's forwards, as
+`Misconfigured(Forbidden)`: it does not pass by itself and the probe does not see
+it, so the forward would look ready on pods that may be gone. Other failures are
+only logged; an outage shows through the probe. A failure is logged once and ends
+with the next event the watch receives. A watch that resumes where it was sends
+one only when something changes; a new listing (after a 410, on recovery or on a
+manual reconnect) ends it too.
+
 **On recovery** (unhealthy to healthy):
 
 1. Restart all watches, because a silently dropped watch can stay stale for up to
@@ -507,6 +516,7 @@ and bind attempts. The derivation is table-tested in `core`.
 | context not `Healthy` | `WaitingForContext` |
 | service missing, or port not on service | `Misconfigured` (re-evaluated on Service watch events) |
 | port-forward rejected with 403 | `Misconfigured(Forbidden)` (re-evaluated on recovery or a manual reconnect) |
+| watch of Services or EndpointSlices rejected with 403 | `Misconfigured(Forbidden)` (until the watch receives an event or lists again) |
 | no ready endpoint | `WaitingForPods` |
 | otherwise | `Ready` |
 
@@ -1005,7 +1015,9 @@ changed`.
     per-namespace fallback; the error classification with the errors kube-rs,
     hyper-util and rustls really return;
   - the watch cache's lookup over hand-built Services and EndpointSlices
-    (several slices, dual stack, unknown readiness, named target ports), and
+    (several slices, dual stack, unknown readiness, named target ports), its
+    watch against the fake API server (a 403 after the first listing that
+    shows until the next event), and
     the forward actor through a fake kubelet: pod choice and the move to
     another pod, connections closed at once while not ready, open connections
     closed once the context is unreachable but not while it logs in, a refused

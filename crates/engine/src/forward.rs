@@ -1142,8 +1142,10 @@ mod tests {
         let forbidden = Arc::new(AtomicBool::new(true));
         let reply = {
             let forbidden = forbidden.clone();
-            move |_: &fake::Request| {
-                if forbidden.load(Ordering::Relaxed) {
+            // Only port-forwards: the watches that a recovery restarts
+            // would show a 403 of their own.
+            move |request: &fake::Request| {
+                if forbidden.load(Ordering::Relaxed) && request.port_forward().is_some() {
                     Reply::Json(403, status(403, "pods \"db-0\" is forbidden"))
                 } else {
                     Reply::Kubelet(Kubelet::Echo)
@@ -1185,8 +1187,10 @@ mod tests {
         let forbidden = Arc::new(AtomicBool::new(false));
         let reply = {
             let forbidden = forbidden.clone();
-            move |_: &fake::Request| {
-                if forbidden.load(Ordering::Relaxed) {
+            // Only port-forwards: the watches that a recovery restarts
+            // would show a 403 of their own.
+            move |request: &fake::Request| {
+                if forbidden.load(Ordering::Relaxed) && request.port_forward().is_some() {
                     Reply::Json(403, status(403, "pods \"web-0\" is forbidden"))
                 } else {
                     Reply::Kubelet(Kubelet::Echo)

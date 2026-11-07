@@ -15,7 +15,7 @@ use kube::runtime::{WatchStreamExt, watcher};
 use kube::{Api, Client, Resource, ResourceExt};
 use serde::de::DeserializeOwned;
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
 use crate::errors::{Failure, classify};
 
@@ -27,7 +27,7 @@ struct Objects<K> {
     /// The first full listing has arrived.
     ready: bool,
     items: HashMap<String, Arc<K>>,
-    /// The last watch error, cleared by the next successful listing.
+    /// The last watch error, cleared by the next event that arrives.
     error: Option<Failure>,
 }
 
@@ -219,19 +219,31 @@ fn count(n: usize) -> u16 {
     u16::try_from(n).unwrap_or(u16::MAX)
 }
 
-/// Fails with the reason the objects cannot be used yet.
+/// Fails with the reason the objects cannot be used.
+///
+/// A 403 counts after the first listing too: it does not pass by itself, and
+/// the context's probe does not see it, so the objects would go stale while
+/// the forward looks ready. Other failures of a listed watch keep what it
+/// has; the probe shows an outage, and the watcher retries the rest.
 fn check<K>(objects: &Objects<K>) -> Result<(), Target> {
-    if objects.ready {
-        return Ok(());
-    }
     match &objects.error {
         Some(Failure::Forbidden(message)) => Err(Target::Forbidden(message.clone())),
+        _ if objects.ready => Ok(()),
         _ => Err(Target::Syncing),
     }
 }
 
+/// Clears the error of `objects` once an event arrived.
+fn recovered<K>(objects: &mut Objects<K>, kind: &str) {
+    if objects.error.take().is_some() {
+        info!(%kind, "watch recovered");
+    }
+}
+
 /// Feeds watch events of one kind into `objects` until aborted. The watcher
-/// retries with backoff on its own.
+/// retries with backoff on its own: a failed listing with a new listing, a
+/// failed watch with a new watch from where it was, which shows only with
+/// the next event.
 async fn watch<K>(api: Api<K>, objects: Shared<K>)
 where
     K: Resource<DynamicType = ()>
@@ -259,24 +271,22 @@ where
                 let mut objects = objects.write().unwrap();
                 objects.items = listing.take().unwrap_or_default();
                 objects.ready = true;
-                if objects.error.take().is_some() {
-                    debug!(%kind, "watch recovered");
-                }
+                recovered(&mut objects, &kind);
             }
             Ok(watcher::Event::Apply(object)) => {
-                let name = object.name_any();
-                objects
-                    .write()
-                    .unwrap()
-                    .items
-                    .insert(name, Arc::new(object));
+                let mut objects = objects.write().unwrap();
+                objects.items.insert(object.name_any(), Arc::new(object));
+                recovered(&mut objects, &kind);
             }
             Ok(watcher::Event::Delete(object)) => {
-                objects.write().unwrap().items.remove(&object.name_any());
+                let mut objects = objects.write().unwrap();
+                objects.items.remove(&object.name_any());
+                recovered(&mut objects, &kind);
             }
             Err(err) => {
                 let failure = classify(&err);
                 let mut objects = objects.write().unwrap();
+                // Once per failure, until an event ends it.
                 if objects.error.as_ref() != Some(&failure) {
                     warn!(%kind, error = %err, "watch failed");
                 }
@@ -288,11 +298,15 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
     use kprtfwd_core::state::NetCause;
     use serde_json::json;
+    use tokio::sync::Barrier;
 
     use super::*;
-    use crate::fake::{service, slice};
+    use crate::fake::{FakeApi, Reply, list, service, slice, status};
 
     fn endpoint(pod: &str, port: u16) -> Endpoint {
         Endpoint {
@@ -514,14 +528,114 @@ mod tests {
             Err(Target::Forbidden("no slices".into()))
         );
 
-        // A failed watch after the first listing keeps what was listed.
+        // After the first listing, a watch that fails for a while keeps
+        // what was listed; the context's probe shows an outage.
         cache.set_slices(vec![slice(
             "api",
             "api",
             &[("http", 8080)],
             &[("api-0", Some(true))],
         )]);
+        for failure in [
+            Failure::Net(NetCause::Timeout),
+            Failure::Other("500 Internal Server Error".into()),
+        ] {
+            cache.slices.write().unwrap().error = Some(failure);
+            assert_eq!(cache.target("api", 80), ready_pods(1, 1));
+        }
+        // A 403 does not pass, so the listing would only go stale.
         cache.slices.write().unwrap().error = Some(Failure::Forbidden("no slices".into()));
-        assert_eq!(cache.target("api", 80), ready_pods(1, 1));
+        assert_eq!(
+            cache.target("api", 80),
+            Target::Forbidden("no slices".into())
+        );
+        cache.services.write().unwrap().error = Some(Failure::Forbidden("no services".into()));
+        assert_eq!(
+            cache.endpoints("api", 80),
+            Err(Target::Forbidden("no services".into()))
+        );
+    }
+
+    /// Waits until `cache` shows `want` for the service port `api:80`.
+    async fn wait_for_target(cache: &NamespaceCache, want: &Target) {
+        let started = Instant::now();
+        while cache.target("api", 80) != *want {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "not {want:?}: {:?}",
+                cache.target("api", 80)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A request the fake API server never answers, like a watch without
+    /// events.
+    fn quiet() -> Reply {
+        Reply::Gated(
+            Arc::new(Barrier::new(2)),
+            Box::new(Reply::Json(200, String::new())),
+        )
+    }
+
+    /// The watch of EndpointSlices is forbidden after the first listing,
+    /// e.g. by an RBAC change, and allowed again later. The forward shows
+    /// the 403 until the next event, which a watch that resumes where it was
+    /// sends only once something changed; it is no longer ready on what may
+    /// be gone.
+    #[tokio::test]
+    async fn a_watch_forbidden_after_the_listing_shows_until_the_next_event() {
+        let forbidden = Arc::new(AtomicBool::new(true));
+        let events = Arc::new(AtomicUsize::new(0));
+        let api = FakeApi::start({
+            let forbidden = forbidden.clone();
+            let events = events.clone();
+            move |request| {
+                let watching = request.query.contains("watch=true");
+                let slices = request.path.ends_with("/endpointslices");
+                match (slices, watching) {
+                    (false, false) => {
+                        let api = serde_json::to_value(service("api", &[("http", 80)])).unwrap();
+                        Reply::Json(200, list("ServiceList", &[api]))
+                    }
+                    (true, false) => {
+                        let api = slice("api", "api", &[("http", 8080)], &[("api-0", Some(true))]);
+                        let api = serde_json::to_value(api).unwrap();
+                        Reply::Json(200, list("EndpointSliceList", &[api]))
+                    }
+                    (true, true) if forbidden.load(Ordering::SeqCst) => Reply::Json(
+                        403,
+                        status(403, "endpointslices is forbidden: cannot watch"),
+                    ),
+                    // One change since the listing, then nothing.
+                    (true, true) if events.fetch_add(1, Ordering::SeqCst) == 0 => {
+                        let mut api = serde_json::to_value(slice(
+                            "api",
+                            "api",
+                            &[("http", 8080)],
+                            &[("api-1", Some(true)), ("api-2", Some(true))],
+                        ))
+                        .unwrap();
+                        api["metadata"]["resourceVersion"] = json!("2");
+                        let event = json!({"type": "MODIFIED", "object": api});
+                        Reply::Json(200, format!("{event}\n"))
+                    }
+                    _ => quiet(),
+                }
+            }
+        })
+        .await;
+        let cache = NamespaceCache::new("shop");
+        cache.restart(&api.client());
+
+        let denied = Target::Forbidden("endpointslices is forbidden: cannot watch".into());
+        wait_for_target(&cache, &denied).await;
+        assert!(cache.slices.read().unwrap().ready, "listed before");
+        assert_eq!(cache.endpoints("api", 80), Err(denied));
+
+        forbidden.store(false, Ordering::SeqCst);
+        wait_for_target(&cache, &ready_pods(2, 2)).await;
+        assert_eq!(cache.slices.read().unwrap().error, None);
+        cache.stop();
     }
 }
