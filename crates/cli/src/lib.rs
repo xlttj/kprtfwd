@@ -1192,6 +1192,9 @@ mod tests {
             waiting,
             ForwardState::WaitingForContext,
             ForwardState::PortBusy { holder: None },
+            ForwardState::CannotListen {
+                error: "Permission denied (os error 13)".into(),
+            },
         ] {
             assert!(
                 !with(&[(true, ready.clone()), (true, not_ready.clone())]),

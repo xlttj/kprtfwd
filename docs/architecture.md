@@ -388,7 +388,9 @@ There is no setting for this either.
 
 **Port busy.** If binding either address fails with `EADDRINUSE`, the state
 becomes `PortBusy`, with the owning process if it can be found, and the forward
-holds neither address. The actor retries the bind every 5 s. This is local and
+holds neither address. Any other error, such as permission denied for a port
+below 1024 on Linux, makes it `CannotListen` with the error. The actor retries
+the bind every 5 s, as either may pass; the event comes once. This is local and
 cheap, so there is no limit. A port busy at the first attempt is tried again
 after 100 ms before it counts as busy: a process the daemon starts just then
 (`lsof`, an exec plugin) holds copies of the daemon's sockets until it has
@@ -481,6 +483,7 @@ enum ForwardState {
     Paused,                                     // global pause, see 6.6
     Starting,                                   // listener or cache not ready yet
     PortBusy { holder: Option<String> },        // "mysqld (pid 812)", via lsof
+    CannotListen { error: String },             // another bind error
     WaitingForContext,                          // context is not Healthy
     WaitingForPods { ready: u16, total: u16 },  // no ready endpoint
     Misconfigured { problem: Misconfig },       // service or port missing, RBAC
@@ -499,7 +502,8 @@ and bind attempts. The derivation is table-tested in `core`.
 |---|---|
 | forward disabled | `Disabled` |
 | global pause on | `Paused` (listeners closed) |
-| bind failed | `PortBusy` (retry bind every 5 s) |
+| bind failed with `EADDRINUSE` | `PortBusy` (retry bind every 5 s) |
+| bind failed with another error | `CannotListen` (retry bind every 5 s) |
 | context not `Healthy` | `WaitingForContext` |
 | service missing, or port not on service | `Misconfigured` (re-evaluated on Service watch events) |
 | port-forward rejected with 403 | `Misconfigured(Forbidden)` (re-evaluated on recovery or a manual reconnect) |
@@ -948,6 +952,7 @@ These are shown in the INFO column and by `kprtfwd status`.
 | 403 on port-forward | `forbidden: port-forward in namespace X`; kube drops the API server's text there |
 | 403 on a watch | `forbidden: ` and the API server's text, e.g. `forbidden: services is forbidden: User "dev" cannot list resource "services" ...` |
 | `EADDRINUSE` | `port busy: mysqld (pid 812)` |
+| another bind error, e.g. a port below 1024 on Linux | `cannot listen: Permission denied (os error 13)` |
 | service gone | `service not found (prune?)` |
 | no ready endpoints | `0/2 pods ready` |
 | error channel message | the kubelet's text, e.g. `pod refused connection on 3000` |

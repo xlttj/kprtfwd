@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 pub use client::{Client, ClientError, connect_or_start, spawn_daemon, stop_daemon};
 
 /// Bumped on every incompatible change to the messages.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// This kprtfwd's version, which a client sends in its hello.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

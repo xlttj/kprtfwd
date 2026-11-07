@@ -418,27 +418,35 @@ async fn bind(spec: &Forward, shared: &Shared) -> Listeners {
             }
             Err(err) => {
                 first = false;
-                let holder = if err.kind() == std::io::ErrorKind::AddrInUse {
-                    port_holder(port).await
-                } else {
-                    Some(err.to_string())
-                };
-                let busy = Bind::Busy { holder };
+                let (failed, event) = failed_bind(port, &err).await;
                 let mut bind = shared.bind.lock().unwrap();
-                if *bind != busy {
-                    warn!(id = %spec.id, port, ?busy, "cannot listen");
-                    if let Bind::Busy { holder } = &busy {
-                        shared.events.push(match holder {
-                            Some(holder) => format!("port {port} busy: {holder}"),
-                            None => format!("port {port} busy"),
-                        });
-                    }
-                    *bind = busy;
+                if *bind != failed {
+                    warn!(id = %spec.id, port, ?failed, "cannot listen");
+                    shared.events.push(event);
+                    *bind = failed;
                 }
             }
         }
         tokio::time::sleep(BIND_RETRY).await;
     }
+}
+
+/// What a failed bind on `port` shows, and its event: a busy port, with the
+/// process that holds it if `lsof` can tell, or another error as what it is,
+/// e.g. permission denied for a port below 1024 on Linux. Either is tried
+/// again, as it may pass.
+async fn failed_bind(port: u16, err: &std::io::Error) -> (Bind, String) {
+    if err.kind() != std::io::ErrorKind::AddrInUse {
+        let error = err.to_string();
+        let event = format!("cannot listen on port {port}: {error}");
+        return (Bind::Failed { error }, event);
+    }
+    let holder = port_holder(port).await;
+    let event = match &holder {
+        Some(holder) => format!("port {port} busy: {holder}"),
+        None => format!("port {port} busy"),
+    };
+    (Bind::Busy { holder }, event)
 }
 
 /// Listens on the local port on 127.0.0.1 and ::1. A client may resolve
@@ -1366,6 +1374,23 @@ mod tests {
         while api.streams()[0].open {
             assert!(started.elapsed() < Duration::from_secs(5), "stream kept");
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Only a port in use is busy; another error, such as permission denied
+    /// for a privileged port on Linux, is shown as what it is.
+    #[tokio::test]
+    async fn a_bind_error_other_than_a_busy_port_is_no_busy_port() {
+        for errno in [Errno::ACCESS, Errno::ADDRNOTAVAIL] {
+            let err = std::io::Error::from_raw_os_error(errno.raw_os_error());
+            let (bind, event) = failed_bind(80, &err).await;
+            assert_eq!(
+                bind,
+                Bind::Failed {
+                    error: err.to_string()
+                }
+            );
+            assert_eq!(event, format!("cannot listen on port 80: {err}"));
         }
     }
 

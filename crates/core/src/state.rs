@@ -107,6 +107,11 @@ pub enum ForwardState {
     PortBusy {
         holder: Option<String>,
     },
+    /// Listening failed for another reason, e.g. permission denied for a
+    /// port below 1024 on Linux.
+    CannotListen {
+        error: String,
+    },
     /// The context is not healthy; its state says why.
     WaitingForContext,
     WaitingForPods {
@@ -138,7 +143,9 @@ impl ForwardState {
             Self::Paused => "paused",
             Self::Ready { .. } => "ready",
             Self::Starting | Self::WaitingForContext | Self::WaitingForPods { .. } => "waiting",
-            Self::PortBusy { .. } | Self::Misconfigured { .. } => "error",
+            Self::PortBusy { .. } | Self::CannotListen { .. } | Self::Misconfigured { .. } => {
+                "error"
+            }
         }
     }
 
@@ -153,6 +160,7 @@ impl ForwardState {
                 holder: Some(holder),
             } => format!("port busy: {holder}"),
             Self::PortBusy { holder: None } => "port busy".into(),
+            Self::CannotListen { error } => format!("cannot listen: {error}"),
             Self::WaitingForContext => match context {
                 ContextState::Unreachable { cause, .. } => {
                     format!("API unreachable ({})", cause.short())
@@ -178,7 +186,13 @@ impl ForwardState {
 pub enum Bind {
     Pending,
     Bound,
-    Busy { holder: Option<String> },
+    Busy {
+        holder: Option<String>,
+    },
+    /// Another error than a busy port.
+    Failed {
+        error: String,
+    },
 }
 
 /// The forward's service and endpoints, as the watch cache sees them.
@@ -223,6 +237,11 @@ pub fn derive(enabled: bool, paused: bool, observed: Option<&Observed>) -> Forwa
         Bind::Busy { holder } => {
             return ForwardState::PortBusy {
                 holder: holder.clone(),
+            };
+        }
+        Bind::Failed { error } => {
+            return ForwardState::CannotListen {
+                error: error.clone(),
             };
         }
         Bind::Bound => {}
@@ -296,6 +315,20 @@ mod tests {
                     pods.clone(),
                 )),
                 ForwardState::PortBusy { holder: None },
+            ),
+            (
+                true,
+                false,
+                Some(observed(
+                    Bind::Failed {
+                        error: "Permission denied (os error 13)".into(),
+                    },
+                    unreachable.clone(),
+                    pods.clone(),
+                )),
+                ForwardState::CannotListen {
+                    error: "Permission denied (os error 13)".into(),
+                },
             ),
             (
                 true,
@@ -410,6 +443,14 @@ mod tests {
             .info(&healthy(), ""),
             "port busy: mysqld (pid 812)"
         );
+        let denied = ForwardState::CannotListen {
+            error: "Permission denied (os error 13)".into(),
+        };
+        assert_eq!(denied.label(), "error");
+        assert_eq!(
+            denied.info(&healthy(), ""),
+            "cannot listen: Permission denied (os error 13)"
+        );
         assert_eq!(unreachable.summary(), "unreachable (DNS)");
     }
 
@@ -452,6 +493,14 @@ mod tests {
         assert_eq!(
             json,
             r#"{"state":"misconfigured","problem":{"kind":"forbidden","detail":"no"}}"#
+        );
+        let json = serde_json::to_string(&ForwardState::CannotListen {
+            error: "Permission denied (os error 13)".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"state":"cannot_listen","error":"Permission denied (os error 13)"}"#
         );
     }
 }
