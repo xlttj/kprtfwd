@@ -370,7 +370,8 @@ There is one actor per enabled forward.
 1. Pick the pod (see below).
 2. Take the warm forward or open a new one.
 3. Copy bytes in both directions.
-4. Record stats: active connections, bytes, last error.
+4. Record the active connections and the last error. Bytes are not counted:
+   nothing shows them.
 
 **Pod choice.** Use the last pod as long as it is ready. Otherwise pick another
 ready pod and keep using that one.
