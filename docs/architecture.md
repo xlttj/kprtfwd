@@ -386,10 +386,10 @@ setting for this.
 **Warm forward.** After each connection, one port-forward stream is opened ahead
 of time for the next one, and kept for at most 60 s.
 
-- Only for HTTP services (by port and name, as in v1's service types). Browsers
-  open many short connections and gain the most. For other protocols an idle
-  connection is just noise in the server's logs, and server-first protocols such
-  as MySQL would send their greeting into a stream nobody reads yet.
+- Only for services that speak HTTP (section 9). Browsers open many short
+  connections and gain the most. For other protocols an idle connection is
+  just noise in the server's logs, and server-first protocols such as MySQL
+  would send their greeting into a stream nobody reads yet.
 - It is discarded when the pod changes, when the context has an outage, when it
   receives anything before it is used, or after 60 s. One that finishes opening
   while the context is not healthy is not kept. After an outage that took it, it
@@ -764,8 +764,14 @@ services the user may not list (section 9).
   Free means that nothing listens on the port on `127.0.0.1` or on `::1`, as
   a forward needs both (section 6.3).
 - **Conflicts** with existing forwards and with ports in use are marked.
-- **Service types.** The classification is ported from `pkg/svctype` (mysql, redis,
-  http, ...). It decides when "open in browser" applies.
+- **Service types.** The labels are ported from `pkg/svctype` (mysql, redis,
+  http, ...): a well-known remote port first, else words of the service name.
+  Names match by whole words, their runs of letters, so `orders-api` and
+  `redis6` are http and redis, while `rapid-cache` is not http.
+- **Speaks HTTP** decides when "open in browser" and warm forwards apply: the
+  services labelled http, and the web endpoints of some with a label of their
+  own, the RabbitMQ management UI (15672), Elasticsearch's REST API (9200) and
+  Kibana (5601, or by name).
 - **Prune** uses the same listing to remove forwards whose service no longer exists.
   A forward in a skipped namespace is unknown, not gone: prune neither lists
   nor deletes it.

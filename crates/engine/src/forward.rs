@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use kprtfwd_core::Forward;
 use kprtfwd_core::state::{Bind, ContextState, Observed, Target};
-use kprtfwd_core::svctype::{ServiceType, classify as service_type};
+use kprtfwd_core::svctype::speaks_http;
 use rustix::io::Errno;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -256,7 +256,7 @@ async fn run(spec: Forward, context: Arc<Context>, shared: Arc<Shared>) {
     // Warm streams help clients that open many short connections, like
     // browsers. For other protocols an idle connection to the server is
     // just noise in its logs.
-    let warm = service_type(&spec.service, spec.remote_port) == ServiceType::Http;
+    let warm = speaks_http(&spec.service, spec.remote_port);
     let mut context_state = context.subscribe();
     let mut healthy = context_state.borrow_and_update().is_healthy();
     // The outage took a warm stream, so the recovery opens one again.

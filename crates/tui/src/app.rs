@@ -7,7 +7,7 @@ use std::cell::Cell;
 use std::collections::HashSet;
 
 use kprtfwd_core::naming::forward_id;
-use kprtfwd_core::svctype::{ServiceType, classify};
+use kprtfwd_core::svctype::speaks_http;
 use kprtfwd_core::validate::{validate_project_name, validate_settings};
 use kprtfwd_core::{Forward, ForwardId, ForwardSettings, Project, filter};
 use kprtfwd_proto::{DiscoveredPort, EventEntry, ForwardView, Request, Snapshot};
@@ -557,7 +557,7 @@ impl App {
             KeyCode::Char('o') => {
                 if let Some(view) = self.selected_view() {
                     let f = &view.forward;
-                    if classify(&f.service, f.remote_port) == ServiceType::Http {
+                    if speaks_http(&f.service, f.remote_port) {
                         return vec![Cmd::Open(format!("http://localhost:{}", f.local_port))];
                     }
                     self.error("not an HTTP service; y copies the address");
@@ -1167,6 +1167,7 @@ fn services_key(key: KeyEvent, s: &mut Services) -> Option<Vec<Cmd>> {
 pub(crate) mod tests {
     use super::*;
     use kprtfwd_core::ForwardState;
+    use kprtfwd_core::svctype::ServiceType;
     use kprtfwd_proto::ProjectView;
     use ratatui::crossterm::event::{KeyEventKind, KeyEventState};
 

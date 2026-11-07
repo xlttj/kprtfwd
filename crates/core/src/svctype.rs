@@ -1,5 +1,6 @@
 //! A short service-type label (mysql, redis, http, ...) derived from the remote
-//! port and the service name. Ported from v1's `pkg/svctype`.
+//! port and the service name, ported from v1's `pkg/svctype`, and whether a
+//! service speaks HTTP.
 
 use serde::{Deserialize, Serialize};
 
@@ -52,37 +53,66 @@ fn by_port(port: u16) -> Option<ServiceType> {
     })
 }
 
-/// Substrings of the service name, checked in order: more specific hints
+/// Words of the service name, checked in order: more specific hints
 /// (sentinel) come before more general ones (redis).
 const NAME_HINTS: &[(&[&str], ServiceType)] = &[
     (&["sentinel"], ServiceType::RedisSentinel),
     (&["redis"], ServiceType::Redis),
     (&["mysql", "mariadb", "maria", "galera"], ServiceType::Mysql),
-    (&["postgres", "postgre", "pgsql"], ServiceType::Postgres),
+    (&["postgres", "postgresql", "pgsql"], ServiceType::Postgres),
     (
         &["elastic", "elasticsearch", "kibana"],
         ServiceType::Elasticsearch,
     ),
-    (&["mongo"], ServiceType::Mongodb),
+    (&["mongo", "mongodb"], ServiceType::Mongodb),
     (&["kafka"], ServiceType::Kafka),
-    (&["rabbit", "amqp"], ServiceType::Rabbitmq),
+    (&["rabbit", "rabbitmq", "amqp"], ServiceType::Rabbitmq),
     (
         &[
-            "http", "nginx", "web", "api", "frontend", "gateway", "ingress",
+            "http", "https", "nginx", "web", "api", "frontend", "gateway", "ingress",
         ],
         ServiceType::Http,
     ),
 ];
 
+/// Ports on which services with a label of their own speak HTTP: the
+/// RabbitMQ management UI, Elasticsearch's REST API and Kibana.
+const HTTP_PORTS: &[u16] = &[15672, 9200, 5601];
+
+/// Words of a name that speaks HTTP on any port, whatever its label.
+const HTTP_WORDS: &[&str] = &["kibana"];
+
 pub fn classify(service: &str, remote_port: u16) -> ServiceType {
-    if let Some(typ) = by_port(remote_port) {
-        return typ;
+    by_port(remote_port).unwrap_or_else(|| by_name(service))
+}
+
+/// Whether the service speaks HTTP, which decides "open in browser" and warm
+/// streams: the services labelled http, and the web endpoints of some with a
+/// label of their own.
+pub fn speaks_http(service: &str, remote_port: u16) -> bool {
+    if HTTP_PORTS.contains(&remote_port) {
+        return true;
     }
-    let name = service.to_lowercase();
+    match by_port(remote_port) {
+        Some(typ) => typ == ServiceType::Http,
+        None => by_name(service) == ServiceType::Http || has_word(service, HTTP_WORDS),
+    }
+}
+
+fn by_name(service: &str) -> ServiceType {
     NAME_HINTS
         .iter()
-        .find(|(hints, _)| hints.iter().any(|hint| name.contains(hint)))
+        .find(|(hints, _)| has_word(service, hints))
         .map_or(ServiceType::Other, |(_, typ)| *typ)
+}
+
+/// Whether one of the words of a service name, its runs of letters, is one
+/// of `hints`, in any case: `orders-api` and `redis6` hold `api` and
+/// `redis`, `rapid-cache` holds no `api`.
+fn has_word(service: &str, hints: &[&str]) -> bool {
+    service
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .any(|word| hints.iter().any(|hint| hint.eq_ignore_ascii_case(word)))
 }
 
 #[cfg(test)]
@@ -120,6 +150,28 @@ mod tests {
     }
 
     #[test]
+    fn names_match_by_whole_words() {
+        for (name, want) in [
+            // Hints inside other words count no more.
+            ("rapid-cache", ServiceType::Other),
+            ("cobweb-db", ServiceType::Other),
+            ("capital", ServiceType::Other),
+            // Digits and dots separate words, and case does not matter.
+            ("redis6", ServiceType::Redis),
+            ("orders.api", ServiceType::Http),
+            ("Orders-API", ServiceType::Http),
+            // The full names of products that v1 found as substrings.
+            ("mongodb-0", ServiceType::Mongodb),
+            ("rabbitmq", ServiceType::Rabbitmq),
+            ("postgresql-ha", ServiceType::Postgres),
+            ("mariadb", ServiceType::Mysql),
+            ("shop-https", ServiceType::Http),
+        ] {
+            assert_eq!(classify(name, 12345), want, "{name}");
+        }
+    }
+
+    #[test]
     fn port_beats_name() {
         assert_eq!(classify("web-frontend", 3306), ServiceType::Mysql);
     }
@@ -127,5 +179,31 @@ mod tests {
     #[test]
     fn unknown_is_other() {
         assert_eq!(classify("mystery-service", 55555), ServiceType::Other);
+    }
+
+    #[test]
+    fn web_endpoints_with_a_label_of_their_own_speak_http() {
+        for (name, port, want) in [
+            ("shop-web", 8080, true),
+            ("orders-api", 12345, true),
+            ("rabbitmq", 15672, true),
+            ("search", 9200, true),
+            ("dashboards", 5601, true),
+            ("kibana", 12345, true),
+            ("logs-kibana", 80, true),
+            // Their other ports do not, nor does a name on a known port.
+            ("rabbitmq", 5672, false),
+            ("search", 9300, false),
+            ("kibana", 3306, false),
+            ("web-frontend", 3306, false),
+            ("elasticsearch", 12345, false),
+            ("rapid-cache", 12345, false),
+            ("mystery-service", 55555, false),
+        ] {
+            assert_eq!(speaks_http(name, port), want, "{name}:{port}");
+        }
+        // The labels stay as they were.
+        assert_eq!(classify("rabbitmq", 15672), ServiceType::Rabbitmq);
+        assert_eq!(classify("kibana", 12345), ServiceType::Elasticsearch);
     }
 }
