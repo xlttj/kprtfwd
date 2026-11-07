@@ -141,6 +141,9 @@ pub enum Mode {
     Help,
 }
 
+/// Why `n` makes no project of an empty list.
+const NOTHING_LISTED: &str = "no forward is listed for a new project";
+
 /// A project name being typed.
 pub struct Naming {
     pub name: String,
@@ -747,6 +750,10 @@ impl App {
             (KeyCode::Esc | KeyCode::Char('q' | 'p'), _) => return Vec::new(),
             (KeyCode::Up | KeyCode::Char('k'), _) => self.mode = stay(selected.saturating_sub(1)),
             (KeyCode::Down | KeyCode::Char('j'), _) => self.mode = stay((selected + 1).min(last)),
+            (KeyCode::Char('n'), _) if listed.is_empty() => {
+                self.error(NOTHING_LISTED);
+                self.mode = stay(selected);
+            }
             (KeyCode::Char('n'), _) => {
                 self.mode = Mode::Projects {
                     selected,
@@ -809,6 +816,12 @@ impl App {
                     self.error(format!("{err}; r renames it"));
                     return Vec::new();
                 }
+                if listed.is_empty() {
+                    self.error(format!(
+                        "no forward is listed; u would empty project {name}"
+                    ));
+                    return Vec::new();
+                }
                 return vec![Cmd::Request {
                     success: format!("project {name}: {} forwards", listed.len()),
                     request: Request::UpsertProject {
@@ -834,10 +847,16 @@ impl App {
     }
 
     /// What `n` sends: a new project of the listed forwards, or what is
-    /// wrong with its name.
+    /// wrong with it. It never replaces the members of an existing project.
     fn new_project(&self, name: String) -> Result<Vec<Cmd>, String> {
         validate_project_name(&name).map_err(|err| err.to_string())?;
+        if self.snapshot.projects.iter().any(|p| p.name == name) {
+            return Err(format!("project {name} already exists; u sets its members"));
+        }
         let listed = self.listed();
+        if listed.is_empty() {
+            return Err(NOTHING_LISTED.into());
+        }
         Ok(vec![Cmd::Request {
             success: format!("project {name}: {} forwards", listed.len()),
             request: Request::UpsertProject {
@@ -1829,6 +1848,51 @@ pub(crate) mod tests {
         assert!(matches!(app.mode, Mode::Projects { naming: None, .. }));
         app.update(key(KeyCode::Esc));
         assert!(matches!(app.mode, Mode::List));
+    }
+
+    #[test]
+    fn n_never_replaces_a_project_and_n_and_u_need_listed_forwards() {
+        let mut app = App::new(snapshot());
+        app.update(key(KeyCode::Char('p')));
+        app.update(key(KeyCode::Char('n')));
+        type_text(&mut app, "web");
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        assert_eq!(
+            message(&app),
+            ("project web already exists; u sets its members", true)
+        );
+        assert!(
+            matches!(&app.mode, Mode::Projects { naming: Some(Naming { name, .. }), .. } if name == "web"),
+            "the line stays for another name"
+        );
+        app.update(key(KeyCode::Esc));
+
+        // A filter with a typo lists nothing.
+        app.filter = "frontnd".into();
+        assert!(app.update(key(KeyCode::Char('n'))).is_empty());
+        assert_eq!(
+            message(&app),
+            ("no forward is listed for a new project", true)
+        );
+        assert!(matches!(app.mode, Mode::Projects { naming: None, .. }));
+        assert!(app.update(key(KeyCode::Char('u'))).is_empty());
+        assert_eq!(
+            message(&app),
+            ("no forward is listed; u would empty project web", true)
+        );
+
+        // The list empties while the name is typed.
+        app.filter.clear();
+        app.update(key(KeyCode::Char('n')));
+        type_text(&mut app, "fe");
+        let mut empty = snapshot();
+        empty.forwards.clear();
+        app.update(Msg::Snapshot(empty));
+        assert!(app.update(key(KeyCode::Enter)).is_empty());
+        assert_eq!(
+            message(&app),
+            ("no forward is listed for a new project", true)
+        );
     }
 
     /// The filter splits on whitespace, so a project name has none. A v1

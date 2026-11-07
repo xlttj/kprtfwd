@@ -829,10 +829,13 @@ together, then `p`:
 | `enter` / `-` | switch the project on / off |
 | `s` | switch to the project: its forwards on, all others off (v1's behaviour) |
 | `f` | show its members: sets the filter to `@name` |
-| `n` | new project from the listed forwards |
+| `n` | new project from the listed forwards; a name in use is refused, `u` sets its members |
 | `u` | set the project's members to the listed forwards |
 | `r` | rename the project |
 | `x` | delete the project (asks; its forwards stay) |
+
+`n` and `u` refuse an empty list, so a filter with a typo neither creates an
+empty project nor empties one.
 
 `@name` works in every filter, also in `kprtfwd up @shop`. Project names
 have no whitespace, so `@name` is always one word of the filter: `n` and `r`
