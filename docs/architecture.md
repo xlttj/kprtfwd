@@ -945,7 +945,8 @@ These are shown in the INFO column and by `kprtfwd status`.
 | refused or timed out | `API unreachable (timeout)` |
 | exec plugin logging in, no accepted token yet | `logging in` |
 | login failed or rejected (401) | TUI: `login needed: reconnect (r) to log in`; `kprtfwd status`: `login needed: kprtfwd reconnect staging to log in` |
-| 403 on watch or port-forward | `forbidden: port-forward in namespace X` |
+| 403 on port-forward | `forbidden: port-forward in namespace X`; kube drops the API server's text there |
+| 403 on a watch | `forbidden: ` and the API server's text, e.g. `forbidden: services is forbidden: User "dev" cannot list resource "services" ...` |
 | `EADDRINUSE` | `port busy: mysqld (pid 812)` |
 | service gone | `service not found (prune?)` |
 | no ready endpoints | `0/2 pods ready` |

@@ -584,13 +584,15 @@ fn forbidden(spec: &Forward, shared: &Shared, err: &PortForwardError) -> bool {
     let PortForwardError::Connect(kube_err) = err else {
         return false;
     };
-    let Failure::Forbidden(message) = classify(kube_err) else {
+    let Failure::Forbidden(error) = classify(kube_err) else {
         return false;
     };
-    warn!(id = %spec.id, %message, "port-forward forbidden");
-    shared
-        .events
-        .push(format!("port-forward forbidden: {message}"));
+    // kube drops the API server's text when it refuses the upgrade, so
+    // its error has only the status line; what was forbidden is known
+    // here.
+    let message = format!("port-forward in namespace {}", spec.namespace);
+    warn!(id = %spec.id, %message, %error, "port-forward forbidden");
+    shared.events.push(format!("forbidden: {message}"));
     *shared.forbidden.lock().unwrap() = Some(message);
     true
 }
@@ -1108,12 +1110,10 @@ mod tests {
         };
         let test = Test::start("db", 5432, &[("db-0", true)], reply).await;
         assert_eq!(test.send("a").await, "");
-        let message =
-            "failed to upgrade to a WebSocket connection: failed to switch protocol: 403 Forbidden";
+        let message = "port-forward in namespace shop";
         assert_eq!(test.observe().target, Target::Forbidden(message.into()));
         assert!(
-            test.events()
-                .contains(&format!("port-forward forbidden: {message}")),
+            test.events().contains(&format!("forbidden: {message}")),
             "{:?}",
             test.events()
         );
