@@ -494,9 +494,12 @@ pub(crate) async fn log_in(
 /// Whether a change of state restarts the watches: watches of a context with
 /// a login start only once it is healthy, and after an outage a watch may be
 /// silently dead, so they start fresh instead of waiting for their idle
-/// timeout. Called only when the state changed.
+/// timeout. A healthy context that reports another server version has not
+/// recovered from anything. Called only when the state changed.
 fn restarts_watches(has_login: bool, previous: &ContextState, next: &ContextState) -> bool {
-    next.is_healthy() && (has_login || !matches!(previous, ContextState::Connecting))
+    next.is_healthy()
+        && !previous.is_healthy()
+        && (has_login || !matches!(previous, ContextState::Connecting))
 }
 
 /// `GET /version`: the API server's version, or why there is none.
@@ -1314,10 +1317,49 @@ contexts:
             &healthy()
         ));
         assert!(restarts_watches(true, &down, &healthy()));
+        assert!(restarts_watches(true, &ContextState::LoggingIn, &healthy()));
+        // Another server version, e.g. from another API server behind the
+        // load balancer, or none when /version is forbidden, is no recovery.
+        for version in ["v1.34.0", "unknown"] {
+            let other = ContextState::Healthy {
+                server_version: version.into(),
+            };
+            for has_login in [false, true] {
+                assert!(
+                    !restarts_watches(has_login, &healthy(), &other),
+                    "{version}"
+                );
+                assert!(
+                    !restarts_watches(has_login, &other, &healthy()),
+                    "{version}"
+                );
+            }
+        }
         // Nothing to start while the context is not usable.
         for next in [ContextState::Connecting, down.clone(), login_needed.clone()] {
             assert!(!restarts_watches(true, &healthy(), &next), "{next:?}");
             assert!(!restarts_watches(false, &healthy(), &next), "{next:?}");
         }
+    }
+
+    /// The watches of a context that reports another server version go on;
+    /// those of a context that recovers list again.
+    #[tokio::test]
+    async fn a_new_server_version_keeps_the_watches() {
+        let api = FakeApi::start(|_| Reply::Json(404, status(404, "not found"))).await;
+        let context = Context::fake(api.client(), healthy());
+        context.put_namespace("shop", NamespaceCache::new("shop"));
+        for version in ["v1.34.0", "unknown", "v1.33.0"] {
+            context.force_state(ContextState::Healthy {
+                server_version: version.into(),
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(api.requests(), Vec::<String>::new());
+
+        context.force_state(unreachable(1, NetCause::Timeout));
+        context.force_state(healthy());
+        wait_until("the watches listed again", || api.requests().len() == 2).await;
+        context.stop();
     }
 }
