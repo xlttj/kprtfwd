@@ -96,7 +96,7 @@ by which process), and so on.
 | `kprtfwd reconnect <context>` | reconnect a context from scratch |
 | `kprtfwd logs [-f] [project or words]` | events of forwards, or the daemon's log |
 | `kprtfwd prune [--context C] [--namespace 'app-*'] [-y]` | delete forwards whose service is gone |
-| `kprtfwd daemon status` / `stop` / `restart` / `run` | control the daemon; `run` keeps it in the foreground |
+| `kprtfwd daemon status` / `stop` / `restart` / `run` | control the daemon; `run` keeps it in the foreground, `run --foreground` also logs to the terminal |
 | `kprtfwd db list` | list forwards and projects without the daemon |
 
 Words select the forwards that contain every one of them, ignoring case, in
@@ -186,8 +186,10 @@ completes it, the forward shows `login needed`; press `r` (or run
 
 - `kprtfwd logs -f` follows the daemon's log; `l` in the TUI shows a forward's
   events.
-- `KPRTFWD_LOG=debug kprtfwd daemon run` runs the daemon in the foreground
-  with more detail. Stop the running daemon first (`kprtfwd daemon stop`).
+- `KPRTFWD_LOG=debug kprtfwd daemon run --foreground` runs the daemon in the
+  foreground and logs to the terminal with more detail; without
+  `--foreground` it logs to the file that `kprtfwd logs -f` follows. Stop the
+  running daemon first (`kprtfwd daemon stop`).
 - `kprtfwd daemon restart` starts the daemon fresh; enabled forwards come back.
 
 ## Development
