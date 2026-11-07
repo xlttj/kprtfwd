@@ -685,6 +685,25 @@ impl Daemon {
             .ok_or_else(|| format!("no project named {name:?}"))
     }
 
+    /// Why no running forward uses `context`, so a reconnect would rebuild
+    /// nothing: no forward uses it, its forwards are off, or all are paused.
+    fn not_connected(&self, context: &str) -> Result<String, StoreError> {
+        let forwards: Vec<Forward> = self
+            .store
+            .forwards()?
+            .into_iter()
+            .filter(|f| f.context == context)
+            .collect();
+        let why = if forwards.is_empty() {
+            "no forward uses it"
+        } else if !forwards.iter().any(|f| f.enabled) {
+            "its forwards are off"
+        } else {
+            "the forwards are paused"
+        };
+        Ok(format!("the context {context:?} is not connected: {why}"))
+    }
+
     async fn handle(&mut self, request: Request) -> Result<Response, String> {
         let text = |err: StoreError| err.to_string();
         match request {
@@ -715,6 +734,9 @@ impl Daemon {
             }
             Request::ReconnectContext { name } => {
                 let wanted = self.wanted().map_err(text)?;
+                if !wanted.iter().any(|f| f.context == name) {
+                    return Err(self.not_connected(&name).map_err(text)?);
+                }
                 self.engine.reconnect(&name, &wanted, None).await;
                 info!(context = %name, "reconnected");
                 return Ok(Response::Done);

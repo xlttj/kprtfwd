@@ -222,6 +222,31 @@ fn up_and_down_switch_the_forwards_that_match() {
     assert!(enabled().is_empty());
 }
 
+/// Reconnecting a context that is not connected rebuilds nothing, so it is
+/// an error that says why: a typo, forwards that are off, or the pause.
+#[test]
+fn reconnect_refuses_a_context_that_is_not_connected() {
+    let home = Home::new();
+    let api = forward("test", "shop", "api", true);
+    let web = forward("other", "shop", "web", false);
+    write_database(&home.db(), &[api, web], false);
+    let refused = |context: &str, why: &str| {
+        let output = home.run(&["reconnect", context]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(
+            stderr(&output),
+            format!("kprtfwd: the context \"{context}\" is not connected: {why}\n")
+        );
+    };
+
+    let output = home.run(&["reconnect", "test"]);
+    assert!(output.status.success(), "{output:?}");
+    refused("tset", "no forward uses it");
+    refused("other", "its forwards are off");
+    assert!(home.run(&["pause"]).status.success());
+    refused("test", "the forwards are paused");
+}
+
 const SERVICES: &str = r#"{"kind":"ServiceList","apiVersion":"v1","metadata":{"resourceVersion":"1"},"items":[{"metadata":{"name":"api","namespace":"shop"},"spec":{"ports":[{"name":"http","port":80,"protocol":"TCP"}]}}]}"#;
 const NO_SERVICES: &str =
     r#"{"kind":"ServiceList","apiVersion":"v1","metadata":{"resourceVersion":"1"},"items":[]}"#;

@@ -947,7 +947,7 @@ Internal structure:
 | `kprtfwd prune [--context C] [--namespace 'app-*'] [-y]` | as in v1: lists forwards whose service is gone and deletes them after asking; only the listed forwards are deleted, and nothing if the cluster cannot be listed. Forwards in namespaces whose services the user may not list are left alone, and those namespaces are named. The list names the context, which defaults to the daemon's current context (its kubeconfig may differ from the shell's) |
 | `kprtfwd logs [-f] [project or words]` | events of the matching forwards and their contexts; without arguments the daemon log |
 | `kprtfwd discover ...` | not built; the TUI's `d` covers it |
-| `kprtfwd reconnect <context>` | rebuild a context's client, watches and forwards |
+| `kprtfwd reconnect <context>` | rebuild a context's client, watches and forwards; a context that is not connected is an error that says why: no forward uses it, its forwards are off, or the forwards are paused |
 | `kprtfwd daemon status/stop/restart` | daemon control (`daemon run [--foreground]` is internal, or for debugging) |
 | `kprtfwd db list [--db PATH]` | read the database without the daemon; the file is not changed |
 
