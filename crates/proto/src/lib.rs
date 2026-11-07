@@ -10,7 +10,7 @@ use std::io;
 use std::time::SystemTime;
 
 use kprtfwd_core::svctype::ServiceType;
-use kprtfwd_core::{ContextState, Forward, ForwardId, ForwardState, Project};
+use kprtfwd_core::{ContextState, Forward, ForwardId, ForwardSettings, ForwardState, Project};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 pub use client::{Client, ClientError, connect_or_start, spawn_daemon, stop_daemon};
 
 /// Bumped on every incompatible change to the messages.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// This kprtfwd's version, which a client sends in its hello.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -94,9 +94,17 @@ pub enum Request {
     ReconnectContext {
         name: String,
     },
-    /// Adds forwards or replaces those with the same ID.
-    UpsertForwards {
+    /// Adds new forwards, all or none: one whose ID is taken fails the
+    /// request. An existing forward is never replaced.
+    AddForwards {
         forwards: Vec<Forward>,
+    },
+    /// Changes a forward's settings. It carries no enabled flag: the
+    /// daemon keeps the one it holds, which another client may have
+    /// switched while this one edited. Answered with [`Response::Saved`].
+    EditForward {
+        id: ForwardId,
+        settings: ForwardSettings,
     },
     DeleteForward {
         id: ForwardId,
@@ -149,6 +157,10 @@ pub enum Response {
     },
     Snapshot(Snapshot),
     Done,
+    /// The ID the edited forward is saved under.
+    Saved {
+        id: ForwardId,
+    },
     Contexts {
         names: Vec<String>,
         current: Option<String>,
@@ -375,7 +387,11 @@ mod tests {
             Request::ReconnectContext {
                 name: "staging".into(),
             },
-            Request::UpsertForwards {
+            Request::EditForward {
+                id: id(),
+                settings: forward.settings(),
+            },
+            Request::AddForwards {
                 forwards: vec![forward],
             },
             Request::DeleteForward { id: id() },

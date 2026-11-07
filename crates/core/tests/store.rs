@@ -542,11 +542,11 @@ fn forward_round_trip() {
     let mut store = Store::in_memory().unwrap();
     let mut f = forward("staging.shop.api-80", "staging", "shop", "api", (80, 18091));
 
-    store.upsert_forward(&f).unwrap();
+    store.add_forward(&f).unwrap();
     assert_eq!(store.forward(&f.id).unwrap(), Some(f.clone()));
 
     f.local_port = 18099;
-    store.upsert_forward(&f).unwrap();
+    assert_eq!(store.edit_forward(&f.id, &f.settings()).unwrap(), f.id);
     assert_eq!(store.forwards().unwrap(), vec![f.clone()]);
 
     store
@@ -565,20 +565,93 @@ fn rejects_invalid_forward() {
     let f = forward("x", "staging", "Shop", "api", (80, 18091));
 
     assert!(matches!(
-        store.upsert_forward(&f),
+        store.add_forward(&f),
         Err(StoreError::Invalid(ValidationError::InvalidName {
             field: "namespace",
             ..
         }))
     ));
     assert!(store.forwards().unwrap().is_empty());
+
+    let ok = forward("x", "staging", "shop", "api", (80, 18091));
+    store.add_forward(&ok).unwrap();
+    let settings = kprtfwd_core::ForwardSettings {
+        local_port: 0,
+        ..ok.settings()
+    };
+    assert!(matches!(
+        store.edit_forward(&ok.id, &settings),
+        Err(StoreError::Invalid(ValidationError::ZeroPort("local port")))
+    ));
+    assert_eq!(store.forwards().unwrap(), [ok]);
+}
+
+/// An add never replaces a forward: one whose ID is taken, perhaps by
+/// another client meanwhile, fails, and so does the whole request.
+#[test]
+fn adding_a_taken_id_fails_and_adds_nothing() {
+    let mut store = Store::in_memory().unwrap();
+    let api = forward("staging.shop.api-80", "staging", "shop", "api", (80, 18091));
+    store.add_forward(&api).unwrap();
+
+    let same = forward("staging.shop.api-80", "staging", "shop", "api", (80, 18092));
+    let result = store.add_forward(&same);
+    assert!(
+        matches!(&result, Err(StoreError::ForwardExists(id)) if *id == api.id),
+        "{result:?}"
+    );
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "forward staging.shop.api-80 already exists"
+    );
+
+    let web = forward("staging.shop.web-80", "staging", "shop", "web", (80, 18093));
+    assert!(matches!(
+        store.add_forwards(&[web.clone(), same.clone()]),
+        Err(StoreError::ForwardExists(_))
+    ));
+    // Twice in one request is taken too.
+    assert!(matches!(
+        store.add_forwards(&[web.clone(), web.clone()]),
+        Err(StoreError::ForwardExists(_))
+    ));
+    assert_eq!(store.forwards().unwrap(), [api]);
+
+    store.add_forwards(std::slice::from_ref(&web)).unwrap();
+    assert_eq!(store.forwards().unwrap().len(), 2);
+}
+
+/// An edit carries no enabled flag: a switch made by another client while
+/// the edit was typed stays.
+#[test]
+fn an_edit_keeps_the_stored_flag() {
+    let mut store = Store::in_memory().unwrap();
+    let api = forward("staging.shop.api-80", "staging", "shop", "api", (80, 18091));
+    store.add_forward(&api).unwrap();
+    // The form was opened now, with the forward off; then it was switched on.
+    let mut edited = api.settings();
+    store
+        .set_enabled(std::slice::from_ref(&api.id), true)
+        .unwrap();
+
+    edited.local_port = 18099;
+    assert_eq!(store.edit_forward(&api.id, &edited).unwrap(), api.id);
+    let stored = store.forward(&api.id).unwrap().unwrap();
+    assert!(stored.enabled);
+    assert_eq!(stored.local_port, 18099);
+
+    let gone = id("staging.shop.gone-80");
+    assert!(matches!(
+        store.edit_forward(&gone, &edited),
+        Err(StoreError::UnknownForward(unknown)) if unknown == gone
+    ));
 }
 
 #[test]
 fn set_enabled_changes_all_or_nothing() {
     let mut store = Store::in_memory().unwrap();
     let f = forward("a", "staging", "shop", "api", (80, 18091));
-    store.upsert_forward(&f).unwrap();
+    store.add_forward(&f).unwrap();
 
     let result = store.set_enabled(&[id("a"), id("missing")], true);
 
@@ -591,7 +664,7 @@ fn set_enabled_exactly_switches_the_whole_set() {
     let mut store = Store::in_memory().unwrap();
     for (i, port) in [("a", 18091), ("b", 18092), ("c", 18093)] {
         store
-            .upsert_forward(&forward(i, "staging", "shop", "api", (80, port)))
+            .add_forward(&forward(i, "staging", "shop", "api", (80, port)))
             .unwrap();
     }
     store.set_enabled(&[id("a"), id("b")], true).unwrap();
@@ -620,7 +693,7 @@ fn projects_replace_members_and_follow_deletes() {
     let mut store = Store::in_memory().unwrap();
     for (i, port) in [("a", 18091), ("b", 18092)] {
         store
-            .upsert_forward(&forward(i, "staging", "shop", "api", (80, port)))
+            .add_forward(&forward(i, "staging", "shop", "api", (80, port)))
             .unwrap();
     }
     let project = |members: &[&str]| Project {

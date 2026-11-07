@@ -12,7 +12,7 @@ use std::time::Duration;
 use rusqlite::backup::Progress;
 use rusqlite::{Connection, MAIN_DB, OpenFlags, OptionalExtension, Row, params};
 
-use crate::model::{Forward, ForwardId, Project};
+use crate::model::{Forward, ForwardId, ForwardSettings, Project};
 use crate::validate::{self, ValidationError};
 
 /// How long a connection waits for another process's lock, such as v1 writing
@@ -33,6 +33,8 @@ pub enum StoreError {
     Invalid(#[from] ValidationError),
     #[error("unknown forward {0}")]
     UnknownForward(ForwardId),
+    #[error("forward {0} already exists")]
+    ForwardExists(ForwardId),
     #[error("forward {id}: {field} {value} is not a valid port")]
     BadPort {
         id: ForwardId,
@@ -189,31 +191,50 @@ impl Store {
             .transpose()
     }
 
-    /// Inserts the forward, or replaces the one with the same ID.
-    pub fn upsert_forward(&mut self, forward: &Forward) -> Result<()> {
-        validate::validate_forward(forward)?;
-        self.conn.execute(
-            "INSERT INTO port_forwards
-                 (id, context, namespace, service, port_remote, port_local, enabled)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(id) DO UPDATE SET
-                 context = excluded.context,
-                 namespace = excluded.namespace,
-                 service = excluded.service,
-                 port_remote = excluded.port_remote,
-                 port_local = excluded.port_local,
-                 enabled = excluded.enabled",
+    /// Adds a new forward; see [`Store::add_forwards`].
+    pub fn add_forward(&mut self, forward: &Forward) -> Result<()> {
+        self.add_forwards(std::slice::from_ref(forward))
+    }
+
+    /// Adds new forwards, all or none: if one is invalid or its ID is taken,
+    /// nothing is added. An existing forward is never replaced.
+    pub fn add_forwards(&mut self, forwards: &[Forward]) -> Result<()> {
+        for forward in forwards {
+            validate::validate_forward(forward)?;
+        }
+        let tx = self.conn.transaction()?;
+        for forward in forwards {
+            insert_forward(&tx, forward)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Changes the settings of forward `id`. Its enabled flag stays as
+    /// stored, whatever a client read before. Returns the forward's ID.
+    pub fn edit_forward(
+        &mut self,
+        id: &ForwardId,
+        settings: &ForwardSettings,
+    ) -> Result<ForwardId> {
+        validate::validate_settings(settings)?;
+        let changed = self.conn.execute(
+            "UPDATE port_forwards
+             SET context = ?2, namespace = ?3, service = ?4, port_remote = ?5, port_local = ?6
+             WHERE id = ?1",
             params![
-                forward.id.as_str(),
-                forward.context,
-                forward.namespace,
-                forward.service,
-                forward.remote_port,
-                forward.local_port,
-                forward.enabled,
+                id.as_str(),
+                settings.context,
+                settings.namespace,
+                settings.service,
+                settings.remote_port,
+                settings.local_port,
             ],
         )?;
-        Ok(())
+        if changed == 0 {
+            return Err(StoreError::UnknownForward(id.clone()));
+        }
+        Ok(id.clone())
     }
 
     /// Deletes the forward and its project memberships. Returns whether it
@@ -351,6 +372,36 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+/// Inserts a forward whose ID must be free. Memberships v1 left for the ID,
+/// of a forward deleted meanwhile, are dropped first: a new forward starts
+/// in no project.
+fn insert_forward(conn: &Connection, forward: &Forward) -> Result<()> {
+    let id = forward.id.as_str();
+    let mut exists = conn.prepare_cached("SELECT 1 FROM port_forwards WHERE id = ?1")?;
+    if exists.exists([id])? {
+        return Err(StoreError::ForwardExists(forward.id.clone()));
+    }
+    conn.execute(
+        "DELETE FROM project_port_forwards WHERE port_forward_id = ?1",
+        [id],
+    )?;
+    conn.execute(
+        "INSERT INTO port_forwards
+             (id, context, namespace, service, port_remote, port_local, enabled)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            id,
+            forward.context,
+            forward.namespace,
+            forward.service,
+            forward.remote_port,
+            forward.local_port,
+            forward.enabled,
+        ],
+    )?;
+    Ok(())
 }
 
 /// A forward as stored; ports are converted and checked afterwards so the

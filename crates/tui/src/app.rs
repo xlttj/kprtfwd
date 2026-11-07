@@ -8,8 +8,8 @@ use std::collections::HashSet;
 
 use kprtfwd_core::naming::forward_id;
 use kprtfwd_core::svctype::{ServiceType, classify};
-use kprtfwd_core::validate::validate_forward;
-use kprtfwd_core::{Forward, ForwardId, Project, filter};
+use kprtfwd_core::validate::validate_settings;
+use kprtfwd_core::{Forward, ForwardId, ForwardSettings, Project, filter};
 use kprtfwd_proto::{DiscoveredPort, EventEntry, ForwardView, Request, Snapshot};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -18,6 +18,12 @@ pub enum Msg {
     Snapshot(Snapshot),
     /// A request finished: what to report, or the daemon's error.
     Done(Result<String, String>),
+    /// The edit of forward `id` finished: the ID it is saved under, or the
+    /// daemon's error.
+    Saved {
+        id: ForwardId,
+        result: Result<ForwardId, String>,
+    },
     Contexts(Result<(Vec<String>, Option<String>), String>),
     /// The answer to discovery number `request`.
     Discovered {
@@ -44,6 +50,11 @@ pub enum Cmd {
     Request {
         request: Request,
         success: String,
+    },
+    /// Saves the edit of a forward; answered with [`Msg::Saved`].
+    Edit {
+        id: ForwardId,
+        settings: ForwardSettings,
     },
     ListContexts,
     Discover {
@@ -353,6 +364,16 @@ impl App {
             }
             Msg::Done(result) => {
                 self.done(result);
+                Vec::new()
+            }
+            Msg::Saved { id, result } => {
+                // The cursor stays on the edited forward.
+                if let Ok(saved) = &result
+                    && self.selected.as_ref() == Some(&id)
+                {
+                    self.selected = Some(saved.clone());
+                }
+                self.done(result.map(|saved| format!("saved {saved}")));
                 Vec::new()
             }
             Msg::Contexts(result) => {
@@ -786,20 +807,11 @@ impl App {
             KeyCode::BackTab | KeyCode::Up => {
                 form.focus = (form.focus + FORM_LABELS.len() - 1) % FORM_LABELS.len();
             }
-            KeyCode::Enter => match self.form_forward(&form) {
-                Ok(forward) => {
-                    let success = match &form.editing {
-                        Some(_) => format!("saved {}", forward.id),
-                        None => format!("added {}", forward.id),
-                    };
+            KeyCode::Enter => match self.form_cmd(&form) {
+                Ok(cmd) => {
                     form.error = None;
                     self.mode = Mode::Form(form);
-                    return vec![Cmd::Request {
-                        request: Request::UpsertForwards {
-                            forwards: vec![forward],
-                        },
-                        success,
-                    }];
+                    return vec![cmd];
                 }
                 Err(err) => form.error = Some(err),
             },
@@ -812,44 +824,46 @@ impl App {
         Vec::new()
     }
 
-    /// The forward a form describes, or what is wrong with it.
-    fn form_forward(&self, form: &Form) -> Result<Forward, String> {
-        let [context, namespace, service, remote, local] =
-            form.fields.clone().map(|f| f.trim().to_owned());
-        let port = |label: &str, text: &str| {
-            text.parse::<u16>()
-                .ok()
-                .filter(|p| *p != 0)
-                .ok_or_else(|| format!("{label} must be a number from 1 to 65535"))
-        };
-        let remote_port = port("remote port", &remote)?;
-        let local_port = port("local port", &local)?;
-        let (id, enabled) = match &form.editing {
-            Some(existing) => (existing.id.clone(), existing.enabled),
-            None => {
-                let taken: HashSet<ForwardId> = self
-                    .snapshot
-                    .forwards
-                    .iter()
-                    .map(|v| v.forward.id.clone())
-                    .collect();
-                (
-                    forward_id(&context, &namespace, &service, remote_port, &taken),
-                    false,
-                )
-            }
-        };
-        let forward = Forward {
-            id,
+    /// What saves the form: the edit of the forward it was opened for, or
+    /// adding a new one, switched off. Or what is wrong with the form.
+    fn form_cmd(&self, form: &Form) -> Result<Cmd, String> {
+        let settings = form_settings(form)?;
+        if let Some(existing) = &form.editing {
+            // Without the enabled flag, which another client may switch
+            // while the form is open.
+            return Ok(Cmd::Edit {
+                id: existing.id.clone(),
+                settings,
+            });
+        }
+        let taken: HashSet<ForwardId> = self
+            .snapshot
+            .forwards
+            .iter()
+            .map(|v| v.forward.id.clone())
+            .collect();
+        let ForwardSettings {
             context,
             namespace,
             service,
             remote_port,
             local_port,
-            enabled,
+        } = settings;
+        let forward = Forward {
+            id: forward_id(&context, &namespace, &service, remote_port, &taken),
+            context,
+            namespace,
+            service,
+            remote_port,
+            local_port,
+            enabled: false,
         };
-        validate_forward(&forward).map_err(|err| err.to_string())?;
-        Ok(forward)
+        Ok(Cmd::Request {
+            success: format!("added {}", forward.id),
+            request: Request::AddForwards {
+                forwards: vec![forward],
+            },
+        })
     }
 
     fn discovery_key(&mut self, key: KeyEvent, step: Discovery) -> Vec<Cmd> {
@@ -913,6 +927,27 @@ impl App {
         }
         Vec::new()
     }
+}
+
+/// The settings a form describes, or what is wrong with them.
+fn form_settings(form: &Form) -> Result<ForwardSettings, String> {
+    let [context, namespace, service, remote, local] =
+        form.fields.clone().map(|f| f.trim().to_owned());
+    let port = |label: &str, text: &str| {
+        text.parse::<u16>()
+            .ok()
+            .filter(|p| *p != 0)
+            .ok_or_else(|| format!("{label} must be a number from 1 to 65535"))
+    };
+    let settings = ForwardSettings {
+        context,
+        namespace,
+        service,
+        remote_port: port("remote port", &remote)?,
+        local_port: port("local port", &local)?,
+    };
+    validate_settings(&settings).map_err(|err| err.to_string())?;
+    Ok(settings)
 }
 
 /// Whether `key` is ctrl+`c`.
@@ -1040,7 +1075,7 @@ fn services_key(key: KeyEvent, s: &mut Services) -> Option<Vec<Cmd>> {
             }
             return Some(vec![Cmd::Request {
                 success: format!("added {} forwards", forwards.len()),
-                request: Request::UpsertForwards { forwards },
+                request: Request::AddForwards { forwards },
             }]);
         }
         _ => {}
@@ -1221,7 +1256,7 @@ pub(crate) mod tests {
         let cmds = app.update(key(KeyCode::Enter));
         assert_eq!(
             requested(&cmds),
-            [Request::UpsertForwards {
+            [Request::AddForwards {
                 forwards: vec![Forward {
                     id: ForwardId::new("production.shop.api-80"),
                     context: "production".into(),
@@ -1289,7 +1324,7 @@ pub(crate) mod tests {
         app.update(key(KeyCode::Char('+')));
         let cmds = app.update(key(KeyCode::Enter));
         let requests = requested(&cmds);
-        let [Request::UpsertForwards { forwards }] = requests.as_slice() else {
+        let [Request::AddForwards { forwards }] = requests.as_slice() else {
             panic!("expected one save, got {cmds:?}")
         };
         let added: Vec<&str> = forwards.iter().map(|f| f.id.as_str()).collect();
@@ -1483,6 +1518,29 @@ pub(crate) mod tests {
         app.update(Msg::Done(Ok("added production.shop.api-80".into())));
         assert!(matches!(app.mode, Mode::List));
         assert_eq!(message(&app), ("added production.shop.api-80", false));
+    }
+
+    #[test]
+    fn a_saved_edit_closes_the_form_and_a_failed_one_keeps_it() {
+        let mut app = App::new(snapshot());
+        app.update(key(KeyCode::Char('e')));
+        let id = ForwardId::new("prd-web");
+        app.update(Msg::Saved {
+            id: id.clone(),
+            result: Err("unknown forward prd-web".into()),
+        });
+        let Mode::Form(form) = &app.mode else {
+            panic!("form closed")
+        };
+        assert_eq!(form.error.as_deref(), Some("unknown forward prd-web"));
+
+        app.update(Msg::Saved {
+            id: id.clone(),
+            result: Ok(id.clone()),
+        });
+        assert!(matches!(app.mode, Mode::List));
+        assert_eq!(message(&app), ("saved prd-web", false));
+        assert_eq!(app.selected, Some(id));
     }
 
     #[test]
@@ -1685,7 +1743,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_edit_form_saves_the_forward_under_its_id() {
+    fn the_edit_form_saves_the_settings_without_the_flag() {
         let mut app = App::new(snapshot());
         app.update(key(KeyCode::Char('G')));
         app.update(key(KeyCode::Char('e')));
@@ -1695,24 +1753,29 @@ pub(crate) mod tests {
         assert_eq!(form.fields, ["staging", "shop", "frontend", "80", "10080"]);
         assert_eq!(form.focus, 4, "the local port is edited most");
 
+        // Another client switches the forward off while the form is open;
+        // the edit carries no flag that could switch it on again.
+        let mut switched = snapshot();
+        switched.forwards[2].forward.enabled = false;
+        app.update(Msg::Snapshot(switched));
         for _ in 0..5 {
             app.update(key(KeyCode::Backspace));
         }
         type_text(&mut app, "18081");
         assert_eq!(
-            requested(&app.update(key(KeyCode::Enter))),
-            [Request::UpsertForwards {
-                forwards: vec![Forward {
-                    id: ForwardId::new("stg-web"),
+            app.update(key(KeyCode::Enter)),
+            [Cmd::Edit {
+                id: ForwardId::new("stg-web"),
+                settings: ForwardSettings {
                     context: "staging".into(),
                     namespace: "shop".into(),
                     service: "frontend".into(),
                     remote_port: 80,
                     local_port: 18081,
-                    enabled: true,
-                }]
+                },
             }]
         );
+        assert!(matches!(app.mode, Mode::Form(_)), "open until saved");
 
         // Focus wraps around; Esc closes without saving.
         app.update(key(KeyCode::Tab));

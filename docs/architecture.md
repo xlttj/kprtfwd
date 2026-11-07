@@ -634,7 +634,8 @@ enum Request {
     SwitchProject { name: String },
     SetPaused { paused: bool },
     ReconnectContext { name: String },
-    UpsertForwards { forwards: Vec<Forward> },
+    AddForwards { forwards: Vec<Forward> },
+    EditForward { id: ForwardId, settings: ForwardSettings },   // all but ID and enabled flag
     DeleteForward { id: ForwardId },
     UpsertProject { project: Project },
     DeleteProject { name: String },
@@ -649,6 +650,7 @@ enum Response {
     Welcome { protocol: u32, daemon_version: String, pid: u32 },
     Snapshot(Snapshot),   // contexts, forwards with state, projects, paused
     Done,
+    Saved { id: ForwardId },   // the edited forward's ID
     Contexts { names: Vec<String>, current: Option<String> },
     Discovered { ports: Vec<DiscoveredPort>, skipped: Vec<String> },   // with proposed ID and local port
     Pruned { forwards: Vec<Forward>, skipped: Vec<String> },
@@ -658,6 +660,13 @@ enum Response {
 
 `SetEnabled` takes a list, so the TUI can switch every forward in its current list
 on or off with one request (`+` / `-`).
+
+Adding and editing are separate, because several clients may act at once (a
+TUI and the CLI, or two TUIs). `AddForwards` never replaces a forward: if an
+ID is taken, also by another client a moment ago, the request fails and adds
+nothing; the client proposes the next free ID on the next try. `EditForward`
+carries the settings without the enabled flag, so a forward that another
+client switched while the form was open stays as it was switched.
 
 `Prune` without `delete` only lists the forwards whose service is gone. The
 confirmed call sends the IDs the user was shown, and the daemon deletes those

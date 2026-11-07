@@ -205,7 +205,7 @@ pub fn forward(context: &str, namespace: &str, service: &str, enabled: bool) -> 
 pub fn write_database(path: &Path, forwards: &[Forward], paused: bool) {
     let mut store = Store::open(path).unwrap();
     for forward in forwards {
-        store.upsert_forward(forward).unwrap();
+        store.add_forward(forward).unwrap();
     }
     store.set_paused(paused).unwrap();
 }

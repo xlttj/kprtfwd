@@ -54,6 +54,28 @@ pub struct Forward {
     pub enabled: bool,
 }
 
+impl Forward {
+    pub fn settings(&self) -> ForwardSettings {
+        ForwardSettings {
+            context: self.context.clone(),
+            namespace: self.namespace.clone(),
+            service: self.service.clone(),
+            remote_port: self.remote_port,
+            local_port: self.local_port,
+        }
+    }
+}
+
+/// What an edit changes: a forward without its ID and its enabled flag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardSettings {
+    pub context: String,
+    pub namespace: String,
+    pub service: String,
+    pub remote_port: u16,
+    pub local_port: u16,
+}
+
 /// A named set of forwards that can be switched on and off together.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {

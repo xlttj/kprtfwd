@@ -905,10 +905,59 @@ async fn a_forward_added_again_starts_without_old_events() {
         ..api.clone()
     };
     client
-        .act(Request::UpsertForwards {
+        .act(Request::AddForwards {
             forwards: vec![again],
         })
         .await
         .unwrap();
     assert_eq!(own_events(&mut client, &api.id).await, Vec::<String>::new());
+}
+
+/// A TUI edits a forward while the CLI switches it on: the edit keeps the
+/// switch. Both add the same service: the second add fails instead of
+/// replacing the first.
+#[tokio::test]
+async fn an_edit_keeps_a_switch_and_an_add_replaces_nothing() {
+    let home = Home::new();
+    let api = forward("test", "shop", "api", false);
+    write_database(&home.db(), std::slice::from_ref(&api), false);
+    home.start_daemon();
+    let mut tui = Client::connect(&home.socket()).await.expect("connect");
+    let mut cli = Client::connect(&home.socket()).await.expect("connect");
+
+    // The form opens with the forward off; then the CLI switches it on.
+    let mut settings = tui.snapshot().await.unwrap().forwards[0].forward.settings();
+    let ids = vec![api.id.clone()];
+    cli.act(Request::SetEnabled { ids, enabled: true })
+        .await
+        .unwrap();
+    settings.local_port = forward("test", "shop", "api", false).local_port;
+    let edit = Request::EditForward {
+        id: api.id.clone(),
+        settings: settings.clone(),
+    };
+    let Response::Saved { id } = tui.request(edit).await.unwrap() else {
+        panic!("no saved answer");
+    };
+    assert_eq!(id, api.id);
+    let snapshot = cli.snapshot().await.unwrap();
+    let [saved] = snapshot.forwards.as_slice() else {
+        panic!("{:?}", snapshot.forwards);
+    };
+    assert!(saved.forward.enabled, "the CLI's switch stays");
+    assert_eq!(saved.forward.settings(), settings);
+
+    let web = forward("test", "shop", "web", false);
+    let add = |forward: &Forward| Request::AddForwards {
+        forwards: vec![forward.clone()],
+    };
+    tui.act(add(&web)).await.unwrap();
+    let same = forward("test", "shop", "web", false);
+    let Err(ClientError::Daemon(message)) = cli.act(add(&same)).await else {
+        panic!("the second add of {} went through", same.id);
+    };
+    assert_eq!(message, "forward test.shop.web-80 already exists");
+    let snapshot = cli.snapshot().await.unwrap();
+    let stored: Vec<&Forward> = snapshot.forwards.iter().map(|v| &v.forward).collect();
+    assert_eq!(stored, [&saved.forward, &web]);
 }

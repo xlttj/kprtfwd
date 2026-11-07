@@ -372,6 +372,10 @@ fn refused(cmd: Cmd, reason: &str) -> Msg {
     match cmd {
         Cmd::ListContexts => Msg::Contexts(Err(reason.into())),
         Cmd::Events { .. } => Msg::Events(Err(reason.into())),
+        Cmd::Edit { id, .. } => Msg::Saved {
+            id,
+            result: Err(reason.into()),
+        },
         // The others do not go over the connection; only requests are left.
         _ => Msg::Done(Err(reason.into())),
     }
@@ -437,6 +441,22 @@ async fn ask<C: Connection>(mut conn: C, cmd: Cmd) -> Finished<C> {
                 lost => lost,
             }
         }
+        Cmd::Edit { id, settings } => {
+            let request = Request::EditForward {
+                id: id.clone(),
+                settings,
+            };
+            let (answer, lost) = split(bounded(conn.request(request)).await);
+            let result = answer.and_then(|response| match response {
+                Response::Saved { id } => Ok(id),
+                _ => Err(UNEXPECTED.into()),
+            });
+            msgs.push(Msg::Saved { id, result });
+            match lost {
+                None => fetch_snapshot(&mut conn, &mut msgs).await,
+                lost => lost,
+            }
+        }
         Cmd::ListContexts => {
             let (answer, lost) = split(bounded(conn.request(Request::ListContexts)).await);
             msgs.push(Msg::Contexts(answer.and_then(|response| match response {
@@ -492,7 +512,9 @@ fn run_cmd<D: Daemon>(
     tx: &mpsc::UnboundedSender<Msg>,
 ) {
     match cmd {
-        Cmd::Request { .. } | Cmd::ListContexts | Cmd::Events { .. } => link.push(cmd, app),
+        Cmd::Request { .. } | Cmd::Edit { .. } | Cmd::ListContexts | Cmd::Events { .. } => {
+            link.push(cmd, app);
+        }
         Cmd::Discover {
             context,
             namespace_filter,
@@ -620,8 +642,8 @@ mod tests {
     use std::sync::{Arc, Mutex, MutexGuard};
     use std::time::SystemTime;
 
-    use kprtfwd_core::ForwardId;
     use kprtfwd_core::svctype::ServiceType;
+    use kprtfwd_core::{Forward, ForwardId};
     use kprtfwd_proto::{DiscoveredPort, EventEntry};
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyEvent, KeyEventState};
@@ -655,6 +677,8 @@ mod tests {
         /// Calls that never get an answer, by the names in `calls`.
         stall: Vec<&'static str>,
         events: Vec<EventEntry>,
+        /// The ID an edited forward gets; `None` keeps its own.
+        saved_as: Option<ForwardId>,
     }
 
     impl FakeDaemon {
@@ -672,6 +696,7 @@ mod tests {
                     refuse: None,
                     stall: Vec::new(),
                     events: Vec::new(),
+                    saved_as: None,
                 })),
                 discovery: Arc::new(Semaphore::new(0)),
             }
@@ -810,6 +835,24 @@ mod tests {
                     }
                     Response::Done
                 }
+                Request::EditForward { id, settings } => {
+                    // Saved under the ID the test gives, else its own.
+                    let saved = state.saved_as.clone().unwrap_or_else(|| id.clone());
+                    for view in &mut state.snapshot.forwards {
+                        if view.forward.id == id {
+                            view.forward = Forward {
+                                id: saved.clone(),
+                                enabled: view.forward.enabled,
+                                context: settings.context.clone(),
+                                namespace: settings.namespace.clone(),
+                                service: settings.service.clone(),
+                                remote_port: settings.remote_port,
+                                local_port: settings.local_port,
+                            };
+                        }
+                    }
+                    Response::Saved { id: saved }
+                }
                 Request::ListContexts => Response::Contexts {
                     names: vec!["staging".into()],
                     current: None,
@@ -909,6 +952,30 @@ mod tests {
             ("on: prd-web", false)
         );
         assert!(app.snapshot.forwards[0].forward.enabled);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_edit_is_saved_and_its_effect_shown_at_once() {
+        let fake = FakeDaemon::new();
+        let mut app = App::new(snapshot());
+        run_loop(&fake, &mut app, async |keys| {
+            keys.send(char_key('e')).await;
+            keys.send(key(KeyCode::Backspace)).await;
+            keys.type_text("1").await;
+            keys.send(key(KeyCode::Enter)).await;
+        })
+        .await;
+
+        let calls = fake.calls();
+        let at = calls.iter().position(|c| c == "EditForward").unwrap();
+        assert_eq!(calls[at + 1], "snapshot", "{calls:?}");
+        assert!(matches!(app.mode, Mode::List));
+        let message = app.message.as_ref().unwrap();
+        assert_eq!(
+            (message.text.as_str(), message.error),
+            ("saved prd-web", false)
+        );
+        assert_eq!(app.snapshot.forwards[0].forward.local_port, 10081);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1074,6 +1141,8 @@ mod tests {
         run_loop(&fake, &mut app, async |keys| {
             keys.ticks(1).await;
             keys.send(char_key(' ')).await;
+            keys.send(char_key('e')).await;
+            keys.send(key(KeyCode::Enter)).await;
         })
         .await;
         assert_eq!(fake.count("SetEnabled"), 0);
@@ -1082,6 +1151,12 @@ mod tests {
             (message.text.as_str(), message.error),
             ("not connected to the daemon", true)
         );
+        // A failed edit keeps its form open.
+        assert_eq!(fake.count("EditForward"), 0);
+        let Mode::Form(form) = &app.mode else {
+            panic!("form closed");
+        };
+        assert_eq!(form.error.as_deref(), Some("not connected to the daemon"));
     }
 
     #[tokio::test(start_paused = true)]

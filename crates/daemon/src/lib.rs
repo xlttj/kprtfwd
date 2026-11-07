@@ -16,7 +16,7 @@ use kprtfwd_core::filter::wildcard;
 use kprtfwd_core::naming::{forward_id, propose_local_port};
 use kprtfwd_core::state::derive;
 use kprtfwd_core::svctype::classify;
-use kprtfwd_core::validate::validate_forward;
+use kprtfwd_core::validate::{validate_forward, validate_settings};
 use kprtfwd_core::{Config, ContextState, Forward, ForwardId, Project, Store, StoreError, paths};
 use kprtfwd_engine::{Engine, discovery, kubeconfig, port_is_free};
 use kprtfwd_proto::{
@@ -719,15 +719,19 @@ impl Daemon {
                 info!(context = %name, "reconnected");
                 return Ok(Response::Done);
             }
-            Request::UpsertForwards { forwards } => {
-                // Check all first, so a bad entry adds none.
+            Request::AddForwards { forwards } => {
                 for forward in &forwards {
                     validate_forward(forward).map_err(|err| format!("{}: {err}", forward.id))?;
                 }
-                for forward in &forwards {
-                    self.store.upsert_forward(forward).map_err(text)?;
-                }
-                info!(count = forwards.len(), "forwards saved");
+                self.store.add_forwards(&forwards).map_err(text)?;
+                info!(count = forwards.len(), "forwards added");
+            }
+            Request::EditForward { id, settings } => {
+                validate_settings(&settings).map_err(|err| format!("{id}: {err}"))?;
+                let saved = self.store.edit_forward(&id, &settings).map_err(text)?;
+                self.apply().await.map_err(text)?;
+                info!(%id, "forward edited");
+                return Ok(Response::Saved { id: saved });
             }
             Request::DeleteForward { id } => {
                 if !self.store.delete_forward(&id).map_err(text)? {

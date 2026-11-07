@@ -1,6 +1,6 @@
 //! Validation of user-supplied forward and project data.
 
-use crate::model::{Forward, Project};
+use crate::model::{Forward, ForwardSettings, Project};
 
 /// Maximum length of a Kubernetes name (RFC 1123 label).
 const MAX_NAME_LEN: usize = 63;
@@ -21,13 +21,17 @@ pub enum ValidationError {
 
 pub fn validate_forward(forward: &Forward) -> Result<(), ValidationError> {
     validate_text("id", forward.id.as_str())?;
-    validate_text("context", &forward.context)?;
-    validate_kubernetes_name("namespace", &forward.namespace)?;
-    validate_kubernetes_name("service", &forward.service)?;
-    if forward.remote_port == 0 {
+    validate_settings(&forward.settings())
+}
+
+pub fn validate_settings(settings: &ForwardSettings) -> Result<(), ValidationError> {
+    validate_text("context", &settings.context)?;
+    validate_kubernetes_name("namespace", &settings.namespace)?;
+    validate_kubernetes_name("service", &settings.service)?;
+    if settings.remote_port == 0 {
         return Err(ValidationError::ZeroPort("remote port"));
     }
-    if forward.local_port == 0 {
+    if settings.local_port == 0 {
         return Err(ValidationError::ZeroPort("local port"));
     }
     Ok(())

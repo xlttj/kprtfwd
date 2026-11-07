@@ -15,7 +15,7 @@ pub mod svctype;
 pub mod validate;
 
 pub use config::Config;
-pub use model::{Forward, ForwardId, Project};
+pub use model::{Forward, ForwardId, ForwardSettings, Project};
 pub use state::{ContextState, ForwardState};
 pub use store::{Store, StoreError};
 pub use validate::ValidationError;
