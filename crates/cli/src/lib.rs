@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use kprtfwd_core::clock::local_date_time;
-use kprtfwd_core::{ForwardId, ForwardState, Store, filter, paths};
+use kprtfwd_core::{ContextState, ForwardId, ForwardState, Store, filter, paths};
 use kprtfwd_proto::{
     Client, ClientError, ForwardView, Request, Snapshot, connect_or_start, other_version,
     stop_daemon,
@@ -26,7 +26,7 @@ const EXIT_NOT_READY: u8 = 3;
 /// Exit code when the daemon is not reachable: not running and not
 /// startable, not answering, or gone during the command.
 const EXIT_NO_DAEMON: u8 = 4;
-/// How long `up` waits for forwards to leave "starting".
+/// How long `up` waits for forwards to come up; see [`settling`].
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Errors older than this are not shown next to a ready forward.
 const RECENT_ERROR: Duration = Duration::from_secs(60);
@@ -450,16 +450,16 @@ fn project_members(snapshot: &Snapshot, name: &str) -> Vec<ForwardId> {
         .unwrap_or_default()
 }
 
-/// Waits until the forwards have left "starting", then shows them.
+/// Waits until the forwards have come up, then shows them.
 async fn report(client: &mut Client, ids: &[ForwardId]) -> Result<ExitCode> {
     let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
     let snapshot = loop {
         let snapshot = client.snapshot().await?;
-        let starting = snapshot
+        let settling = snapshot
             .forwards
             .iter()
-            .any(|view| ids.contains(&view.forward.id) && view.state == ForwardState::Starting);
-        if !starting || tokio::time::Instant::now() >= deadline {
+            .any(|view| ids.contains(&view.forward.id) && settling(&snapshot, view));
+        if !settling || tokio::time::Instant::now() >= deadline {
             break snapshot;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -471,6 +471,20 @@ async fn report(client: &mut Client, ids: &[ForwardId]) -> Result<ExitCode> {
         .collect();
     print_forwards(&snapshot, &shown);
     Ok(ExitCode::SUCCESS)
+}
+
+/// Whether a forward is still coming up: its listener or cache is not ready,
+/// or its context is connecting. A login may wait minutes for the browser,
+/// so it is not waited for.
+fn settling(snapshot: &Snapshot, view: &ForwardView) -> bool {
+    match view.state {
+        ForwardState::Starting => true,
+        ForwardState::WaitingForContext => matches!(
+            snapshot.context_state(&view.forward.context),
+            ContextState::Idle | ContextState::Connecting
+        ),
+        _ => false,
+    }
 }
 
 /// Lists the forwards whose service is gone, asks, and deletes exactly those
@@ -826,7 +840,7 @@ fn count(n: usize, noun: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kprtfwd_core::{ContextState, Forward};
+    use kprtfwd_core::Forward;
     use kprtfwd_proto::ProjectView;
 
     fn view(id: &str, context: &str, service: &str) -> ForwardView {
@@ -1112,5 +1126,43 @@ mod tests {
                 "{not_ready:?}"
             );
         }
+    }
+
+    /// `up` waits for a forward whose context is still connecting, as for
+    /// one that is starting, but not for a login or an outage.
+    #[test]
+    fn up_waits_while_a_forward_starts_or_its_context_connects() {
+        let mut snapshot = snapshot();
+        let mut view = view("stg-api", "staging", "api");
+        let with = |snapshot: &mut Snapshot, view: &mut ForwardView, state, context| {
+            view.state = state;
+            snapshot.contexts = vec![kprtfwd_proto::ContextView {
+                name: "staging".into(),
+                state: context,
+            }];
+            settling(snapshot, view)
+        };
+        let healthy = ContextState::Healthy {
+            server_version: "v1".into(),
+        };
+        let down = ContextState::Unreachable {
+            since: SystemTime::UNIX_EPOCH,
+            cause: kprtfwd_core::state::NetCause::Dns,
+        };
+        let waiting = || ForwardState::WaitingForContext;
+        assert!(with(
+            &mut snapshot,
+            &mut view,
+            ForwardState::Starting,
+            healthy.clone()
+        ));
+        for context in [ContextState::Connecting, ContextState::Idle] {
+            assert!(with(&mut snapshot, &mut view, waiting(), context));
+        }
+        for context in [ContextState::LoggingIn, down] {
+            assert!(!with(&mut snapshot, &mut view, waiting(), context));
+        }
+        let pods = ForwardState::WaitingForPods { ready: 0, total: 1 };
+        assert!(!with(&mut snapshot, &mut view, pods, healthy));
     }
 }

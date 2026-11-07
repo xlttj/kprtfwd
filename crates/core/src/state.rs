@@ -204,10 +204,10 @@ pub fn derive(enabled: bool, paused: bool, observed: Option<&Observed>) -> Forwa
         }
         Bind::Bound => {}
     }
-    match &observed.context {
-        ContextState::Healthy { .. } => {}
-        ContextState::Idle | ContextState::Connecting => return ForwardState::Starting,
-        _ => return ForwardState::WaitingForContext,
+    // Connecting and logging in too: the context's state says what the
+    // forward waits for.
+    if !observed.context.is_healthy() {
+        return ForwardState::WaitingForContext;
     }
     match &observed.target {
         Target::Syncing => ForwardState::Starting,
@@ -294,7 +294,7 @@ mod tests {
                     ContextState::Connecting,
                     pods.clone(),
                 )),
-                ForwardState::Starting,
+                ForwardState::WaitingForContext,
             ),
             (
                 true,
@@ -362,6 +362,10 @@ mod tests {
         assert_eq!(
             ForwardState::WaitingForContext.info(&auth),
             "login needed: reconnect (r) to log in"
+        );
+        assert_eq!(
+            ForwardState::WaitingForContext.info(&ContextState::Connecting),
+            "connecting"
         );
         assert_eq!(
             ForwardState::WaitingForContext.info(&ContextState::LoggingIn),
